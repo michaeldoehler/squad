@@ -292,3 +292,41 @@ impl ServerHandle {
         }
     }
 }
+
+/// Adds [`serve`](Serve::serve) to [`Database`]: one call makes an
+/// embedded database reachable for other processes and for tools and
+/// drivers that speak the Postgres protocol.
+///
+/// ```
+/// use squad::Database;
+/// use squad_server::Serve;
+///
+/// let db = Database::open_in_memory()?;
+/// let server = db.serve("127.0.0.1:0")?;
+/// // e.g. postgres://squad@127.0.0.1:54321/squad
+/// println!("{}", server.url().unwrap());
+/// server.shutdown();
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub trait Serve {
+    /// Serves the database on `addr` in background threads, trusting every
+    /// client. Use [`Server`] directly to configure authentication or a
+    /// Unix socket. The database stays usable through the embedded API.
+    fn serve(&self, addr: impl ToSocketAddrs) -> io::Result<ServerHandle>;
+}
+
+impl Serve for Database {
+    fn serve(&self, addr: impl ToSocketAddrs) -> io::Result<ServerHandle> {
+        let mut server = Server::new(self.clone(), ServerConfig::default());
+        server.bind(addr)?;
+        Ok(server.spawn())
+    }
+}
+
+impl ServerHandle {
+    /// Connection URL for clients on this machine, as accepted by libpq,
+    /// sqlx, tokio-postgres and other drivers.
+    pub fn url(&self) -> Option<String> {
+        self.local_addr().map(|a| format!("postgres://squad@{a}/squad"))
+    }
+}

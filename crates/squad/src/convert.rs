@@ -287,3 +287,10 @@ impl<T: FromSql> FromSql for Vec<T> {
         }
     }
 }
+
+impl ToSql for [u8; 16] {
+    /// Sixteen bytes are a `uuid`.
+    fn to_value(&self) -> Value {
+        Value::Uuid(*self)
+    }
+}
