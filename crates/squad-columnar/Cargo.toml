@@ -1,0 +1,13 @@
+[package]
+name = "squad-columnar"
+description = "Column-oriented segment format and vectorized aggregation engine for the squad database."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+crc32c = "0.6"
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
