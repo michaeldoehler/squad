@@ -242,7 +242,11 @@ pub(crate) struct TxnState {
     /// A statement failed; only ROLLBACK is accepted.
     pub(crate) failed: bool,
     /// Started by BEGIN rather than implicitly for one statement.
-    pub(crate) explicit: bool,
+        pub(crate) explicit: bool,
+    /// The implicit transaction around a multi-statement string. It acts
+    /// like a block while the string runs and ends with it, unless a BEGIN
+    /// inside the string takes it over.
+    pub(crate) batch: bool,
     pub(crate) savepoints: Vec<Savepoint>,
     pub(crate) start_time: i64,
     /// Counters to forget when the transaction ends either way.
@@ -412,6 +416,15 @@ impl Session {
 
     /// Returns a plan for ad-hoc SQL, reusing a cached one when the
     /// catalog has not changed.
+        fn cache_lookup(&self, sql: &str) -> Option<Arc<Prepared>> {
+        if self.txn.as_ref().is_some_and(|t| t.dirty) {
+            return None;
+        }
+        let key = format!("{}\u{0}{}", self.state.search_path.join(","), sql);
+        let hit = self.shared.plan_cache.lock().get(&key).cloned()?;
+        (hit.catalog_version == self.catalog().version).then_some(hit)
+    }
+
     fn cached(&mut self, sql: &str) -> Result<Arc<Prepared>> {
         let catalog = self.catalog();
         let private = self.txn.as_ref().is_some_and(|t| t.dirty);
@@ -454,16 +467,23 @@ impl Session {
     /// Like [`execute`](Session::execute), but hands every statement's
     /// result to `on_result` as soon as it is available, so that results
     /// of the statements before a failing one are not lost.
-    pub fn execute_each(&mut self, sql: &str, on_result: &mut dyn FnMut(QueryResult) -> Result<()>) -> Result<()> {
+        pub fn execute_each(&mut self, sql: &str, on_result: &mut dyn FnMut(QueryResult) -> Result<()>) -> Result<()> {
+        // A cache hit means the text is a single, already planned statement:
+        // skip parsing altogether.
+        if let Some(prepared) = self.cache_lookup(sql) {
+            return on_result(self.execute_prepared(&prepared, &[])?);
+        }
         let stmts = parse_sql(sql)?;
         if stmts.len() <= 1 {
             let prepared = self.cached(sql)?;
             return on_result(self.execute_prepared(&prepared, &[])?);
         }
         let implicit_block = self.txn.is_none();
-        if implicit_block {
+                if implicit_block {
             self.begin(None, false)?;
-            self.txn.as_mut().unwrap().explicit = true;
+            let t = self.txn.as_mut().unwrap();
+            t.explicit = true;
+            t.batch = true;
         }
         let mut outcome = Ok(());
         for raw in stmts {
@@ -477,13 +497,13 @@ impl Session {
                 break;
             }
         }
-        if implicit_block {
-            if let Some(t) = &self.txn {
-                if outcome.is_ok() && !t.failed {
-                    outcome = self.commit();
-                } else {
-                    self.rollback();
-                }
+                // The string may have ended its transaction itself (COMMIT) or
+        // opened a real block (BEGIN), which then stays open.
+        if let Some(t) = self.txn.as_ref().filter(|t| implicit_block && t.batch) {
+            if outcome.is_ok() && !t.failed {
+                outcome = self.commit();
+            } else {
+                self.rollback();
             }
         }
         outcome
@@ -672,7 +692,8 @@ impl Session {
             catalog,
             dirty: false,
             failed: false,
-            explicit,
+                        explicit,
+            batch: false,
             savepoints: Vec::new(),
             start_time: now_micros(),
             reset_counters: Vec::new(),

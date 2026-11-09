@@ -1,0 +1,237 @@
+[
+ {
+  "name": "sqlx type",
+  "sql": "SELECT typname, typtype, typcategory, typrelid, typelem, typbasetype FROM pg_catalog.pg_type WHERE oid = (SELECT oid FROM pg_type WHERE typname = 'mood')",
+  "expected": "mood | e | E | 0 | 0 | 0"
+ },
+ {
+  "name": "sqlx type builtin",
+  "sql": "SELECT typname, typtype, typcategory, typrelid, typelem, typbasetype FROM pg_catalog.pg_type WHERE oid = 1007",
+  "expected": "_int4 | b | A | 0 | 23 | 0"
+ },
+ {
+  "name": "sqlx enum",
+  "sql": "SELECT enumlabel FROM pg_catalog.pg_enum WHERE enumtypid = (SELECT oid FROM pg_type WHERE typname = 'mood') ORDER BY enumsortorder",
+  "expected": "sad\nok\nhappy"
+ },
+ {
+  "name": "sqlx ilike",
+  "sql": "SELECT count(oid) FROM pg_catalog.pg_type WHERE typname ILIKE 'mood'",
+  "expected": "1"
+ },
+ {
+  "name": "sqlx attnotnull",
+  "sql": "SELECT attnotnull FROM pg_attribute WHERE attrelid = 'users'::regclass AND attnum = 2",
+  "expected": "t"
+ },
+ {
+  "name": "sqlx composite",
+  "sql": "SELECT attname, atttypid FROM pg_catalog.pg_attribute WHERE attrelid = 'posts'::regclass AND NOT attisdropped AND attnum > 0 ORDER BY attnum",
+  "expected": "id | 20\nuser_id | 23\ntitle | 25\ntags | 1009"
+ },
+ {
+  "name": "sqlx range",
+  "sql": "SELECT rngsubtype FROM pg_catalog.pg_range WHERE rngtypid = 3904",
+  "expected": "23"
+ },
+ {
+  "name": "sqlx lock",
+  "sql": "SELECT pg_advisory_lock(1234567)",
+  "expected": ""
+ },
+ {
+  "name": "sqlx dirty",
+  "sql": "SELECT version FROM _sqlx_migrations WHERE success = false ORDER BY version LIMIT 1",
+  "expected": ""
+ },
+ {
+  "name": "sqlx list",
+  "sql": "SELECT version, checksum FROM _sqlx_migrations ORDER BY version",
+  "expected": ""
+ },
+ {
+  "name": "diesel tables",
+  "sql": "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name NOT LIKE '\\_\\_%' AND table_type LIKE 'BASE TABLE' ORDER BY table_name",
+  "expected": "_sqlx_migrations\nposts\nusers"
+ },
+ {
+  "name": "diesel columns",
+  "sql": "SELECT column_name, udt_name, udt_schema, is_nullable, column_default, data_type, character_maximum_length, numeric_precision, numeric_scale, ordinal_position, is_identity, identity_generation FROM information_schema.columns WHERE table_name = 'users' AND table_schema = 'public' ORDER BY ordinal_position",
+  "expected": "id | int4 | pg_catalog | NO | nextval('users_id_seq'::regclass) | integer |  | 32 | 0 | 1 | NO | \nemail | varchar | pg_catalog | NO |  | character varying | 100 |  |  | 2 | NO | \nname | text | pg_catalog | YES | 'anon'::text | text |  |  |  | 3 | NO | \nage | int4 | pg_catalog | YES |  | integer |  | 32 | 0 | 4 | NO | \nmood | mood | public | YES |  | USER-DEFINED |  |  |  | 5 | NO | \ncreated_at | timestamptz | pg_catalog | NO | now() | timestamp with time zone |  |  |  | 6 | NO | \nscore | numeric | pg_catalog | YES |  | numeric |  | 10 | 2 | 7 | NO | "
+ },
+ {
+  "name": "diesel columns posts",
+  "sql": "SELECT column_name, udt_name, is_nullable, column_default, data_type, is_identity, identity_generation, is_generated, is_updatable, numeric_precision_radix, datetime_precision, character_octet_length FROM information_schema.columns WHERE table_name IN ('posts','user_posts') AND table_schema = 'public' ORDER BY table_name, ordinal_position",
+  "expected": "id | int8 | NO |  | bigint | YES | ALWAYS | NEVER | YES | 2 |  | \nuser_id | int4 | NO |  | integer | NO |  | NEVER | YES | 2 |  | \ntitle | text | NO |  | text | NO |  | NEVER | YES |  |  | 1073741824\ntags | _text | YES |  | ARRAY | NO |  | NEVER | YES |  |  | \nid | int4 | YES |  | integer | NO |  | NEVER | NO | 2 |  | \nname | text | YES |  | text | NO |  | NEVER | NO |  |  | 1073741824\ntitle | text | YES |  | text | NO |  | NEVER | NO |  |  | 1073741824"
+ },
+ {
+  "name": "diesel pk",
+  "sql": "SELECT kcu.column_name FROM information_schema.key_column_usage kcu JOIN information_schema.table_constraints tc ON tc.constraint_schema = kcu.constraint_schema AND tc.constraint_name = kcu.constraint_name WHERE tc.constraint_type = 'PRIMARY KEY' AND kcu.table_name = 'users' AND kcu.table_schema = 'public' ORDER BY kcu.ordinal_position",
+  "expected": "id"
+ },
+ {
+  "name": "diesel fk",
+  "sql": "SELECT tc.table_name, kcu.column_name, ccu.table_name AS foreign_table_name, ccu.column_name AS foreign_column_name, tc.constraint_name, rc.update_rule, rc.delete_rule, rc.unique_constraint_name, rc.match_option FROM information_schema.table_constraints AS tc JOIN information_schema.key_column_usage AS kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema JOIN information_schema.constraint_column_usage AS ccu ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema JOIN information_schema.referential_constraints rc ON rc.constraint_name = tc.constraint_name AND rc.constraint_schema = tc.constraint_schema WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public' ORDER BY 1, 2",
+  "expected": "posts | user_id | users | id | posts_user_id_fkey | NO ACTION | CASCADE | users_pkey | NONE"
+ },
+ {
+  "name": "info table_constraints",
+  "sql": "SELECT constraint_name, table_name, constraint_type, is_deferrable, initially_deferred FROM information_schema.table_constraints WHERE table_schema = 'public' AND constraint_type <> 'CHECK' ORDER BY 1",
+  "expected": "_sqlx_migrations_pkey | _sqlx_migrations | PRIMARY KEY | NO | NO\nposts_pkey | posts | PRIMARY KEY | NO | NO\nposts_user_id_fkey | posts | FOREIGN KEY | NO | NO\nposts_user_id_title_key | posts | UNIQUE | NO | NO\nusers_email_key | users | UNIQUE | NO | NO\nusers_pkey | users | PRIMARY KEY | NO | NO"
+ },
+ {
+  "name": "info kcu",
+  "sql": "SELECT constraint_name, table_name, column_name, ordinal_position, position_in_unique_constraint FROM information_schema.key_column_usage WHERE table_schema = 'public' ORDER BY 1, 4",
+  "expected": "_sqlx_migrations_pkey | _sqlx_migrations | version | 1 | \nposts_pkey | posts | id | 1 | \nposts_user_id_fkey | posts | user_id | 1 | 1\nposts_user_id_title_key | posts | user_id | 1 | \nposts_user_id_title_key | posts | title | 2 | \nusers_email_key | users | email | 1 | \nusers_pkey | users | id | 1 | "
+ },
+ {
+  "name": "info ccu",
+  "sql": "SELECT table_name, column_name, constraint_name FROM information_schema.constraint_column_usage WHERE table_schema = 'public' AND constraint_name NOT LIKE '%check' ORDER BY 3, 2",
+  "expected": "_sqlx_migrations | version | _sqlx_migrations_pkey\nposts | id | posts_pkey\nusers | id | posts_user_id_fkey\nposts | title | posts_user_id_title_key\nposts | user_id | posts_user_id_title_key\nusers | email | users_email_key\nusers | id | users_pkey"
+ },
+ {
+  "name": "info schemata",
+  "sql": "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT LIKE 'pg_%' ORDER BY 1",
+  "expected": "information_schema\npublic"
+ },
+ {
+  "name": "info views",
+  "sql": "SELECT table_name, check_option, is_updatable FROM information_schema.views WHERE table_schema = 'public'",
+  "expected": "user_posts | NONE | NO"
+ },
+ {
+  "name": "info sequences",
+  "sql": "SELECT sequence_name, data_type, numeric_precision, start_value, minimum_value, maximum_value, increment, cycle_option FROM information_schema.sequences WHERE sequence_schema = 'public' ORDER BY 1",
+  "expected": "my_seq | bigint | 64 | 10 | 1 | 9223372036854775807 | 5 | NO\nusers_id_seq | integer | 32 | 1 | 1 | 2147483647 | 1 | NO"
+ },
+ {
+  "name": "info tables",
+  "sql": "SELECT table_schema, table_name, table_type, is_insertable_into FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema') ORDER BY 2",
+  "expected": "public | _sqlx_migrations | BASE TABLE | YES\npublic | posts | BASE TABLE | YES\npublic | user_posts | VIEW | NO\npublic | users | BASE TABLE | YES"
+ },
+ {
+  "name": "info check",
+  "sql": "SELECT constraint_name FROM information_schema.check_constraints WHERE constraint_schema = 'public' AND constraint_name NOT LIKE '%not_null' ORDER BY 1",
+  "expected": "users_age_check"
+ },
+ {
+  "name": "rails columns",
+  "sql": "SELECT a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypmod, c.collname, col_description(a.attrelid, a.attnum) AS comment, attidentity AS identity, attgenerated as attgenerated FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum LEFT JOIN pg_type t ON a.atttypid = t.oid LEFT JOIN pg_collation c ON a.attcollation = c.oid AND a.attcollation <> t.typcollation WHERE a.attrelid = '\"users\"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+  "expected": "id | integer | nextval('users_id_seq'::regclass) | t | -1 |  |  |  | \nemail | character varying(100) |  | t | 104 |  |  |  | \nname | text | 'anon'::text | f | -1 |  |  |  | \nage | integer |  | f | -1 |  |  |  | \nmood | mood |  | f | -1 |  |  |  | \ncreated_at | timestamp with time zone | now() | t | -1 |  |  |  | \nscore | numeric(10,2) |  | f | 655366 |  |  |  | "
+ },
+ {
+  "name": "rails pk",
+  "sql": "SELECT a.attname FROM (SELECT indrelid, indkey, generate_subscripts(indkey, 1) idx FROM pg_index WHERE indrelid = '\"users\"'::regclass AND indisprimary) i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[i.idx] ORDER BY i.idx",
+  "expected": "id"
+ },
+ {
+  "name": "rails tables",
+  "sql": "SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relkind IN ('r','p') AND c.relname <> '_sqlx_migrations' ORDER BY 1",
+  "expected": "posts\nusers"
+ },
+ {
+  "name": "rails indexes",
+  "sql": "SELECT distinct i.relname, d.indisunique, pg_get_indexdef(d.indexrelid), pg_catalog.obj_description(i.oid, 'pg_class') AS comment, d.indisvalid FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i', 'I') AND d.indisprimary = 'f' AND t.relname = 'posts' AND n.nspname = ANY (current_schemas(false)) ORDER BY i.relname",
+  "expected": "posts_title_idx | f | CREATE INDEX posts_title_idx ON public.posts USING btree (title) |  | t\nposts_user_id_title_key | t | CREATE UNIQUE INDEX posts_user_id_title_key ON public.posts USING btree (user_id, title) |  | t"
+ },
+ {
+  "name": "rails fks",
+  "sql": "SELECT t2.oid::regclass::text AS to_table, a1.attname AS column, a2.attname AS primary_key, c.conname AS name, c.confupdtype AS on_update, c.confdeltype AS on_delete, c.convalidated AS valid, c.condeferrable AS deferrable, c.condeferred AS deferred FROM pg_constraint c JOIN pg_class t1 ON c.conrelid = t1.oid JOIN pg_class t2 ON c.confrelid = t2.oid JOIN pg_attribute a1 ON a1.attnum = c.conkey[1] AND a1.attrelid = t1.oid JOIN pg_attribute a2 ON a2.attnum = c.confkey[1] AND a2.attrelid = t2.oid JOIN pg_namespace t3 ON c.connamespace = t3.oid WHERE c.contype = 'f' AND t1.relname = 'posts' AND t3.nspname = ANY (current_schemas(false)) ORDER BY c.conname",
+  "expected": "users | user_id | id | posts_user_id_fkey | a | c | t | f | f"
+ },
+ {
+  "name": "rails serial",
+  "sql": "SELECT pg_get_serial_sequence('\"users\"', 'id')",
+  "expected": "public.users_id_seq"
+ },
+ {
+  "name": "rails typemap",
+  "sql": "SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, r.rngsubtype, t.typtype, t.typbasetype FROM pg_type as t LEFT JOIN pg_range as r ON oid = rngtypid WHERE t.typname IN ('int2','int4','int8','oid','float4','float8','numeric','bool','timestamp','timestamptz','varchar','text','bytea','jsonb','uuid','_int4','_text') ORDER BY 1",
+  "expected": "16 | bool | 0 | , | boolin |  | b | 0\n17 | bytea | 0 | , | byteain |  | b | 0\n20 | int8 | 0 | , | int8in |  | b | 0\n21 | int2 | 0 | , | int2in |  | b | 0\n23 | int4 | 0 | , | int4in |  | b | 0\n25 | text | 0 | , | textin |  | b | 0\n26 | oid | 0 | , | oidin |  | b | 0\n700 | float4 | 0 | , | float4in |  | b | 0\n701 | float8 | 0 | , | float8in |  | b | 0\n1007 | _int4 | 23 | , | array_in |  | b | 0\n1009 | _text | 25 | , | array_in |  | b | 0\n1043 | varchar | 0 | , | varcharin |  | b | 0\n1114 | timestamp | 0 | , | timestamp_in |  | b | 0\n1184 | timestamptz | 0 | , | timestamptz_in |  | b | 0\n1700 | numeric | 0 | , | numeric_in |  | b | 0\n2950 | uuid | 0 | , | uuid_in |  | b | 0\n3802 | jsonb | 0 | , | jsonb_in |  | b | 0"
+ },
+ {
+  "name": "rails checks",
+  "sql": "SELECT conname, pg_get_constraintdef(c.oid, true) AS constraintdef, c.convalidated AS valid FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid WHERE c.contype = 'c' AND t.relname = 'users'",
+  "expected": "users_age_check | CHECK (age > 0) | t"
+ },
+ {
+  "name": "rails maxid",
+  "sql": "SHOW max_identifier_length",
+  "expected": "63"
+ },
+ {
+  "name": "rails exists",
+  "sql": "SELECT to_regclass('users') IS NOT NULL, to_regclass('nope') IS NULL, to_regtype('mood') IS NOT NULL, to_regtype('nope') IS NULL",
+  "expected": "t | t | t | t"
+ },
+ {
+  "name": "prisma tables",
+  "sql": "SELECT tbl.relname AS table_name, namespace.nspname as namespace, (tbl.relhassubclass and tbl.relkind = 'p') as is_partition, (tbl.relhassubclass and tbl.relkind = 'r') as has_subclass, tbl.relrowsecurity as has_row_level_security, reloptions, pd.description as description FROM pg_class AS tbl INNER JOIN pg_namespace AS namespace ON namespace.oid = tbl.relnamespace LEFT JOIN pg_description pd ON pd.objoid = tbl.oid AND pd.objsubid = 0 AND pd.classoid = 'pg_catalog.pg_class'::regclass::oid WHERE (tbl.relkind = 'r' OR tbl.relkind = 'p') AND namespace.nspname = ANY ( ARRAY['public'] ) AND tbl.relname <> '_sqlx_migrations' ORDER BY namespace, table_name",
+  "expected": "posts | public | f | f | f |  | \nusers | public | f | f | f |  | "
+ },
+ {
+  "name": "prisma enums",
+  "sql": "SELECT t.typname as name, e.enumlabel as value, n.nspname as namespace FROM pg_type t JOIN pg_enum e ON t.oid = e.enumtypid JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = ANY ( ARRAY['public'] ) ORDER BY e.enumsortorder",
+  "expected": "mood | sad | public\nmood | ok | public\nmood | happy | public"
+ },
+ {
+  "name": "prisma columns",
+  "sql": "SELECT oid.namespace, info.table_name, info.column_name, format_type(att.atttypid, att.atttypmod) as formatted_type, info.numeric_precision, info.numeric_scale, info.numeric_precision_radix, info.datetime_precision, info.data_type, info.udt_schema as type_schema_name, info.udt_name as full_data_type, pg_get_expr(attdef.adbin, attdef.adrelid) AS column_default, info.is_nullable, info.is_identity, info.character_maximum_length FROM information_schema.columns info JOIN pg_attribute att ON att.attname = info.column_name JOIN (SELECT pg_class.oid, relname, pg_namespace.nspname as namespace FROM pg_class JOIN pg_namespace on pg_namespace.oid = pg_class.relnamespace AND pg_namespace.nspname = ANY ( ARRAY['public'] ) WHERE reltype > 0 OR true) as oid on oid.oid = att.attrelid AND relname = info.table_name AND namespace = info.table_schema LEFT OUTER JOIN pg_attrdef attdef ON attdef.adrelid = att.attrelid AND attdef.adnum = att.attnum AND table_schema = namespace WHERE info.table_name = 'users' ORDER BY namespace, table_name, ordinal_position",
+  "expected": "public | users | id | integer | 32 | 0 | 2 |  | integer | pg_catalog | int4 | nextval('users_id_seq'::regclass) | NO | NO | \npublic | users | email | character varying(100) |  |  |  |  | character varying | pg_catalog | varchar |  | NO | NO | 100\npublic | users | name | text |  |  |  |  | text | pg_catalog | text | 'anon'::text | YES | NO | \npublic | users | age | integer | 32 | 0 | 2 |  | integer | pg_catalog | int4 |  | YES | NO | \npublic | users | mood | mood |  |  |  |  | USER-DEFINED | public | mood |  | YES | NO | \npublic | users | created_at | timestamp with time zone |  |  |  | 6 | timestamp with time zone | pg_catalog | timestamptz | now() | NO | NO | \npublic | users | score | numeric(10,2) | 10 | 2 | 10 |  | numeric | pg_catalog | numeric |  | YES | NO | "
+ },
+ {
+  "name": "pg_tables",
+  "sql": "SELECT schemaname, tablename, hasindexes, hastriggers FROM pg_tables WHERE schemaname = 'public' AND tablename <> '_sqlx_migrations' ORDER BY 2",
+  "expected": "public | posts | t | t\npublic | users | t | t"
+ },
+ {
+  "name": "pg_indexes",
+  "sql": "SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' AND tablename <> '_sqlx_migrations' ORDER BY 2",
+  "expected": "posts | posts_pkey | CREATE UNIQUE INDEX posts_pkey ON public.posts USING btree (id)\nposts | posts_title_idx | CREATE INDEX posts_title_idx ON public.posts USING btree (title)\nposts | posts_user_id_title_key | CREATE UNIQUE INDEX posts_user_id_title_key ON public.posts USING btree (user_id, title)\nusers | users_email_key | CREATE UNIQUE INDEX users_email_key ON public.users USING btree (email)\nusers | users_pkey | CREATE UNIQUE INDEX users_pkey ON public.users USING btree (id)"
+ },
+ {
+  "name": "pg_sequences",
+  "sql": "SELECT sequencename, start_value, min_value, max_value, increment_by, cycle FROM pg_sequences ORDER BY 1",
+  "expected": "my_seq | 10 | 1 | 9223372036854775807 | 5 | f\nposts_id_seq | 1 | 1 | 9223372036854775807 | 1 | f\nusers_id_seq | 1 | 1 | 2147483647 | 1 | f"
+ },
+ {
+  "name": "pg_views",
+  "sql": "SELECT viewname FROM pg_views WHERE schemaname = 'public'",
+  "expected": "user_posts"
+ },
+ {
+  "name": "seq",
+  "sql": "SELECT c.relname, s.seqstart, s.seqincrement, s.seqmax, s.seqmin, s.seqcycle FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid ORDER BY 1",
+  "expected": "my_seq | 10 | 5 | 9223372036854775807 | 1 | f\nposts_id_seq | 1 | 1 | 9223372036854775807 | 1 | f\nusers_id_seq | 1 | 1 | 2147483647 | 1 | f"
+ },
+ {
+  "name": "constraints",
+  "sql": "SELECT conname, contype, conrelid::regclass, confrelid::regclass, conkey, confkey, confupdtype, confdeltype, confmatchtype, pg_get_constraintdef(oid) FROM pg_constraint WHERE connamespace = 'public'::regnamespace AND conrelid <> '_sqlx_migrations'::regclass ORDER BY 1",
+  "expected": "posts_pkey | p | posts | - | {1} |  |   |   |   | PRIMARY KEY (id)\nposts_user_id_fkey | f | posts | users | {2} | {1} | a | c | s | FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\nposts_user_id_title_key | u | posts | - | {2,3} |  |   |   |   | UNIQUE (user_id, title)\nusers_age_check | c | users | - | {4} |  |   |   |   | CHECK ((age > 0))\nusers_email_key | u | users | - | {2} |  |   |   |   | UNIQUE (email)\nusers_pkey | p | users | - | {1} |  |   |   |   | PRIMARY KEY (id)"
+ },
+ {
+  "name": "format_type",
+  "sql": "SELECT format_type(23, NULL), format_type(1043, 24), format_type(1043, -1), format_type(1700, 655366), format_type(1007, -1), format_type(1042, 9), format_type(1184, -1), format_type(1114, 3), format_type(16, -1), format_type(2950, -1), format_type(3802, -1), format_type(1015, -1), format_type(701, -1), format_type(18, -1), format_type(19, -1), format_type(26, -1)",
+  "expected": "integer | character varying(20) | character varying | numeric(10,2) | integer[] | character(5) | timestamp with time zone | timestamp(3) without time zone | boolean | uuid | jsonb | character varying[] | double precision | \"char\" | name | oid"
+ },
+ {
+  "name": "size",
+  "sql": "SELECT pg_size_pretty(10240::bigint), pg_encoding_to_char(6), pg_is_in_recovery(), has_table_privilege('users', 'SELECT'), has_schema_privilege('public', 'USAGE'), pg_table_is_visible('users'::regclass), pg_get_userbyid(10) IS NOT NULL",
+  "expected": "10 kB | UTF8 | f | t | t | t | t"
+ },
+ {
+  "name": "index attrs",
+  "sql": "SELECT i.relname, a.attname, a.attnum FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = ANY(x.indkey) WHERE x.indrelid = 'posts'::regclass ORDER BY 1, 3",
+  "expected": "posts_pkey | id | 1\nposts_title_idx | title | 3\nposts_user_id_title_key | user_id | 2\nposts_user_id_title_key | title | 3"
+ },
+ {
+  "name": "pg_class kinds",
+  "sql": "SELECT relname, relkind, relnatts, relhasindex, relchecks FROM pg_class WHERE relnamespace = 2200 AND relname <> '_sqlx_migrations' AND relname <> '_sqlx_migrations_pkey' ORDER BY 1",
+  "expected": "my_seq | S | 3 | f | 0\nposts | r | 4 | t | 0\nposts_id_seq | S | 3 | f | 0\nposts_pkey | i | 1 | f | 0\nposts_title_idx | i | 1 | f | 0\nposts_user_id_title_key | i | 2 | f | 0\nuser_posts | v | 3 | f | 0\nusers | r | 7 | t | 1\nusers_email_key | i | 1 | f | 0\nusers_id_seq | S | 3 | f | 0\nusers_pkey | i | 1 | f | 0"
+ },
+ {
+  "name": "pg_namespace",
+  "sql": "SELECT oid, nspname FROM pg_namespace WHERE nspname IN ('public','pg_catalog','information_schema') ORDER BY 1",
+  "expected": "11 | pg_catalog\n2200 | public\n13256 | information_schema"
+ }
+]

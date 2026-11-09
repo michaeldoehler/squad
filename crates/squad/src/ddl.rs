@@ -2043,10 +2043,17 @@ fn transaction(sess: &mut Session, stmt: &pb::TransactionStmt) -> Result<QueryRe
             }
             match &mut sess.txn {
                 // Already inside a block: Postgres only warns.
-                Some(t) if t.explicit => {}
-                // BEGIN inside a multi-statement batch turns the batch's
-                // implicit transaction into an explicit one.
-                Some(t) => t.explicit = true,
+                                Some(t) if t.explicit && !t.batch => {}
+                // BEGIN inside a multi-statement string turns the string's
+                // implicit transaction into a real block.
+                Some(t) => {
+                    t.explicit = true;
+                    t.batch = false;
+                    if isolation.is_some_and(|i| i != t.txn.isolation()) && !t.txn.has_writes() {
+                        sess.rollback();
+                        sess.begin(isolation, true)?;
+                    }
+                }
                 None => sess.begin(isolation, true)?,
             }
             if let Some(t) = &mut sess.txn {
