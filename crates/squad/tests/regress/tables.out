@@ -1,0 +1,134 @@
+-- Tables, constraints and DML.
+CREATE TABLE users (
+    id bigint PRIMARY KEY,
+    email text NOT NULL UNIQUE,
+    name varchar(20),
+    age int CHECK (age >= 0),
+    active boolean NOT NULL DEFAULT true,
+    created timestamp DEFAULT '2024-01-01 00:00:00'
+);
+INSERT INTO users (id, email, name, age) VALUES (1, 'ada@example.org', 'Ada', 36), (2, 'bob@example.org', 'Bob', 25);
+INSERT INTO users (id, email) VALUES (3, 'cy@example.org') RETURNING *;
+id|email|name|age|active|created
+3|cy@example.org|NULL|NULL|t|2024-01-01 00:00:00
+(1 row)
+SELECT * FROM users ORDER BY id;
+id|email|name|age|active|created
+1|ada@example.org|Ada|36|t|2024-01-01 00:00:00
+2|bob@example.org|Bob|25|t|2024-01-01 00:00:00
+3|cy@example.org|NULL|NULL|t|2024-01-01 00:00:00
+(3 rows)
+SELECT id, name FROM users WHERE age > 30;
+id|name
+1|Ada
+(1 row)
+SELECT count(*), count(age), sum(age), avg(age), min(name), max(name) FROM users;
+count|count|sum|avg|min|max
+3|2|61|30.5000000000000000|Ada|Bob
+(1 row)
+-- constraint violations
+INSERT INTO users (id, email) VALUES (1, 'dup@example.org');
+ERROR:  23505
+INSERT INTO users (id, email) VALUES (4, 'ada@example.org');
+ERROR:  23505
+INSERT INTO users (id, email) VALUES (4, NULL);
+ERROR:  23502
+INSERT INTO users (id, email, age) VALUES (4, 'neg@example.org', -1);
+ERROR:  23514
+INSERT INTO users (id, email, name) VALUES (4, 'long@example.org', 'a name that is far too long');
+ERROR:  22001
+INSERT INTO users (id, email, age) VALUES (4, 'type@example.org', 'old');
+ERROR:  22P02
+INSERT INTO users (id, nosuch) VALUES (4, 1);
+ERROR:  42703
+INSERT INTO users (id, email) VALUES (4, 'a', 'b');
+ERROR:  42601
+SELECT count(*) FROM users;
+count
+3
+(1 row)
+-- update and delete
+UPDATE users SET age = age + 1 WHERE id = 1 RETURNING id, age;
+id|age
+1|37
+(1 row)
+UPDATE users SET name = upper(name), active = false WHERE age IS NULL;
+UPDATE users SET id = 2 WHERE id = 1;
+ERROR:  23505
+UPDATE users SET email = 'bob@example.org' WHERE id = 1;
+ERROR:  23505
+SELECT id, name, age, active FROM users ORDER BY id;
+id|name|age|active
+1|Ada|37|t
+2|Bob|25|t
+3|NULL|NULL|f
+(3 rows)
+DELETE FROM users WHERE id = 3 RETURNING email;
+email
+cy@example.org
+(1 row)
+DELETE FROM users WHERE id = 99;
+SELECT count(*) FROM users;
+count
+2
+(1 row)
+-- upsert
+INSERT INTO users (id, email, name) VALUES (1, 'ada@example.org', 'Ada L.') ON CONFLICT (id) DO UPDATE SET name = excluded.name RETURNING id, name;
+id|name
+1|Ada L.
+(1 row)
+INSERT INTO users (id, email, name) VALUES (2, 'x@example.org', 'X') ON CONFLICT DO NOTHING;
+INSERT INTO users (id, email, name) VALUES (5, 'bob@example.org', 'X') ON CONFLICT (email) DO UPDATE SET name = users.name || '!' WHERE users.id = 2;
+SELECT id, email, name FROM users ORDER BY id;
+id|email|name
+1|ada@example.org|Ada L.
+2|bob@example.org|Bob!
+(2 rows)
+-- serial and defaults
+CREATE TABLE items (id serial PRIMARY KEY, label text DEFAULT 'none', qty int DEFAULT 1 + 1);
+INSERT INTO items DEFAULT VALUES;
+INSERT INTO items (label) VALUES ('a'), ('b');
+INSERT INTO items (label, qty) VALUES (DEFAULT, 7) RETURNING id, label, qty;
+id|label|qty
+4|none|7
+(1 row)
+SELECT * FROM items ORDER BY id;
+id|label|qty
+1|none|2
+2|a|2
+3|b|2
+4|none|7
+(4 rows)
+-- foreign keys
+CREATE TABLE orders (id int PRIMARY KEY, user_id bigint NOT NULL REFERENCES users (id), item_id int REFERENCES items (id) ON DELETE SET NULL);
+INSERT INTO orders VALUES (1, 1, 1), (2, 2, 2);
+INSERT INTO orders VALUES (3, 99, 1);
+ERROR:  23503
+DELETE FROM users WHERE id = 1;
+ERROR:  23503
+DELETE FROM items WHERE id = 2;
+SELECT * FROM orders ORDER BY id;
+id|user_id|item_id
+1|1|1
+2|2|NULL
+(2 rows)
+CREATE TABLE lines (order_id int REFERENCES orders (id) ON DELETE CASCADE, n int, PRIMARY KEY (order_id, n));
+INSERT INTO lines VALUES (1, 1), (1, 2), (2, 1);
+DELETE FROM orders WHERE id = 1;
+SELECT * FROM lines ORDER BY 1, 2;
+order_id|n
+2|1
+(1 row)
+-- drop and truncate
+DROP TABLE users;
+ERROR:  2BP01
+TRUNCATE lines;
+SELECT count(*) FROM lines;
+count
+0
+(1 row)
+DROP TABLE lines, orders;
+DROP TABLE users;
+DROP TABLE nosuch;
+ERROR:  42P01
+DROP TABLE IF EXISTS nosuch;

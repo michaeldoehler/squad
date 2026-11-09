@@ -299,9 +299,17 @@ impl<'p> Runner<'p> {
 }
 
 fn json_result(tree: Json, ret: &Type) -> Value {
-    match ret {
-        Type::Json => Value::Json(tree.to_string()),
-        _ => Value::Jsonb(Box::new(tree)),
+    match (ret, tree) {
+        // `json` aggregates print with the spacing Postgres uses.
+        (Type::Json, Json::Array(items)) => {
+            Value::Json(format!("[{}]", items.iter().map(Json::to_string).collect::<Vec<_>>().join(", ")))
+        }
+        (Type::Json, Json::Object(map)) => {
+            let fields: Vec<String> = map.iter().map(|(k, v)| format!("{} : {v}", Json::String(k.clone()))).collect();
+            Value::Json(format!("{{ {} }}", fields.join(", ")))
+        }
+        (Type::Json, tree) => Value::Json(tree.to_string()),
+        (_, tree) => Value::Jsonb(Box::new(tree)),
     }
 }
 
@@ -375,7 +383,7 @@ fn frame_bounds(
         s.dedup();
         s
     };
-    let mut range_pos = |offset: Option<&Value>, preceding: bool, is_start: bool, cx: &mut ExecCx| -> Result<usize> {
+    let range_pos = |offset: Option<&Value>, preceding: bool, is_start: bool, cx: &mut ExecCx| -> Result<usize> {
         let off = offset.ok_or_else(|| Error::internal("frame offset missing"))?;
         let cur = &order_vals[pos][0];
         if cur.is_null() {

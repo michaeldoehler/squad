@@ -1,0 +1,129 @@
+-- Aggregation and grouping.
+CREATE TABLE sales (id int PRIMARY KEY, region text, product text, qty int, price numeric(8,2), sold date);
+INSERT INTO sales VALUES (1, 'north', 'apple', 10, 1.50, '2024-01-05'), (2, 'north', 'pear', 5, 2.00, '2024-01-06'), (3, 'south', 'apple', 7, 1.60, '2024-02-01'), (4, 'south', 'apple', NULL, 1.55, '2024-02-03'), (5, 'east', 'fig', 1, 9.99, '2024-03-10'), (6, NULL, 'fig', 2, 9.50, '2024-03-11');
+SELECT count(*), count(qty), count(DISTINCT product), count(DISTINCT region) FROM sales;
+count|count|count|count
+6|5|3|3
+(1 row)
+SELECT sum(qty), avg(qty), min(qty), max(qty), sum(price), avg(price) FROM sales;
+sum|avg|min|max|sum|avg
+25|5.0000000000000000|1|10|26.14|4.3566666666666667
+(1 row)
+SELECT region, count(*), sum(qty) FROM sales GROUP BY region ORDER BY region NULLS FIRST;
+region|count|sum
+NULL|1|2
+east|1|1
+north|2|15
+south|2|7
+(4 rows)
+SELECT region, product, sum(qty * price) AS revenue FROM sales GROUP BY region, product ORDER BY 1 NULLS LAST, 2;
+region|product|revenue
+east|fig|9.99
+north|apple|15.00
+north|pear|10.00
+south|apple|11.20
+NULL|fig|19.00
+(5 rows)
+SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) > 1 ORDER BY product;
+product|count
+apple|3
+fig|2
+(2 rows)
+SELECT product, sum(qty) FROM sales WHERE region IS NOT NULL GROUP BY 1 HAVING sum(qty) >= 10 ORDER BY 2 DESC;
+product|sum
+apple|17
+(1 row)
+SELECT upper(product) AS p, max(price) FROM sales GROUP BY p ORDER BY p;
+p|max
+APPLE|1.60
+FIG|9.99
+PEAR|2.00
+(3 rows)
+SELECT extract(month FROM sold) AS m, count(*) FROM sales GROUP BY m ORDER BY m;
+m|count
+1|2
+2|2
+3|2
+(3 rows)
+SELECT region, string_agg(product, ',' ORDER BY product) FROM sales GROUP BY region ORDER BY region NULLS LAST;
+region|string_agg
+east|fig
+north|apple,pear
+south|apple,apple
+NULL|fig
+(4 rows)
+SELECT array_agg(qty ORDER BY id), array_agg(DISTINCT product ORDER BY product) FROM sales;
+array_agg|array_agg
+{10,5,7,NULL,1,2}|{apple,fig,pear}
+(1 row)
+SELECT bool_and(qty > 0), bool_or(qty > 9), every(price > 1) FROM sales;
+bool_and|bool_or|every
+t|t|t
+(1 row)
+SELECT count(*) FILTER (WHERE region = 'north'), sum(qty) FILTER (WHERE product = 'apple') FROM sales;
+count|sum
+2|17
+(1 row)
+SELECT sum(qty), count(*) FROM sales WHERE false;
+sum|count
+NULL|0
+(1 row)
+SELECT region, sum(qty) FROM sales WHERE false GROUP BY region;
+region|sum
+(0 rows)
+SELECT max(sold), min(sold), max(product), min(region) FROM sales;
+max|min|max|min
+2024-03-11|2024-01-05|pear|east
+(1 row)
+SELECT sum(qty)::float8 / count(*), round(avg(price), 3), stddev_pop(qty)::numeric(10,4), variance(qty)::numeric(10,4) FROM sales;
+?column?|round|stddev_pop|variance
+4.166666666666667|4.357|3.2863|13.5000
+(1 row)
+SELECT json_agg(id ORDER BY id), jsonb_object_agg(id, product ORDER BY id) FROM sales WHERE id <= 2;
+json_agg|jsonb_object_agg
+[1, 2]|{"1": "apple", "2": "pear"}
+(1 row)
+SELECT s.id, s.region FROM sales s GROUP BY s.id ORDER BY s.id LIMIT 2;
+id|region
+1|north
+2|north
+(2 rows)
+SELECT DISTINCT region FROM sales ORDER BY region NULLS FIRST;
+region
+NULL
+east
+north
+south
+(4 rows)
+SELECT DISTINCT product, region IS NULL FROM sales ORDER BY 1, 2;
+product|?column?
+apple|f
+fig|f
+fig|t
+pear|f
+(4 rows)
+SELECT DISTINCT ON (product) product, qty, id FROM sales ORDER BY product, qty DESC NULLS LAST;
+product|qty|id
+apple|10|1
+fig|2|6
+pear|5|2
+(3 rows)
+SELECT region, sum(qty) FROM sales GROUP BY region ORDER BY sum(qty) DESC NULLS LAST, region LIMIT 2;
+region|sum
+north|15
+south|7
+(2 rows)
+SELECT count(*) FROM (SELECT DISTINCT region, product FROM sales) x;
+count
+5
+(1 row)
+SELECT product, qty FROM sales GROUP BY product;
+ERROR:  42803
+SELECT sum(product) FROM sales;
+ERROR:  42883
+SELECT count(*) FROM sales WHERE sum(qty) > 1;
+ERROR:  42803
+SELECT max(sum(qty)) FROM sales;
+ERROR:  42803
+SELECT region FROM sales GROUP BY 7;
+ERROR:  42P10

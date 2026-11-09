@@ -407,7 +407,7 @@ impl<'a> Binder<'a> {
             return Err(Error::unsupported("FETCH FIRST ... WITH TIES"));
         }
         let scope = Scope::default();
-        let mut bind = |b: &mut Self, n: &Option<Box<pb::Node>>, what: &'static str| -> Result<Option<Expr>> {
+        let bind = |b: &mut Self, n: &Option<Box<pb::Node>>, what: &'static str| -> Result<Option<Expr>> {
             let Some(n) = n else { return Ok(None) };
             if matches!(n.node.as_ref(), Some(N::AConst(c)) if c.isnull) {
                 return Ok(None);

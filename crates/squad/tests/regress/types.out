@@ -1,0 +1,205 @@
+-- Data types: storage, formatting, casts and comparisons.
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TABLE ty (
+    id int PRIMARY KEY, i2 smallint, i8 bigint, f4 real, f8 double precision, n numeric(12,4), nn numeric,
+    t text, vc varchar(5), c char(4), b bytea, bo boolean, d date, tm time, ts timestamp, tz timestamptz,
+    iv interval, u uuid, j json, jb jsonb, ia int[], ta text[], m mood
+);
+INSERT INTO ty VALUES (1, 32767, 9223372036854775807, 1.5, 2.5e10, 1234.5678, 0.000123, 'héllo', 'abc', 'x', '\xdeadbeef', true,
+    '2024-02-29', '13:14:15.123456', '2024-02-29 13:14:15', '2024-02-29 13:14:15+02', '1 year 2 mons 3 days 04:05:06',
+    'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '{"a" : 1}', '{"b": 2, "a": [1, 2, {"c": null}]}', '{1,2,NULL}', '{"a b",c}', 'happy');
+INSERT INTO ty (id) VALUES (2);
+SELECT id, i2, i8, f4, f8, n, nn FROM ty ORDER BY id;
+id|i2|i8|f4|f8|n|nn
+1|32767|9223372036854775807|1.5|25000000000|1234.5678|0.000123
+2|NULL|NULL|NULL|NULL|NULL|NULL
+(2 rows)
+SELECT id, t, vc, c || '|', b, bo FROM ty ORDER BY id;
+id|t|vc|?column?|b|bo
+1|héllo|abc|x||\xdeadbeef|t
+2|NULL|NULL|NULL|NULL|NULL
+(2 rows)
+SELECT id, d, tm, ts, tz, iv FROM ty ORDER BY id;
+id|d|tm|ts|tz|iv
+1|2024-02-29|13:14:15.123456|2024-02-29 13:14:15|2024-02-29 11:14:15+00|1 year 2 mons 3 days 04:05:06
+2|NULL|NULL|NULL|NULL|NULL
+(2 rows)
+SELECT id, u, j, jb, ia, ta, m FROM ty ORDER BY id;
+id|u|j|jb|ia|ta|m
+1|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|{"a" : 1}|{"a": [1, 2, {"c": null}], "b": 2}|{1,2,NULL}|{"a b",c}|happy
+2|NULL|NULL|NULL|NULL|NULL|NULL
+(2 rows)
+SELECT pg_typeof(i2), pg_typeof(i8), pg_typeof(n), pg_typeof(t), pg_typeof(bo), pg_typeof(tz), pg_typeof(ia), pg_typeof(m) FROM ty WHERE id = 1;
+pg_typeof|pg_typeof|pg_typeof|pg_typeof|pg_typeof|pg_typeof|pg_typeof|pg_typeof
+smallint|bigint|numeric|text|boolean|timestamp with time zone|integer[]|mood
+(1 row)
+-- integers and overflow
+SELECT 32767::smallint + 1::smallint;
+ERROR:  22003
+SELECT 9223372036854775807 + 1;
+ERROR:  22003
+SELECT (-2147483648)::int / -1;
+ERROR:  22003
+SELECT 1::smallint + 1::bigint, pg_typeof(1::smallint + 1::bigint), pg_typeof(1 + 1.5), pg_typeof(1 + 1.5::float4), pg_typeof(1::numeric + 1.5::float8);
+?column?|pg_typeof|pg_typeof|pg_typeof|pg_typeof
+2|bigint|numeric|double precision|double precision
+(1 row)
+SELECT 7 / 2, -7 / 2, 7 % -2, 7.5 % 2, abs(-3), mod(10, 3), div(7.5, 2);
+?column?|?column?|?column?|?column?|abs|mod|div
+3|-3|1|1.5|3|1|3
+(1 row)
+-- numeric
+SELECT 1.10 + 2.205, 1.5 * 2.25, 10 / 3.0, 1::numeric / 3, round(2.5), round(-2.5), round(3.14159, 2), trunc(-3.99), ceil(2.1), floor(-2.1);
+?column?|?column?|?column?|?column?|round|round|round|trunc|ceil|floor
+3.305|3.375|3.3333333333333333|0.33333333333333333333|3|-3|3.14|-3|3|-3
+(1 row)
+SELECT 0.1 + 0.2 = 0.3, 0.1::float8 + 0.2::float8 = 0.3::float8, 1e-3::numeric, 123.456::numeric(5,1), 2 ^ 0.5;
+?column?|?column?|numeric|numeric|?column?
+t|f|0.001|123.5|1.4142135623730950
+(1 row)
+SELECT 99999.99999::numeric(7,2);
+ERROR:  22003
+SELECT 100000::numeric(7,2);
+ERROR:  22003
+-- floats
+SELECT 1.0::float8 / 3, 1e300::float8 * 10, 'NaN'::float8, 'Infinity'::float8, -'Infinity'::float8, 3::float4 / 7, 0.1::float4;
+?column?|?column?|float8|float8|?column?|?column?|float4
+0.3333333333333333|1e+301|NaN|Infinity|-Infinity|0.42857142857142855|0.1
+(1 row)
+SELECT 1e300::float8 * 1e300::float8;
+ERROR:  22003
+-- text and char
+SELECT 'abc'::varchar(2), 'ab'::char(4) || '|', length('ab'::char(4)), 'a' = 'a  '::char(3);
+varchar|?column?|length|?column?
+ab|ab||2|t
+(1 row)
+INSERT INTO ty (id, vc) VALUES (3, 'toolong');
+ERROR:  22001
+INSERT INTO ty (id, vc) VALUES (3, 'ok   ');
+SELECT vc || '|' FROM ty WHERE id = 3;
+?column?
+ok   |
+(1 row)
+-- booleans
+SELECT 't'::boolean, 'no'::boolean, 'ON'::boolean, 0::boolean, true::int, true::text, NOT true, true > false;
+bool|bool|bool|bool|int4|text|?column?|?column?
+t|f|t|f|1|true|f|t
+(1 row)
+SELECT 'maybe'::boolean;
+ERROR:  22P02
+-- dates and times
+SELECT '2024-01-31'::date + 1, '2024-03-01'::date - 1, '2024-03-01'::date - '2023-03-01'::date, '2024-01-15'::date + interval '1 month 2 days';
+?column?|?column?|?column?|?column?
+2024-02-01|2024-02-29|366|2024-02-17 00:00:00
+(1 row)
+SELECT '2024-02-30'::date;
+ERROR:  22008
+SELECT timestamp '2024-01-01 10:00:00' + interval '90 minutes', timestamp '2024-03-10 00:00:00' - timestamp '2024-03-01 12:00:00';
+?column?|?column?
+2024-01-01 11:30:00|8 days 12:00:00
+(1 row)
+SELECT extract(year FROM date '2024-07-04'), extract(dow FROM date '2024-07-04'), extract(epoch FROM timestamp '2024-01-01 00:00:00'), date_trunc('month', timestamp '2024-07-04 12:34:56');
+extract|extract|extract|date_trunc
+2024|4|1704067200.000000|2024-07-01 00:00:00
+(1 row)
+SELECT '2024-06-01 12:00:00+00'::timestamptz AT TIME ZONE 'Europe/Berlin', '2024-06-01 12:00:00'::timestamp AT TIME ZONE 'America/New_York';
+timezone|timezone
+2024-06-01 14:00:00|2024-06-01 16:00:00+00
+(1 row)
+SELECT to_char(timestamp '2024-07-04 08:05:09', 'YYYY-MM-DD HH24:MI:SS'), to_char(date '2024-07-04', 'Dy, DD Mon YYYY'), to_char(1234.5, '9,999.00');
+to_char|to_char|to_char
+2024-07-04 08:05:09|Thu, 04 Jul 2024| 1,234.50
+(1 row)
+SELECT interval '1 day' * 3, interval '1 hour' / 2, interval '25 hours', justify_hours(interval '25 hours'), age(date '2024-03-01', date '2023-01-15');
+?column?|?column?|interval|justify_hours|age
+3 days|00:30:00|25:00:00|1 day 01:00:00|1 year 1 mon 17 days
+(1 row)
+SELECT date '2024-01-01' < timestamp '2024-01-01 00:00:01', '2024-01-01'::date = '2024-01-01 00:00:00'::timestamp;
+?column?|?column?
+t|t
+(1 row)
+-- uuid, bytea
+SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid < 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid;
+uuid|?column?
+a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|t
+(1 row)
+SELECT 'not-a-uuid'::uuid;
+ERROR:  22P02
+SELECT '\x00ff'::bytea, 'abc'::bytea, length('\x00ff'::bytea), encode('\x00ff'::bytea, 'base64'), decode('3q2+7w==', 'base64');
+bytea|bytea|length|encode|decode
+\x00ff|\x616263|2|AP8=|\xdeadbeef
+(1 row)
+-- json
+SELECT j -> 'a', j ->> 'a', jb -> 'a' -> 2, jb #>> '{a,0}', jb ? 'b', jb @> '{"b": 2}', jsonb_typeof(jb -> 'a') FROM ty WHERE id = 1;
+?column?|?column?|?column?|?column?|?column?|?column?|jsonb_typeof
+1|1|{"c": null}|1|t|t|array
+(1 row)
+SELECT jsonb_build_object('a', 1, 'b', ARRAY[1, 2]), json_build_array(1, 'x', NULL, true), to_jsonb('x'::text), jsonb_array_length('[1,2,3]');
+jsonb_build_object|json_build_array|to_jsonb|jsonb_array_length
+{"a": 1, "b": [1, 2]}|[1, "x", null, true]|"x"|3
+(1 row)
+SELECT '{"a":1}'::jsonb || '{"b":2}'::jsonb, '{"a":1,"b":2}'::jsonb - 'a', jsonb_set('{"a":{"b":1}}', '{a,b}', '2'), '[1,2]'::jsonb = '[1, 2]'::jsonb;
+?column?|?column?|jsonb_set|?column?
+{"a": 1, "b": 2}|{"b": 2}|{"a": {"b": 2}}|t
+(1 row)
+SELECT '{bad json'::jsonb;
+ERROR:  22P02
+-- arrays
+SELECT ia[1], ia[3], ia[9], array_length(ia, 1), ta[1], cardinality(ta), 2 = ANY (ia), ia @> ARRAY[1], array_append(ia, 4), array_to_string(ta, '-') FROM ty WHERE id = 1;
+ia|ia|ia|array_length|ta|cardinality|?column?|?column?|array_append|array_to_string
+1|NULL|NULL|3|a b|2|t|t|{1,2,NULL,4}|a b-c
+(1 row)
+SELECT ARRAY[1, 2] || ARRAY[3], ARRAY[1, 2] = ARRAY[1, 2], ARRAY[1, 2] < ARRAY[1, 3], '{}'::int[], array_remove(ARRAY[1, 2, 1], 1), ARRAY[]::text[], (ARRAY[1, 2, 3, 4])[2:3];
+?column?|?column?|?column?|int4|array_remove|array|array
+{1,2,3}|t|t|{}|{2}|{}|{2,3}
+(1 row)
+SELECT unnest(ARRAY[3, 1, 2]) AS x ORDER BY x;
+x
+1
+2
+3
+(3 rows)
+SELECT * FROM unnest(ARRAY['a', 'b'], ARRAY[1, 2, 3]) AS u (s, n) ORDER BY n;
+s|n
+a|1
+b|2
+NULL|3
+(3 rows)
+-- enums
+SELECT m, m > 'ok', m::text || '!' FROM ty WHERE id = 1;
+m|?column?|?column?
+happy|t|happy!
+(1 row)
+INSERT INTO ty (id, m) VALUES (4, 'sad'), (5, 'ok');
+SELECT id, m FROM ty WHERE m IS NOT NULL ORDER BY m DESC, id;
+id|m
+1|happy
+5|ok
+4|sad
+(3 rows)
+SELECT id FROM ty WHERE m = 'ok';
+id
+5
+(1 row)
+INSERT INTO ty (id, m) VALUES (6, 'furious');
+ERROR:  22P02
+SELECT 'happy'::mood, 'sad'::mood < 'happy'::mood;
+mood|?column?
+happy|t
+(1 row)
+-- NULL handling in sorting and comparison
+SELECT id FROM ty ORDER BY i2 NULLS FIRST, id LIMIT 3;
+id
+2
+3
+4
+(3 rows)
+SELECT id FROM ty ORDER BY i2 DESC, id LIMIT 2;
+id
+2
+3
+(2 rows)
+SELECT NULL::int + 1, NULL || 'a', coalesce(NULL::text, 'x'), NULL IS NOT DISTINCT FROM NULL, (1, NULL) IS NULL, ROW(NULL, NULL) IS NULL;
+?column?|?column?|coalesce|?column?|?column?|?column?
+NULL|NULL|x|t|f|t
+(1 row)

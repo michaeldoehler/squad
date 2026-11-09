@@ -1,0 +1,22 @@
+-- Literals, operators and simple expressions.
+SELECT 1 AS one, 'text' AS t, true AS b, NULL AS n, 1.5 AS num, 2e3 AS f;
+SELECT 1 + 2 * 3, 7 / 2, 7 % 3, -5 / 2, 7.0 / 2, 2 ^ 10;
+SELECT 'a' || 'b' || 1, upper('abc'), length('héllo'), substring('hello' from 2 for 3);
+SELECT 1 = 1, 1 <> 2, 'a' < 'b', NULL = NULL, NULL IS NULL, 1 IS DISTINCT FROM NULL;
+SELECT true AND NULL, false AND NULL, true OR NULL, false OR NULL, NOT NULL::boolean;
+SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END, CASE 3 WHEN 1 THEN 'one' WHEN 3 THEN 'three' END;
+SELECT coalesce(NULL, NULL, 3), nullif(1, 1), nullif(1, 2), greatest(1, 5, 3), least('b', 'a');
+SELECT 5 BETWEEN 1 AND 10, 5 NOT BETWEEN 1 AND 3, 2 IN (1, 2, 3), 4 NOT IN (1, 2, 3), 1 IN (2, NULL);
+SELECT 'abc' LIKE 'a%', 'abc' ILIKE 'A_C', 'abc' NOT LIKE '%z', 'abc' ~ '^a.c$', 'ABC' ~* 'b';
+SELECT '42'::int + 1, 42::text || 'x', '3.14'::numeric * 2, 1::boolean, 'yes'::boolean, 3.7::int, -3.5::int;
+SELECT cast('2024-02-29' AS date) + 1, date '2024-03-01' - date '2024-02-01', '2024-01-31'::date + interval '1 month';
+SELECT ARRAY[1, 2, 3], ARRAY['a', 'b'] || 'c', (ARRAY[10, 20, 30])[2], array_length(ARRAY[1, 2], 1), 2 = ANY (ARRAY[1, 2]);
+SELECT '{"a": 1, "b": [1, 2]}'::jsonb -> 'b' -> 0, '{"a": {"b": "c"}}'::jsonb #>> '{a,b}', '{"a": 1}'::jsonb @> '{"a": 1}';
+SELECT 1 / 0;
+SELECT 'abc'::int;
+SELECT 2147483647 + 1;
+SELECT nosuchcolumn;
+SELECT nosuchfunction(1);
+SELECT 1 +;
+SELECT * FROM nosuchtable;
+SELECT 1 WHERE 'x';

@@ -1,0 +1,26 @@
+-- Window functions.
+CREATE TABLE w (id int PRIMARY KEY, grp text, v int);
+INSERT INTO w VALUES (1, 'a', 10), (2, 'a', 20), (3, 'a', 20), (4, 'b', 5), (5, 'b', NULL), (6, 'c', 7);
+SELECT id, row_number() OVER (ORDER BY id), count(*) OVER () FROM w ORDER BY id;
+SELECT id, grp, row_number() OVER (PARTITION BY grp ORDER BY id) FROM w ORDER BY id;
+SELECT id, v, rank() OVER (ORDER BY v), dense_rank() OVER (ORDER BY v) FROM w ORDER BY v NULLS LAST, id;
+SELECT id, v, rank() OVER (PARTITION BY grp ORDER BY v DESC NULLS LAST) FROM w ORDER BY id;
+SELECT id, sum(v) OVER (PARTITION BY grp), avg(v) OVER (PARTITION BY grp) FROM w ORDER BY id;
+SELECT id, sum(v) OVER (ORDER BY id) AS running FROM w ORDER BY id;
+SELECT id, sum(v) OVER (ORDER BY v) AS running_with_peers FROM w ORDER BY v NULLS LAST, id;
+SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM w ORDER BY id;
+SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM w ORDER BY id;
+SELECT id, max(v) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM w ORDER BY id;
+SELECT id, count(v) OVER (ORDER BY id RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) FROM w ORDER BY id;
+SELECT id, lag(v) OVER (ORDER BY id), lead(v) OVER (ORDER BY id), lag(v, 2, -1) OVER (ORDER BY id) FROM w ORDER BY id;
+SELECT id, first_value(v) OVER (PARTITION BY grp ORDER BY id), last_value(v) OVER (PARTITION BY grp ORDER BY id), nth_value(v, 2) OVER (PARTITION BY grp ORDER BY id) FROM w ORDER BY id;
+SELECT id, ntile(2) OVER (ORDER BY id), ntile(4) OVER (ORDER BY id) FROM w ORDER BY id;
+SELECT id, percent_rank() OVER (ORDER BY v), cume_dist() OVER (ORDER BY v) FROM w WHERE v IS NOT NULL ORDER BY v, id;
+SELECT id, sum(v) OVER win, count(*) OVER win FROM w WINDOW win AS (PARTITION BY grp ORDER BY id) ORDER BY id;
+SELECT grp, sum(v), rank() OVER (ORDER BY sum(v) DESC NULLS LAST) FROM w GROUP BY grp ORDER BY grp;
+SELECT grp, sum(v), sum(sum(v)) OVER () FROM w GROUP BY grp ORDER BY grp;
+SELECT * FROM (SELECT id, row_number() OVER (PARTITION BY grp ORDER BY v DESC NULLS LAST) AS rn FROM w) s WHERE rn = 1 ORDER BY id;
+SELECT id, string_agg(grp, '') OVER (ORDER BY id) FROM w ORDER BY id;
+SELECT id FROM w WHERE row_number() OVER () = 1;
+SELECT row_number() FROM w;
+SELECT rank() OVER (ORDER BY rank() OVER ()) FROM w;

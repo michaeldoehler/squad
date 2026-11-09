@@ -209,7 +209,8 @@ pub(crate) fn deparse_expr(expr: &pb::Node) -> Result<String> {
         node: Some(N::ResTarget(Box::new(pb::ResTarget { val: Some(Box::new(expr.clone())), ..Default::default() }))),
     };
     let select =
-        pb::SelectStmt { target_list: vec![target], op: pb::SetOperation::SetopNone as i32, ..Default::default() };
+        pb::SelectStmt { target_list: vec![target], op: pb::SetOperation::SetopNone as i32,
+        limit_option: pb::LimitOption::Default as i32, ..Default::default() };
     let sql = deparse_stmt(&pb::Node { node: Some(N::SelectStmt(Box::new(select))) })?;
     Ok(sql.strip_prefix("SELECT ").unwrap_or(&sql).to_string())
 }
@@ -478,37 +479,32 @@ mod typmod {
         (args[0].as_str().unwrap_or_default(), n)
     }
 
-    fn check(args: &[Value], kind: &str, pad: bool) -> Result<Value> {
+        /// `char(n)` values are stored without their padding: trailing spaces
+    /// are insignificant for the type, and every operation that converts
+    /// to text drops them anyway.
+    fn unpadded(s: &str) -> Value {
+        Value::Text(s.trim_end_matches(' ').to_string())
+    }
+
+    fn check(args: &[Value], kind: &str, bpchar: bool) -> Result<Value> {
         let (s, n) = parts(args);
         let len = s.chars().count();
         if len <= n {
-            return Ok(if pad && len < n {
-                Value::Text(format!("{s}{}", " ".repeat(n - len)))
-            } else {
-                args[0].clone()
-            });
+            return Ok(if bpchar { unpadded(s) } else { args[0].clone() });
         }
         // Excess characters may be dropped only if they are all spaces.
         let cut = s.char_indices().nth(n).map_or(s.len(), |(i, _)| i);
-        if s[cut..].chars().all(|c| c == ' ') {
-            Ok(Value::Text(s[..cut].to_string()))
+                if s[cut..].chars().all(|c| c == ' ') {
+            Ok(if bpchar { unpadded(&s[..cut]) } else { Value::Text(s[..cut].to_string()) })
         } else {
             Err(too_long(kind, n))
         }
     }
 
-    fn truncate(args: &[Value], pad: bool) -> Result<Value> {
+        fn truncate(args: &[Value], bpchar: bool) -> Result<Value> {
         let (s, n) = parts(args);
-        let len = s.chars().count();
-        if len <= n {
-            return Ok(if pad && len < n {
-                Value::Text(format!("{s}{}", " ".repeat(n - len)))
-            } else {
-                args[0].clone()
-            });
-        }
         let cut = s.char_indices().nth(n).map_or(s.len(), |(i, _)| i);
-        Ok(Value::Text(s[..cut].to_string()))
+        Ok(if bpchar { unpadded(&s[..cut]) } else { Value::Text(s[..cut].to_string()) })
     }
 
     pub(super) fn varchar_check(_: &FnCtx, args: &[Value]) -> Result<Value> {

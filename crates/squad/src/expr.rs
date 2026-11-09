@@ -260,7 +260,7 @@ impl Expr {
         if let Some(r) = f(&self)? {
             return Ok(r);
         }
-        let mut list = |v: Vec<Expr>, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>| -> Result<Vec<Expr>> {
+        let list = |v: Vec<Expr>, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>| -> Result<Vec<Expr>> {
             v.into_iter().map(|e| e.rewrite(f)).collect()
         };
         let bx = |e: Box<Expr>, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>| -> Result<Box<Expr>> {

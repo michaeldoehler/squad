@@ -57,6 +57,8 @@ pub(crate) fn srf(name: &str) -> Option<Srf> {
     Some(match name {
         "generate_series" => Srf::GenerateSeries,
         "unnest" => Srf::Unnest,
+        // Without table inheritance a relation's only ancestor is itself.
+        "pg_partition_ancestors" | "pg_inherits_ancestors" => Srf::Unnest,
         "json_array_elements" | "jsonb_array_elements" => Srf::JsonArrayElements { text: false },
         "json_array_elements_text" | "jsonb_array_elements_text" => Srf::JsonArrayElements { text: true },
         "json_each" | "jsonb_each" => Srf::JsonEach { text: false },
@@ -364,7 +366,11 @@ impl<'a> Binder<'a> {
         if matches!(type_name.as_str(), "regclass" | "regtype" | "regproc" | "regnamespace") {
             let (e, t) = self.bind_expr(arg, scope)?;
             if t.is_integer() {
-                return Ok((self.coerce(e, &t, &Type::Int8)?, Type::Int8));
+                // There is no regclass type: casting an OID to one yields
+                // the object's name, which is what such casts are used
+                // for (display); casting a name yields the OID.
+                let e = self.coerce(e, &t, &Type::Int8)?;
+                return Ok((Expr::Session(SessionFn::Catalog(format!("{type_name}_out")), vec![e]), Type::Text));
             }
             let e = self.coerce(e, &t, &Type::Text)?;
             return Ok((Expr::Session(SessionFn::Catalog(type_name), vec![e]), Type::Int8));
@@ -476,7 +482,7 @@ impl<'a> Binder<'a> {
                 let [lo, hi] = list.items.as_slice() else { return Err(Error::internal("BETWEEN needs two bounds")) };
                 let lo = self.bind_expr(lo, scope)?;
                 let hi = self.bind_expr(hi, scope)?;
-                let mut range = |b: &mut Self, lo: Typed, hi: Typed| -> Result<Expr> {
+                let range = |b: &mut Self, lo: Typed, hi: Typed| -> Result<Expr> {
                     Ok(Expr::And(vec![
                         b.bind_op(">=", Some(l.clone()), lo)?.0,
                         b.bind_op("<=", Some(l.clone()), hi)?.0,
@@ -579,8 +585,7 @@ impl<'a> Binder<'a> {
         }
         if window_func(&name).is_some() {
             return Err(Error::new(
-                sqlstate::WINDOWING_ERROR,
-                format!("window function {name} requires an OVER clause"),
+                sqlstate::WRONG_OBJECT_TYPE, format!("window function {name} requires an OVER clause"),
             ));
         }
         if f.agg_distinct || !f.agg_order.is_empty() || f.agg_filter.is_some() {
@@ -697,7 +702,7 @@ impl<'a> Binder<'a> {
     ) -> Result<(Vec<Expr>, Vec<(String, Type)>)> {
         let types: Vec<Type> = args.iter().map(|(_, t)| t.clone()).collect();
         let bad = || undefined_function(name, &types);
-        let mut coerce_all = |b: &mut Self, want: &[Type]| -> Result<Vec<Expr>> {
+        let coerce_all = |b: &mut Self, want: &[Type]| -> Result<Vec<Expr>> {
             args.iter().cloned().zip(want).map(|((e, t), w)| b.coerce(e, &t, w)).collect()
         };
         Ok(match kind {
@@ -724,6 +729,15 @@ impl<'a> Binder<'a> {
                 };
                 let want = [elem.clone(), elem.clone(), step];
                 (coerce_all(self, &want[..types.len()])?, vec![(name.to_string(), elem)])
+            }
+            Srf::Unnest if name != "unnest" => {
+                // pg_partition_ancestors(regclass): the relation itself.
+                if types.len() != 1 {
+                    return Err(bad());
+                }
+                let (e, t) = args[0].clone();
+                let oid = self.coerce(e, &t, &Type::Int8)?;
+                (vec![Expr::Array(vec![oid])], vec![("relid".to_string(), Type::Int8)])
             }
             Srf::Unnest => {
                 if types.is_empty() {
@@ -786,7 +800,7 @@ impl<'a> Binder<'a> {
         })
     }
 
-    fn bind_agg_call(&mut self, f: &pb::FuncCall, name: &str, scope: &Scope) -> Result<AggCall> {
+    fn bind_agg_call(&mut self, f: &pb::FuncCall, name: &str, scope: &Scope, nested_aggs: bool) -> Result<AggCall> {
         let func = if f.agg_star {
             AggFunc::CountStar
         } else {
@@ -797,7 +811,7 @@ impl<'a> Binder<'a> {
         }
         // Aggregate arguments belong to this query level but must not
         // contain aggregates themselves.
-        let saved = self.agg_levels.last_mut().map(|l| std::mem::replace(&mut l.allow_aggs, false));
+        let saved = self.agg_levels.last_mut().map(|l| std::mem::replace(&mut l.allow_aggs, nested_aggs));
         let result = (|| -> Result<AggCall> {
             let mut args = Vec::with_capacity(f.args.len());
             for a in &f.args {
@@ -821,11 +835,13 @@ impl<'a> Binder<'a> {
                     (_, _, Type::Unknown) => Type::Text,
                     (_, _, t) => t.clone(),
                 };
-                let e = match (&func, i) {
-                    (AggFunc::StringAgg, _) | (AggFunc::JsonObjectAgg { .. }, 0)
-                        if t != Type::Text && t != Type::Unknown =>
-                    {
+                                let e = match (&func, i) {
+                    (AggFunc::StringAgg, _) if t != Type::Text && t != Type::Unknown => {
                         return Err(undefined_function(name, &types))
+                    }
+                    // Object keys of any type are converted to text.
+                    (AggFunc::JsonObjectAgg { .. }, 0) if t != Type::Text && t != Type::Unknown => {
+                        self.explicit_cast(e, &t, &Type::Text)?
                     }
                     _ => self.coerce(e, &t, &want)?,
                 };
@@ -857,7 +873,7 @@ impl<'a> Binder<'a> {
             }
         }
         self.agg_levels.last_mut().unwrap().in_aggregate = true;
-        let call = self.bind_agg_call(f, name, scope);
+        let call = self.bind_agg_call(f, name, scope, false);
         let level = self.agg_levels.last_mut().unwrap();
         level.in_aggregate = false;
         let call = call?;
@@ -924,7 +940,7 @@ impl<'a> Binder<'a> {
         level.allow_windows = false;
         let result = (|| -> Result<WindowCall> {
             let (func, args, ret) = if f.agg_star || agg_func(name).is_some() {
-                let call = self.bind_agg_call(f, name, scope)?;
+                let call = self.bind_agg_call(f, name, scope, true)?;
                 if call.distinct {
                     return Err(Error::unsupported("DISTINCT in window aggregates"));
                 }

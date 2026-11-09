@@ -1,0 +1,168 @@
+-- Subqueries, EXISTS, IN, ANY/ALL and set operations.
+CREATE TABLE t1 (a int PRIMARY KEY, b text);
+CREATE TABLE t2 (x int, y int);
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, NULL);
+INSERT INTO t2 VALUES (1, 10), (1, 11), (2, 20), (NULL, 99), (5, 50);
+SELECT a FROM t1 WHERE a IN (SELECT x FROM t2) ORDER BY a;
+a
+1
+2
+(2 rows)
+SELECT a FROM t1 WHERE a NOT IN (SELECT x FROM t2 WHERE x IS NOT NULL) ORDER BY a;
+a
+3
+4
+(2 rows)
+SELECT a FROM t1 WHERE a NOT IN (SELECT x FROM t2) ORDER BY a;
+a
+(0 rows)
+SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x = t1.a) ORDER BY a;
+a
+1
+2
+(2 rows)
+SELECT a FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.x = t1.a) ORDER BY a;
+a
+3
+4
+(2 rows)
+SELECT a, (SELECT count(*) FROM t2 WHERE t2.x = t1.a) AS n FROM t1 ORDER BY a;
+a|n
+1|2
+2|1
+3|0
+4|0
+(4 rows)
+SELECT a, (SELECT max(y) FROM t2 WHERE t2.x = t1.a) FROM t1 ORDER BY a;
+a|max
+1|11
+2|20
+3|NULL
+4|NULL
+(4 rows)
+SELECT (SELECT b FROM t1 WHERE a = 2), (SELECT b FROM t1 WHERE a = 99);
+b|b
+two|NULL
+(1 row)
+SELECT a FROM t1 WHERE a > (SELECT avg(x) FROM t2) ORDER BY a;
+a
+3
+4
+(2 rows)
+SELECT a FROM t1 WHERE a = ANY (SELECT x FROM t2) ORDER BY a;
+a
+1
+2
+(2 rows)
+SELECT a FROM t1 WHERE a > ALL (SELECT x FROM t2 WHERE x < 3) ORDER BY a;
+a
+3
+4
+(2 rows)
+SELECT a FROM t1 WHERE a < ANY (SELECT x FROM t2) ORDER BY a;
+a
+1
+2
+3
+4
+(4 rows)
+SELECT a FROM t1 WHERE (a, b) IN (SELECT 1, 'one' UNION ALL SELECT 2, 'zwei') ORDER BY a;
+a
+1
+(1 row)
+SELECT a, ARRAY(SELECT y FROM t2 WHERE x = a ORDER BY y) FROM t1 ORDER BY a;
+a|array
+1|{10,11}
+2|{20}
+3|{}
+4|{}
+(4 rows)
+SELECT * FROM (SELECT a, b FROM t1 WHERE a < 3) s WHERE s.b LIKE 't%';
+a|b
+2|two
+(1 row)
+SELECT x.a FROM (SELECT a FROM t1 ORDER BY a DESC LIMIT 2) x ORDER BY x.a;
+a
+3
+4
+(2 rows)
+SELECT a FROM t1 WHERE b = (SELECT b FROM t1);
+ERROR:  21000
+SELECT (SELECT a, b FROM t1 WHERE a = 1);
+ERROR:  42601
+SELECT a FROM t1 UNION SELECT x FROM t2 ORDER BY 1 NULLS LAST;
+a
+1
+2
+3
+4
+5
+NULL
+(6 rows)
+SELECT a FROM t1 UNION ALL SELECT x FROM t2 ORDER BY 1 NULLS LAST;
+a
+1
+1
+1
+2
+2
+3
+4
+5
+NULL
+(9 rows)
+SELECT a FROM t1 INTERSECT SELECT x FROM t2 ORDER BY 1;
+a
+1
+2
+(2 rows)
+SELECT x FROM t2 EXCEPT SELECT a FROM t1 ORDER BY 1 NULLS LAST;
+x
+5
+NULL
+(2 rows)
+SELECT x FROM t2 EXCEPT ALL SELECT a FROM t1 ORDER BY 1 NULLS LAST;
+x
+1
+5
+NULL
+(3 rows)
+SELECT x FROM t2 INTERSECT ALL SELECT x FROM t2 WHERE x = 1 ORDER BY 1;
+x
+1
+1
+(2 rows)
+(SELECT a FROM t1 ORDER BY a LIMIT 2) UNION ALL (SELECT a FROM t1 ORDER BY a DESC LIMIT 1) ORDER BY 1;
+a
+1
+2
+4
+(3 rows)
+SELECT a, 'x' FROM t1 WHERE a = 1 UNION SELECT 2, NULL ORDER BY 1;
+a|?column?
+1|x
+2|NULL
+(2 rows)
+SELECT 1 UNION SELECT 'a';
+ERROR:  22P02
+SELECT 1, 2 UNION SELECT 1;
+ERROR:  42601
+SELECT 1 AS n UNION SELECT 2 UNION SELECT 1 ORDER BY n DESC;
+n
+2
+1
+(2 rows)
+VALUES (1, 'a'), (2, 'b') ORDER BY 1 DESC;
+column1|column2
+2|b
+1|a
+(2 rows)
+SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS v (n, s) WHERE n > 1;
+n|s
+2|b
+(1 row)
+SELECT column1 + 1 FROM (VALUES (1), (2)) v ORDER BY 1;
+?column?
+2
+3
+(2 rows)

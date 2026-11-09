@@ -66,7 +66,7 @@ pub(crate) fn show_setting(state: &SessionState, name: &str) -> Result<String> {
         return Ok(v.clone());
     }
     Ok(match lower.as_str() {
-        "search_path" => state.search_path.join(", "),
+        "search_path" => "\"$user\", public".to_string(),
         "timezone" => state.tz.name().to_string(),
         "transaction_isolation" | "default_transaction_isolation" => match state.default_isolation {
             Isolation::ReadCommitted => "read committed",
@@ -141,7 +141,12 @@ pub(crate) fn apply_setting(state: &mut SessionState, name: &str, value: Option<
                     .map(|s| s.trim().trim_matches('"').to_string())
                     .filter(|s| !s.is_empty() && s != "$user")
                     .collect(),
-                None => vec!["public".to_string()],
+                                None => vec!["public".to_string()],
+            };
+            // `SHOW search_path` echoes the list as it was set.
+            match value {
+                Some(v) => state.settings.insert(lower, v.to_string()),
+                None => state.settings.remove(&lower),
             };
         }
         "timezone" => {
@@ -581,7 +586,7 @@ fn create_table(sess: &mut Session, stmt: &pb::CreateStmt) -> Result<QueryResult
         }
 
         let mut taken: Vec<String> = Vec::new();
-        let mut index_name =
+        let index_name =
             |catalog: &Catalog, given: &str, default: String, taken: &mut Vec<String>| -> Result<String> {
                 let name =
                     if given.is_empty() { free_name(catalog, &schema, &default, taken) } else { given.to_string() };
@@ -876,7 +881,7 @@ fn drop_objects(sess: &mut Session, stmt: &pb::DropStmt) -> Result<QueryResult> 
                     Ok(())
                 } else {
                     Err(Error::new(
-                        if what == "type" || what == "schema" {
+                        if what == "type" || what == "schema" || what == "index" {
                             sqlstate::UNDEFINED_OBJECT
                         } else {
                             sqlstate::UNDEFINED_TABLE
@@ -1302,9 +1307,20 @@ fn alter_table_cmd(sess: &mut Session, rv: &pb::RangeVar, cmd: &pb::AlterTableCm
             target.decl = decl.decl.clone();
             target.decl_oid = decl.oid;
             target.typmod = decl.typmod;
-            let using = match &def.raw_default {
+                        let using = match &def.raw_default {
                 Some(u) => deparse_expr(u)?,
-                None => format!("{}::{}", quote_ident(&cmd.name), decl.decl),
+                None => {
+                    // Without USING the conversion must be an assignment cast.
+                    let from = &table.columns[idx].ty;
+                    if *from != decl.ty && !crate::value::can_cast(from, &decl.ty, crate::value::CastContext::Assignment) {
+                        return Err(Error::type_mismatch(format!(
+                            "column \"{}\" cannot be cast automatically to type {}",
+                            cmd.name, decl.ty
+                        ))
+                        .with_hint(format!("You might need to specify \"USING {}::{}\".", quote_ident(&cmd.name), decl.decl)));
+                    }
+                    format!("{}::{}", quote_ident(&cmd.name), decl.decl)
+                }
             };
             let mut rows = sess.with_cx(|cx| all_rows(&table, cx.txn))?;
             let values = eval_per_row(sess, &table, &rows, &using, &target)?;
