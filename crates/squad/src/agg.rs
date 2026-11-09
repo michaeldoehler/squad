@@ -434,9 +434,13 @@ fn frame_bounds(
         let op = if subtract { "-" } else { "+" };
         let f = value::resolve_operator(op, Some(&cur.type_of()), &off.type_of())?;
         let target = (f.eval)(&cx.fn_ctx, &[cur.clone(), off.clone()])?;
+        // NULLs are peers of each other only and sit at one end of the
+        // sorted partition: leading NULLs precede every frame of a
+        // non-null row, trailing ones follow it.
+        let nulls_first = order_vals.first().is_some_and(|v| v[0].is_null());
         let before = |v: &Value| -> bool {
             if v.is_null() {
-                return false;
+                return nulls_first;
             }
             let o = compare(v, &target);
             let o = if desc { o.reverse() } else { o };

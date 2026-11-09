@@ -551,6 +551,11 @@ impl<'a> Binder<'a> {
                 }
             }
             width = groups.len() + level.aggs.len();
+            // A HAVING clause that can never hold: no group is produced, and
+            // the input is not evaluated either.
+            if having.as_ref().is_some_and(super::opt::cannot_be_true) {
+                plan = self.push_filter(plan, Some(Expr::Const(crate::types::Value::Bool(false))), &scope.types())?;
+            }
             plan = Plan::Aggregate { input: Box::new(plan), groups, aggs: level.aggs };
             if let Some(h) = having {
                 plan = Plan::Filter(Box::new(plan), h);

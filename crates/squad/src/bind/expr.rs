@@ -178,10 +178,20 @@ impl<'a> Binder<'a> {
         // Constant folding: an immutable function of constants is computed
         // once, while planning.
         let foldable = f.volatility == value::Volatility::Immutable && out.iter().all(Expr::is_const);
-        let folded = if !foldable {
-            None
-        } else if f.strict && out.iter().any(|a| matches!(a, Expr::Const(Value::Null))) {
+        // A constant argument that already failed must still be reported.
+        let failed_argument = !self.const_errors.is_empty()
+            && out.iter().any(|a| {
+                let mut hit = false;
+                a.walk(&mut |n| hit |= self.const_errors.iter().any(|(c, _)| c == n));
+                hit
+            });
+        let folded = if !failed_argument && f.strict && out.iter().any(|a| matches!(a, Expr::Const(Value::Null))) {
+            // A strict function of a NULL constant is NULL whatever the
+            // other arguments are; they are not evaluated (so `x / 0 +
+            // NULL` is NULL, as in Postgres).
             Some(Ok(Value::Null))
+        } else if !foldable {
+            None
         } else {
             let vals: Vec<Value> = out
                 .iter()
@@ -581,7 +591,14 @@ impl<'a> Binder<'a> {
             K::AexprNullif => {
                 let l = left(self)?.ok_or_else(|| Error::internal("NULLIF without left operand"))?;
                 let r = self.bind_expr(rexpr, scope)?;
-                let ty = if l.1 == Type::Unknown { Type::Text } else { l.1.clone() };
+                // The result has the type the left operand is compared as.
+                // (Postgres compares integers of different widths directly.)
+                let ty = match value::resolve_operator("=", Some(&l.1), &r.1) {
+                    Ok(_) if l.1.is_integer() && r.1.is_integer() => l.1.clone(),
+                    Ok(f) if f.args[0] != Type::Unknown => f.args[0].clone(),
+                    _ if l.1 == Type::Unknown => Type::Text,
+                    _ => l.1.clone(),
+                };
                 let result = self.coerce(l.0.clone(), &l.1, &ty)?;
                 let (cond, _) = self.bind_op("=", Some(l), r)?;
                 Ok((Expr::Case(vec![(cond, Expr::null())], Some(Box::new(result))), ty))
@@ -728,7 +745,7 @@ impl<'a> Binder<'a> {
         if let Some(r) = self.bind_session_fn(&name, &mut args)? {
             return Ok(r);
         }
-                if matches!(name.as_str(), "gen_random_uuid" | "uuid_generate_v4") && args.is_empty() {
+        if matches!(name.as_str(), "gen_random_uuid" | "uuid_generate_v4") && args.is_empty() {
             fn random_uuid(_: &crate::types::FnCtx, _: &[Value]) -> Result<Value> {
                 let mut bytes: [u8; 16] = rand::random();
                 // Version 4, RFC 4122 variant.

@@ -255,6 +255,11 @@ impl<'a> Binder<'a> {
         if let Some(p) = pred {
             conjuncts(p, &mut preds);
         }
+        // A condition that can never hold makes the result empty without
+        // evaluating the other conditions, which might fail.
+        if preds.iter().any(cannot_be_true) {
+            preds = vec![Expr::Const(crate::types::Value::Bool(false))];
+        }
         Ok(self.push(plan, preds, types))
     }
 
@@ -629,6 +634,34 @@ impl<'a> Binder<'a> {
             Some(scan) => Plan::Scan(scan),
             None => Plan::Sort { input: Box::new(Plan::Scan(scan)), keys },
         }
+    }
+}
+
+fn is_const_null_or(e: &Expr, b: bool) -> bool {
+    matches!(e, Expr::Const(crate::types::Value::Null)) || *e == Expr::Const(crate::types::Value::Bool(b))
+}
+
+/// True if the predicate is known, from its constants alone, to be false
+/// or NULL for every row.
+pub(crate) fn cannot_be_true(e: &Expr) -> bool {
+    match e {
+        Expr::And(items) => items.iter().any(cannot_be_true),
+        Expr::Or(items) => items.iter().all(cannot_be_true),
+        Expr::Not(inner) => cannot_be_false(inner),
+        // `x NOT IN (..., NULL)` is false or NULL.
+        Expr::InList(_, items, true) => items.iter().any(|i| matches!(i, Expr::Const(crate::types::Value::Null))),
+        other => is_const_null_or(other, false),
+    }
+}
+
+/// True if the predicate is known to be true or NULL for every row.
+fn cannot_be_false(e: &Expr) -> bool {
+    match e {
+        Expr::Or(items) => items.iter().any(cannot_be_false),
+        Expr::And(items) => items.iter().all(cannot_be_false),
+        Expr::Not(inner) => cannot_be_true(inner),
+        Expr::InList(_, items, false) => items.iter().any(|i| matches!(i, Expr::Const(crate::types::Value::Null))),
+        other => is_const_null_or(other, true),
     }
 }
 

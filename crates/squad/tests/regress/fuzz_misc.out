@@ -216,3 +216,13 @@ SELECT count(*) FROM f a, f b JOIN f c ON (b.n = ALL (SELECT d.n FROM f d WHERE 
 count
 20
 (1 row)
+-- RANGE frames with offsets when the ordering column has NULLs
+SELECT x, count(*) OVER (ORDER BY x DESC RANGE BETWEEN 2 PRECEDING AND 1 FOLLOWING), sum(x) OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING), count(*) OVER (ORDER BY x NULLS FIRST RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (1), (2), (4), (NULL), (NULL), (5)) v (x) ORDER BY x;
+x|count|sum|count
+1|2|3|1
+2|3|3|2
+4|2|9|1
+5|2|9|2
+NULL|2|NULL|2
+NULL|2|NULL|2
+(6 rows)

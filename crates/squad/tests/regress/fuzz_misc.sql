@@ -92,3 +92,5 @@ UPDATE u SET b = a WHERE id = 2;
 SELECT a.id, c.id FROM f a, f b JOIN f c ON (1 <> ANY (SELECT d.id FROM f d WHERE c.b)) WHERE a.id = 1 ORDER BY 1, 2;
 SELECT a.id, b.id, c.id FROM f a, f b JOIN f c ON EXISTS (SELECT 1 FROM f d WHERE d.id = b.id AND c.id = 2) WHERE a.id <= 2 AND b.id <= 2 ORDER BY 1, 2, 3;
 SELECT count(*) FROM f a, f b JOIN f c ON (b.n = ALL (SELECT d.n FROM f d WHERE b.b)) WHERE a.id = 1;
+-- RANGE frames with offsets when the ordering column has NULLs
+SELECT x, count(*) OVER (ORDER BY x DESC RANGE BETWEEN 2 PRECEDING AND 1 FOLLOWING), sum(x) OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING), count(*) OVER (ORDER BY x NULLS FIRST RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (1), (2), (4), (NULL), (NULL), (5)) v (x) ORDER BY x;

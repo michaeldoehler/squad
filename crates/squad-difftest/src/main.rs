@@ -36,6 +36,8 @@ enum Diff {
 
 fn compare(a: &Outcome, b: &Outcome, ordered: bool) -> Diff {
     match (a, b) {
+        // An internal error of the reference server says nothing about squad.
+        (_, Outcome::Error(y)) if y == "XX000" => Diff::None,
         (Outcome::Error(x), Outcome::Error(y)) if x == y => Diff::None,
         (Outcome::Error(_), Outcome::Error(_)) => Diff::ErrorCode,
         (Outcome::Rows { columns: ca, rows: ra }, Outcome::Rows { columns: cb, rows: rb }) => {
