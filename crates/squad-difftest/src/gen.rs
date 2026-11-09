@@ -73,10 +73,18 @@ pub struct Table {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     /// A query; `ordered` if its ORDER BY determines the row order fully.
-    Query { sql: String, ordered: bool },
+    Query {
+        sql: String,
+        ordered: bool,
+    },
     /// Data modification of the named table.
-    Dml { sql: String, table: String },
-    Other { sql: String },
+    Dml {
+        sql: String,
+        table: String,
+    },
+    Other {
+        sql: String,
+    },
 }
 
 impl Stmt {
@@ -266,7 +274,9 @@ impl Gen {
                 "integer" if self.chance(0.03) => self.pick(&["2147483647", "-2147483648", "100000"]).to_string(),
                 _ => self.int_value().to_string(),
             },
-            K::Text if c.decl.starts_with("varchar") => format!("'{}'", self.pick(&["", "a", "ab", "abc", "h€llo", "Zed"])),
+            K::Text if c.decl.starts_with("varchar") => {
+                format!("'{}'", self.pick(&["", "a", "ab", "abc", "h€llo", "Zed"]))
+            }
             K::Num => self.lit_not_null(K::Num).trim_matches(|ch| ch == '(' || ch == ')').to_string(),
             K::Float => (self.rng.gen_range(-40..80i64) as f64 * 0.25).to_string(),
             K::Date | K::Ts | K::Tstz | K::Uuid | K::Bytea | K::Jsonb | K::IntArr | K::TextArr | K::Enum => {
@@ -310,7 +320,13 @@ impl Gen {
             let mut cols =
                 vec![Col { name: "id".into(), decl: "integer".into(), kind: K::Int, not_null: true, unique: false }];
             if composite {
-                cols.push(Col { name: "k".into(), decl: "integer".into(), kind: K::Int, not_null: true, unique: false });
+                cols.push(Col {
+                    name: "k".into(),
+                    decl: "integer".into(),
+                    kind: K::Int,
+                    not_null: true,
+                    unique: false,
+                });
             }
             let pk: Vec<usize> = (0..cols.len()).collect();
             let ncols = self.rng.gen_range(2..=7);
@@ -347,14 +363,24 @@ impl Gen {
                     defs[i].push_str(&format!(" CHECK ({} > -1000)", cols[i].name));
                 }
             }
-            defs.push(format!("PRIMARY KEY ({})", pk.iter().map(|&i| cols[i].name.clone()).collect::<Vec<_>>().join(", ")));
+            defs.push(format!(
+                "PRIMARY KEY ({})",
+                pk.iter().map(|&i| cols[i].name.clone()).collect::<Vec<_>>().join(", ")
+            ));
             // A foreign key to an earlier table with a single-column key.
             if t > 0 && self.chance(0.4) {
-                let parents: Vec<String> = self.tables.iter().filter(|p| p.pk.len() == 1).map(|p| p.name.clone()).collect();
+                let parents: Vec<String> =
+                    self.tables.iter().filter(|p| p.pk.len() == 1).map(|p| p.name.clone()).collect();
                 if !parents.is_empty() {
                     let parent = self.pick(&parents).clone();
                     let action = *self.pick(&["", " ON DELETE CASCADE", " ON DELETE SET NULL"]);
-                    cols.push(Col { name: "ref".into(), decl: "integer".into(), kind: K::Int, not_null: false, unique: false });
+                    cols.push(Col {
+                        name: "ref".into(),
+                        decl: "integer".into(),
+                        kind: K::Int,
+                        not_null: false,
+                        unique: false,
+                    });
                     defs.push(format!("ref integer REFERENCES {parent} (id){action}"));
                     let last = defs.len() - 1;
                     defs.swap(last - 1, last);
@@ -391,7 +417,11 @@ impl Gen {
                     } else if i == 1 && table.pk.len() > 1 {
                         (r % 3).to_string()
                     } else if c.name == "ref" {
-                        if self.chance(0.3) { "NULL".to_string() } else { self.rng.gen_range(1..5).to_string() }
+                        if self.chance(0.3) {
+                            "NULL".to_string()
+                        } else {
+                            self.rng.gen_range(1..5).to_string()
+                        }
                     } else {
                         self.col_value(c)
                     });
@@ -449,7 +479,9 @@ impl Gen {
                 return format!("{f}({}, {})", self.expr(k, d, sc), self.expr(k, d, sc));
             }
             3 if k.orderable() => return format!("nullif({}, {})", self.expr(k, d, sc), self.expr(k, d, sc)),
-            4 if !matches!(k, K::Jsonb | K::IntArr | K::TextArr | K::Bool | K::Uuid | K::Bytea) && !self.tables.is_empty() => {
+            4 if !matches!(k, K::Jsonb | K::IntArr | K::TextArr | K::Bool | K::Uuid | K::Bytea)
+                && !self.tables.is_empty() =>
+            {
                 // Scalar subquery over a table that has a column of the kind.
                 let cands: Vec<(String, String)> = self
                     .tables
@@ -490,7 +522,14 @@ impl Gen {
                 15 => format!("({})::bigint", self.expr(k, d, sc)),
                 16 => format!("extract(day FROM {})::int", self.expr(K::Ts, d, sc)),
                 17 => format!("({} - {})", self.expr(K::Date, d, sc), self.expr(K::Date, d, sc)),
-                18 => format!("CASE {} WHEN {} THEN {} WHEN {} THEN {} END", self.expr(k, d, sc), self.lit_not_null(k), self.expr(k, d, sc), self.lit_not_null(k), self.expr(k, d, sc)),
+                18 => format!(
+                    "CASE {} WHEN {} THEN {} WHEN {} THEN {} END",
+                    self.expr(k, d, sc),
+                    self.lit_not_null(k),
+                    self.expr(k, d, sc),
+                    self.lit_not_null(k),
+                    self.expr(k, d, sc)
+                ),
                 19 => format!("({})::smallint", self.expr(k, d, sc)),
                 20 => format!("sign({})::int", self.expr(K::Num, d, sc)),
                 21 => format!("octet_length({})", self.expr(K::Text, d, sc)),
@@ -533,7 +572,10 @@ impl Gen {
                 7 => format!("left({}, {})", self.expr(k, d, sc), self.small()),
                 8 => format!("({})::text", self.expr(K::Int, d, sc)),
                 9 => format!("({})::text", self.expr(K::Num, d, sc)),
-                10 => format!("({})::text", { let kk = *self.pick(&[K::Bool, K::Date, K::Enum, K::Uuid]); self.expr(kk, d, sc) }),
+                10 => format!("({})::text", {
+                    let kk = *self.pick(&[K::Bool, K::Date, K::Enum, K::Uuid]);
+                    self.expr(kk, d, sc)
+                }),
                 11 => format!("concat({}, {})", self.expr(k, d, sc), self.expr(K::Int, d, sc)),
                 12 => format!("lpad({}, 5, 'x')", self.expr(k, d, sc)),
                 13 => format!("({} ->> 'b')", self.expr(K::Jsonb, d, sc)),
@@ -547,7 +589,12 @@ impl Gen {
                 21 => format!("translate({}, 'ab', 'x')", self.expr(k, d, sc)),
                 22 => format!("to_char({}, 'YYYY-MM-DD HH24:MI')", self.expr(K::Ts, d, sc)),
                 23 => format!("array_to_string({}, '-')", self.expr(K::TextArr, d, sc)),
-                24 => format!("concat_ws('/', {}, {}, {})", self.expr(k, d, sc), self.expr(K::Int, d, sc), self.expr(k, d, sc)),
+                24 => format!(
+                    "concat_ws('/', {}, {}, {})",
+                    self.expr(k, d, sc),
+                    self.expr(K::Int, d, sc),
+                    self.expr(k, d, sc)
+                ),
                 25 => format!("substring({} from {})", self.expr(k, d, sc), self.small()),
                 26 => format!("regexp_replace({}, '[ab]', '#', 'g')", self.expr(k, d, sc)),
                 27 => format!("quote_literal({})", self.expr(k, d, sc)),
@@ -601,11 +648,38 @@ impl Gen {
             0 => format!("({} - {})::text", self.expr(K::Ts, d, sc), self.expr(K::Ts, d, sc)),
             1 => format!("age({}, {})::text", self.expr(K::Ts, d, sc), self.expr(K::Ts, d, sc)),
             2 => format!("(interval '{n} hours 30 minutes' * {})::text", self.expr(i, d, sc)),
-            3 => format!("date_trunc('{}', {})::text", self.pick(&["week", "quarter", "year", "minute"]), self.expr(K::Ts, d, sc)),
-            4 => format!("extract({} FROM {})::text", self.pick(&["dow", "doy", "epoch", "week", "quarter", "isodow", "hour", "second"]), self.expr(K::Ts, d, sc)),
-            5 => format!("({} AT TIME ZONE '{}')::text", self.expr(K::Tstz, d, sc), self.pick(&["Europe/Berlin", "America/New_York", "UTC", "Asia/Tokyo"])),
-            6 => format!("to_char({}, '{}')", self.expr(K::Ts, d, sc), self.pick(&["Dy DD Mon YYYY", "HH12:MI AM", "YYYY\"Q\"Q", "FMMonth FMDD, YYYY", "IYYY-IW-ID", "DDD HH24:MI:SS.MS"])),
-            7 => format!("({} + {})::text", self.expr(K::Date, d, sc), self.pick(&["interval '1 month'", "interval '1 year 2 days'", "interval '36 hours'", "time '10:30'"])),
+            3 => format!(
+                "date_trunc('{}', {})::text",
+                self.pick(&["week", "quarter", "year", "minute"]),
+                self.expr(K::Ts, d, sc)
+            ),
+            4 => format!(
+                "extract({} FROM {})::text",
+                self.pick(&["dow", "doy", "epoch", "week", "quarter", "isodow", "hour", "second"]),
+                self.expr(K::Ts, d, sc)
+            ),
+            5 => format!(
+                "({} AT TIME ZONE '{}')::text",
+                self.expr(K::Tstz, d, sc),
+                self.pick(&["Europe/Berlin", "America/New_York", "UTC", "Asia/Tokyo"])
+            ),
+            6 => format!(
+                "to_char({}, '{}')",
+                self.expr(K::Ts, d, sc),
+                self.pick(&[
+                    "Dy DD Mon YYYY",
+                    "HH12:MI AM",
+                    "YYYY\"Q\"Q",
+                    "FMMonth FMDD, YYYY",
+                    "IYYY-IW-ID",
+                    "DDD HH24:MI:SS.MS"
+                ])
+            ),
+            7 => format!(
+                "({} + {})::text",
+                self.expr(K::Date, d, sc),
+                self.pick(&["interval '1 month'", "interval '1 year 2 days'", "interval '36 hours'", "time '10:30'"])
+            ),
             8 => format!("({})::text", self.expr(K::Tstz, d, sc)),
             9 => format!("(({})::timestamptz)::text", self.expr(K::Ts, d, sc)),
             10 => format!("justify_hours(interval '{} hours')::text", self.rng.gen_range(1..100)),
@@ -616,7 +690,11 @@ impl Gen {
             14 => format!("sqrt(abs({}))::text", self.expr(num, d, sc)),
             15 => format!("round(ln(abs({}) + 1), 6)::text", self.expr(num, d, sc)),
             16 => format!("round(exp({n}::numeric / 3), 8)::text"),
-            17 => format!("to_char({}, '{}')", self.expr(num, d, sc), self.pick(&["999D99", "FM9990.00", "S9999.9", "000000", "9,999.99PR"])),
+            17 => format!(
+                "to_char({}, '{}')",
+                self.expr(num, d, sc),
+                self.pick(&["999D99", "FM9990.00", "S9999.9", "000000", "9,999.99PR"])
+            ),
             18 => format!("width_bucket({}, 0, 50, 5)::text", self.expr(num, d, sc)),
             19 => format!("round({}, -1)::text", self.expr(num, d, sc)),
             20 => format!("({} % {n})::text", self.expr(num, d, sc)),
@@ -641,7 +719,12 @@ impl Gen {
             38 => format!("({} - 'a')::text", self.expr(K::Jsonb, d, sc)),
             39 => format!("jsonb_typeof({})", self.expr(K::Jsonb, d, sc)),
             40 => format!("({} < {})::text", self.expr(K::Jsonb, d, sc), self.expr(K::Jsonb, d, sc)),
-            41 => format!("jsonb_build_array({}, {}, {})::text", self.expr(i, d, sc), self.expr(t, d, sc), self.expr(K::Bool, d, sc)),
+            41 => format!(
+                "jsonb_build_array({}, {}, {})::text",
+                self.expr(i, d, sc),
+                self.expr(t, d, sc),
+                self.expr(K::Bool, d, sc)
+            ),
             42 => format!("to_jsonb({})::text", self.expr(K::IntArr, d, sc)),
             43 => format!("jsonb_pretty({})", self.leaf(K::Jsonb, sc)),
             44 => format!("to_json(({})::text)::text", self.expr(t, d, sc)),
@@ -663,16 +746,44 @@ impl Gen {
             58 => format!("length({})::text", self.expr(K::Bytea, d, sc)),
             59 => format!("({} SIMILAR TO '(a|b)%')::text", self.expr(t, d, sc)),
             60 => format!("(regexp_match({}, '([a-z])([a-z])'))::text", self.expr(t, d, sc)),
-            61 => format!("(({}, {}) < ({}, {}))::text", self.expr(i, d, sc), self.expr(t, d, sc), self.expr(i, d, sc), self.expr(t, d, sc)),
+            61 => format!(
+                "(({}, {}) < ({}, {}))::text",
+                self.expr(i, d, sc),
+                self.expr(t, d, sc),
+                self.expr(i, d, sc),
+                self.expr(t, d, sc)
+            ),
             62 => format!("(ROW({}, {}) IS NULL)::text", self.expr(i, d, sc), self.expr(t, d, sc)),
-            _ => format!("({} BETWEEN SYMMETRIC {} AND {})::text", self.expr(i, d, sc), self.expr(i, d, sc), self.expr(i, d, sc)),
+            _ => format!(
+                "({} BETWEEN SYMMETRIC {} AND {})::text",
+                self.expr(i, d, sc),
+                self.expr(i, d, sc),
+                self.expr(i, d, sc)
+            ),
         }
     }
 
     fn bool_expr(&mut self, d: u32, sc: &Scope) -> String {
         match self.below(22) {
             0..=5 => {
-                let k = *self.pick(&[K::Int, K::Int, K::Int, K::Text, K::Text, K::Num, K::Float, K::Date, K::Ts, K::Tstz, K::Enum, K::Uuid, K::Bytea, K::IntArr, K::TextArr, K::Bool]);
+                let k = *self.pick(&[
+                    K::Int,
+                    K::Int,
+                    K::Int,
+                    K::Text,
+                    K::Text,
+                    K::Num,
+                    K::Float,
+                    K::Date,
+                    K::Ts,
+                    K::Tstz,
+                    K::Enum,
+                    K::Uuid,
+                    K::Bytea,
+                    K::IntArr,
+                    K::TextArr,
+                    K::Bool,
+                ]);
                 let op = *self.pick(&["=", "<>", "<", "<=", ">", ">="]);
                 format!("({} {op} {})", self.expr(k, d, sc), self.expr(k, d, sc))
             }
@@ -743,11 +854,8 @@ impl Gen {
         let mut inner: Scope = t.cols.iter().map(|c| (format!("{a}.{}", c.name), c.kind)).collect();
         let own = inner.clone();
         inner.extend(sc.iter().cloned());
-        let filter = if self.chance(0.7) {
-            format!(" WHERE {}", self.expr(K::Bool, d.min(1), &inner))
-        } else {
-            String::new()
-        };
+        let filter =
+            if self.chance(0.7) { format!(" WHERE {}", self.expr(K::Bool, d.min(1), &inner)) } else { String::new() };
         match self.below(4) {
             0 => {
                 let not = if self.chance(0.3) { "NOT " } else { "" };
@@ -762,7 +870,8 @@ impl Gen {
                 format!("({} {not}IN (SELECT {col} FROM {} {a}{filter}))", self.expr(k, d.min(1), sc), t.name)
             }
             _ => {
-                let cands: Vec<(String, K)> = own.iter().filter(|(_, k)| matches!(k, K::Int | K::Num | K::Text)).cloned().collect();
+                let cands: Vec<(String, K)> =
+                    own.iter().filter(|(_, k)| matches!(k, K::Int | K::Num | K::Text)).cloned().collect();
                 if cands.is_empty() {
                     return format!("(EXISTS (SELECT 1 FROM {} {a}{filter}))", t.name);
                 }
@@ -780,7 +889,7 @@ impl Gen {
 
     /// FROM clause: returns `(sql, scope, total order columns, WITH items)`;
     /// the order columns are present only if every item is a base table.
-    fn from_clause(&mut self, depth: u32) -> (String, Scope, Option<Vec<String>>, Vec<String>) {
+    fn gen_from(&mut self, depth: u32) -> (String, Scope, Option<Vec<String>>, Vec<String>) {
         let mut sql = String::new();
         let mut scope: Scope = Vec::new();
         let mut order: Option<Vec<String>> = Some(Vec::new());
@@ -817,8 +926,9 @@ impl Gen {
                 }
             } else if choice == 18 {
                 let a = self.fresh("v");
-                let rows: Vec<String> =
-                    (0..self.rng.gen_range(1..4)).map(|_| format!("({}, {})", self.lit(K::Int), self.lit(K::Text))).collect();
+                let rows: Vec<String> = (0..self.rng.gen_range(1..4))
+                    .map(|_| format!("({}, {})", self.lit(K::Int), self.lit(K::Text)))
+                    .collect();
                 (
                     format!("(VALUES {}) AS {a} (c0, c1)", rows.join(", ")),
                     vec![(format!("{a}.c0"), K::Int), (format!("{a}.c1"), K::Text)],
@@ -827,7 +937,12 @@ impl Gen {
                 )
             } else {
                 let a = self.fresh("g");
-                (format!("generate_series(1, {}) AS {a} (c0)", self.rng.gen_range(0..6)), vec![(format!("{a}.c0"), K::Int)], a, None)
+                (
+                    format!("generate_series(1, {}) AS {a} (c0)", self.rng.gen_range(0..6)),
+                    vec![(format!("{a}.c0"), K::Int)],
+                    a,
+                    None,
+                )
             };
             match (&base, &mut order) {
                 (Some(t), Some(o)) => o.extend(t.pk.iter().map(|&p| format!("{alias}.{}", t.cols[p].name))),
@@ -839,9 +954,20 @@ impl Gen {
             } else {
                 let mut both = scope.clone();
                 both.extend(cols.iter().cloned());
-                let kind = *self.pick(&["JOIN", "JOIN", "LEFT JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN", "CROSS JOIN", ","]);
+                let kind = *self.pick(&[
+                    "JOIN",
+                    "JOIN",
+                    "LEFT JOIN",
+                    "LEFT JOIN",
+                    "RIGHT JOIN",
+                    "FULL JOIN",
+                    "CROSS JOIN",
+                    ",",
+                ]);
                 match kind {
-                    "CROSS JOIN" | "," => sql = format!("{sql}{}{item}", if kind == "," { ", " } else { " CROSS JOIN " }),
+                    "CROSS JOIN" | "," => {
+                        sql = format!("{sql}{}{item}", if kind == "," { ", " } else { " CROSS JOIN " })
+                    }
                     _ if this_has_id && !has_id.is_empty() && self.chance(0.15) && n == 2 => {
                         sql = format!("{sql} {kind} {item} USING (id)");
                     }
@@ -896,20 +1022,21 @@ impl Gen {
             let mut inner: Scope = t.cols.iter().map(|c| (format!("{x}.{}", c.name), c.kind)).collect();
             inner.extend(scope.iter().cloned());
             let cond = self.expr(K::Bool, 1, &inner);
-            let agg = if c.kind.orderable() && !matches!(c.kind, K::Bool | K::Uuid | K::Bytea) { "max" } else { "count" };
+            let agg =
+                if c.kind.orderable() && !matches!(c.kind, K::Bool | K::Uuid | K::Bytea) { "max" } else { "count" };
             let kind = if agg == "count" { K::Int } else { c.kind };
-            sql = format!("{sql} LEFT JOIN LATERAL (SELECT {agg}({x}.{}) AS v FROM {} {x} WHERE {cond}) {l} ON true", c.name, t.name);
+            sql = format!(
+                "{sql} LEFT JOIN LATERAL (SELECT {agg}({x}.{}) AS v FROM {} {x} WHERE {cond}) {l} ON true",
+                c.name, t.name
+            );
             scope.push((format!("{l}.v"), kind));
         }
         (sql, scope, order, with)
     }
 
     fn aggregate(&mut self, sc: &Scope) -> (String, K) {
-        let filter = if self.chance(0.15) {
-            format!(" FILTER (WHERE {})", self.expr(K::Bool, 1, sc))
-        } else {
-            String::new()
-        };
+        let filter =
+            if self.chance(0.15) { format!(" FILTER (WHERE {})", self.expr(K::Bool, 1, sc)) } else { String::new() };
         let (call, k) = match self.below(19) {
             0 | 1 => ("count(*)".to_string(), K::Int),
             2 => {
@@ -922,7 +1049,13 @@ impl Gen {
             }
             4 => (format!("sum({})", self.expr(K::Int, 1, sc)), K::Num),
             5 => (format!("sum({})", self.expr(K::Num, 1, sc)), K::Num),
-            6 => (format!("avg({})", { let kk = *self.pick(&[K::Int, K::Num]); self.expr(kk, 1, sc) }), K::Num),
+            6 => (
+                format!("avg({})", {
+                    let kk = *self.pick(&[K::Int, K::Num]);
+                    self.expr(kk, 1, sc)
+                }),
+                K::Num,
+            ),
             7 | 8 => {
                 let k = *self.pick(&[K::Int, K::Text, K::Num, K::Date, K::Ts, K::Enum, K::Float]);
                 let f = *self.pick(&["min", "max"]);
@@ -1033,7 +1166,14 @@ impl Gen {
                 );
                 (call, if f == "sum" { K::Num } else { K::Int })
             }
-            14 => (format!("avg({}) FILTER (WHERE {}) OVER ({part}{order})", self.expr(K::Num, 1, sc), self.expr(K::Bool, 1, sc)), K::Num),
+            14 => (
+                format!(
+                    "avg({}) FILTER (WHERE {}) OVER ({part}{order})",
+                    self.expr(K::Num, 1, sc),
+                    self.expr(K::Bool, 1, sc)
+                ),
+                K::Num,
+            ),
             _ => {
                 // RANGE frame with peers: deterministic for any ordering.
                 let (c, k) = self.pick(sc).clone();
@@ -1050,7 +1190,9 @@ impl Gen {
         if depth >= 1 && self.chance(0.08) {
             let kinds: Vec<K> = match want {
                 Some(w) => w.to_vec(),
-                None => (0..self.rng.gen_range(1..3)).map(|_| *self.pick(&[K::Int, K::Text, K::Num, K::Bool, K::Date])).collect(),
+                None => (0..self.rng.gen_range(1..3))
+                    .map(|_| *self.pick(&[K::Int, K::Text, K::Num, K::Bool, K::Date]))
+                    .collect(),
             };
             let (l, _, _) = self.select(depth - 1, Some(&kinds), false);
             let (r, _, _) = self.select(depth - 1, Some(&kinds), false);
@@ -1062,7 +1204,7 @@ impl Gen {
             return (sql, kinds, false);
         }
 
-        let (from, scope, total, with) = self.from_clause(depth);
+        let (from, scope, total, with) = self.gen_from(depth);
         let filter = if self.chance(0.65) { Some(self.expr(K::Bool, depth.min(2) + 1, &scope)) } else { None };
         let mut items: Vec<(String, K)> = Vec::new();
         let mut group = String::new();
@@ -1114,7 +1256,13 @@ impl Gen {
                 let kinds: Vec<K> = match want {
                     Some(w) => w.to_vec(),
                     None => (0..self.rng.gen_range(1..5))
-                        .map(|_| if self.chance(0.6) { *self.pick(&[K::Int, K::Text, K::Num, K::Bool]) } else { *self.pick(&ALL_KINDS) })
+                        .map(|_| {
+                            if self.chance(0.6) {
+                                *self.pick(&[K::Int, K::Text, K::Num, K::Bool])
+                            } else {
+                                *self.pick(&ALL_KINDS)
+                            }
+                        })
                         .collect(),
                 };
                 for k in kinds {
@@ -1124,7 +1272,8 @@ impl Gen {
                     distinct = "DISTINCT ";
                 }
                 if mode == 5 {
-                    let cands: Vec<String> = scope.iter().filter(|(_, k)| k.orderable()).map(|(c, _)| c.clone()).collect();
+                    let cands: Vec<String> =
+                        scope.iter().filter(|(_, k)| k.orderable()).map(|(c, _)| c.clone()).collect();
                     if !cands.is_empty() {
                         distinct_on = Some(self.pick(&cands).clone());
                     }
@@ -1196,12 +1345,19 @@ impl Gen {
                 .iter()
                 .map(|c| if c.name == "id" { format!("id + {}", self.next_id) } else { c.name.clone() })
                 .collect();
-            let sql = format!("INSERT INTO {} SELECT {} FROM {} WHERE id < 6{returning}", t.name, list.join(", "), t.name);
+            let sql =
+                format!("INSERT INTO {} SELECT {} FROM {} WHERE id < 6{returning}", t.name, list.join(", "), t.name);
             return Stmt::Dml { sql, table: t.name };
         }
         let nrows = if self.chance(0.2) { 2 } else { 1 };
         let partial = self.chance(0.3);
-        let cols: Vec<&Col> = t.cols.iter().enumerate().filter(|(i, _)| t.pk.contains(i) || !partial || self.rng.gen_bool(0.6)).map(|(_, c)| c).collect();
+        let cols: Vec<&Col> = t
+            .cols
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| t.pk.contains(i) || !partial || self.rng.gen_bool(0.6))
+            .map(|(_, c)| c)
+            .collect();
         let mut rows = Vec::new();
         for _ in 0..nrows {
             let mut vals = Vec::new();
@@ -1217,7 +1373,11 @@ impl Gen {
                 } else if c.name == "k" {
                     self.below(3).to_string()
                 } else if c.name == "ref" {
-                    if self.chance(0.2) { "999".to_string() } else { self.rng.gen_range(1..5).to_string() }
+                    if self.chance(0.2) {
+                        "999".to_string()
+                    } else {
+                        self.rng.gen_range(1..5).to_string()
+                    }
                 } else if self.chance(0.08) {
                     "DEFAULT".to_string()
                 } else {
@@ -1228,7 +1388,10 @@ impl Gen {
         }
         let conflict = match self.below(8) {
             0 => " ON CONFLICT DO NOTHING".to_string(),
-            1 => format!(" ON CONFLICT ({}) DO NOTHING", t.pk.iter().map(|&p| t.cols[p].name.clone()).collect::<Vec<_>>().join(", ")),
+            1 => format!(
+                " ON CONFLICT ({}) DO NOTHING",
+                t.pk.iter().map(|&p| t.cols[p].name.clone()).collect::<Vec<_>>().join(", ")
+            ),
             2 if t.cols.len() > t.pk.len() => {
                 let c = &t.cols[t.pk.len() + self.below(t.cols.len() - t.pk.len())];
                 let filter = if self.chance(0.3) { format!(" WHERE {}.id > 2", t.name) } else { String::new() };
@@ -1242,7 +1405,8 @@ impl Gen {
             _ => String::new(),
         };
         let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
-        let sql = format!("INSERT INTO {} ({}) VALUES {}{conflict}{returning}", t.name, names.join(", "), rows.join(", "));
+        let sql =
+            format!("INSERT INTO {} ({}) VALUES {}{conflict}{returning}", t.name, names.join(", "), rows.join(", "));
         Stmt::Dml { sql, table: t.name }
     }
 
@@ -1259,7 +1423,8 @@ impl Gen {
                 scope.extend(Self::table_scope(&o, &a));
             }
         }
-        let settable: Vec<&Col> = t.cols.iter().enumerate().filter(|(i, c)| !t.pk.contains(i) && c.name != "ref").map(|(_, c)| c).collect();
+        let settable: Vec<&Col> =
+            t.cols.iter().enumerate().filter(|(i, c)| !t.pk.contains(i) && c.name != "ref").map(|(_, c)| c).collect();
         if settable.is_empty() {
             return self.insert();
         }
@@ -1310,7 +1475,11 @@ impl Gen {
                 let decl = self.col_decl(kind);
                 let name = format!("x{}", self.extra);
                 let col = Col { name: name.clone(), decl: decl.clone(), kind, not_null: false, unique: false };
-                let default = if self.chance(0.5) { format!(" DEFAULT {}", self.col_value(&Col { not_null: true, ..col.clone() })) } else { String::new() };
+                let default = if self.chance(0.5) {
+                    format!(" DEFAULT {}", self.col_value(&Col { not_null: true, ..col.clone() }))
+                } else {
+                    String::new()
+                };
                 self.tables[ti].cols.push(col);
                 Stmt::Dml { sql: format!("ALTER TABLE {} ADD COLUMN {name} {decl}{default}", t.name), table: t.name }
             }

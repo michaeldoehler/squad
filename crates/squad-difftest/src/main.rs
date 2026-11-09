@@ -79,7 +79,13 @@ fn compare(a: &Outcome, b: &Outcome, ordered: bool) -> Diff {
 fn same_value(a: &Option<String>, b: &Option<String>) -> bool {
     match (a, b) {
         (Some(x), Some(y)) if x != y => {
-            let trim = |s: &str| if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s.to_string() };
+            let trim = |s: &str| {
+                if s.contains('.') {
+                    s.trim_end_matches('0').trim_end_matches('.').to_string()
+                } else {
+                    s.to_string()
+                }
+            };
             x.parse::<f64>().is_ok() && y.parse::<f64>().is_ok() && trim(x) == trim(y)
         }
         _ => a == b,
@@ -119,7 +125,9 @@ impl Squad {
                         .iter()
                         .map(|row| {
                             row.iter()
-                                .map(|v| if v.is_null() { None } else { Some(squad::value::format_value(v, &self.ctx)) })
+                                .map(
+                                    |v| if v.is_null() { None } else { Some(squad::value::format_value(v, &self.ctx)) },
+                                )
                                 .collect()
                         })
                         .collect(),
@@ -281,7 +289,12 @@ fn options() -> Options {
         iterations: 10,
         statements: 200,
         only: Only::All,
-        conninfo: format!("host={} port={} user={}", env("PGHOST", "127.0.0.1"), env("PGPORT", "5432"), env("PGUSER", "postgres")),
+        conninfo: format!(
+            "host={} port={} user={}",
+            env("PGHOST", "127.0.0.1"),
+            env("PGPORT", "5432"),
+            env("PGUSER", "postgres")
+        ),
         strict: false,
         minimize: true,
         max_reports: 20,
@@ -375,7 +388,10 @@ fn main() -> ExitCode {
                 } else {
                     (a.clone(), b.clone(), ordered, squad.last_error.borrow().clone())
                 };
-                println!("==== seed {seed}: {} ====", if diff == Diff::Hard { "DIFFERENCE" } else { "SQLSTATE differs" });
+                println!(
+                    "==== seed {seed}: {} ====",
+                    if diff == Diff::Hard { "DIFFERENCE" } else { "SQLSTATE differs" }
+                );
                 for (s, _) in &minimal {
                     println!("{s};");
                 }
