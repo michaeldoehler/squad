@@ -305,3 +305,77 @@ fn concurrent_counter_with_locks() {
     let v = store.begin(Isolation::ReadCommitted).get(b"n").unwrap().unwrap();
     assert_eq!(u64::from_be_bytes(v.try_into().unwrap()), 1600);
 }
+
+/// Readers must always find a complete, consistent snapshot while writers
+/// replace every value and garbage collection removes old versions.
+#[test]
+fn snapshots_survive_concurrent_gc() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const KEYS: u64 = 40;
+    let store = Store::in_memory();
+    let mut t = store.begin(Isolation::ReadCommitted);
+    for k in 0..KEYS {
+        t.put(&k.to_be_bytes(), &100u64.to_be_bytes()).unwrap();
+    }
+    t.commit().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (store, stop) = (store.clone(), stop.clone());
+        thread::spawn(move || {
+            let mut i = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                i += 1;
+                // Move one unit between two keys: the total stays put.
+                let (a, b) = (i % KEYS, (i * 7 + 3) % KEYS);
+                if a == b {
+                    continue;
+                }
+                let mut t = store.begin(Isolation::RepeatableRead);
+                let read = |t: &squad_kv::Txn, k: u64| {
+                    u64::from_be_bytes(t.get(&k.to_be_bytes()).unwrap().unwrap().try_into().unwrap())
+                };
+                let (va, vb) = (read(&t, a), read(&t, b));
+                if va == 0 {
+                    continue;
+                }
+                t.put_blind(&a.to_be_bytes(), &(va - 1).to_be_bytes()).unwrap();
+                t.put_blind(&b.to_be_bytes(), &(vb + 1).to_be_bytes()).unwrap();
+                t.commit().unwrap();
+                if i % 16 == 0 {
+                    store.gc().unwrap();
+                }
+            }
+        })
+    };
+    let readers: Vec<_> = (0..4)
+        .map(|r| {
+            let (store, stop) = (store.clone(), stop.clone());
+            thread::spawn(move || {
+                let mut rounds = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let mut t = store.begin(if r % 2 == 0 { Isolation::RepeatableRead } else { Isolation::ReadCommitted });
+                    for _ in 0..3 {
+                        let rows = t.scan(U, U, r % 3 == 0, usize::MAX).unwrap();
+                        assert_eq!(rows.len() as u64, KEYS, "a key vanished from a snapshot");
+                        let total: u64 = rows.iter().map(|(_, v)| u64::from_be_bytes(v.as_slice().try_into().unwrap())).sum();
+                        assert_eq!(total, KEYS * 100, "snapshot is not consistent");
+                        // Point reads agree with the scan under Repeatable Read.
+                        if r % 2 == 0 {
+                            let (k, v) = &rows[(rounds % KEYS) as usize];
+                            assert_eq!(t.get(k).unwrap().as_ref(), Some(v));
+                        }
+                        t.refresh_snapshot();
+                        rounds += 1;
+                    }
+                }
+                rounds
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(1500));
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    for r in readers {
+        assert!(r.join().unwrap() > 0);
+    }
+}

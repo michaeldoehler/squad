@@ -38,8 +38,12 @@ pub struct Shared {
     sequences: Mutex<HashMap<u32, SeqState>>,
     /// Plans of ad-hoc statements, keyed by search path and SQL text.
     plan_cache: Mutex<HashMap<String, Arc<Prepared>>>,
-    next_pid: AtomicI32,
+        next_pid: AtomicI32,
     pub database_name: String,
+    /// Version of `catalog`, readable without taking its lock. Sessions
+    /// keep their own reference to the catalog and only go back to the
+    /// shared one when this number changes.
+    catalog_version: std::sync::atomic::AtomicU64,
 }
 
 fn table_lock_key(id: u32) -> Vec<u8> {
@@ -58,20 +62,23 @@ impl Shared {
             Some(bytes) => Catalog::from_bytes(&bytes)?,
             None => Catalog::bootstrap(),
         };
-        drop(txn);
+                drop(txn);
+        let version = catalog.version;
         Ok(Arc::new(Shared {
             store,
             catalog: RwLock::new(Arc::new(catalog)),
             sequences: Mutex::new(HashMap::new()),
             plan_cache: Mutex::new(HashMap::new()),
-            next_pid: AtomicI32::new(1),
+                        next_pid: AtomicI32::new(1),
             database_name: database_name.to_string(),
+            catalog_version: std::sync::atomic::AtomicU64::new(version),
         }))
     }
 
     fn publish_catalog(&self, catalog: Arc<Catalog>) {
         let mut current = self.catalog.write();
-        if catalog.version > current.version {
+                if catalog.version > current.version {
+            self.catalog_version.store(catalog.version, Ordering::Release);
             *current = catalog;
             self.plan_cache.lock().clear();
         }
@@ -90,7 +97,7 @@ impl Shared {
         cache: i64,
         name: &str,
     ) -> Result<i64> {
-                let mut seqs = self.sequences.lock();
+        let mut seqs = self.sequences.lock();
         let state = match seqs.entry(id) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -246,7 +253,7 @@ pub(crate) struct TxnState {
     /// A statement failed; only ROLLBACK is accepted.
     pub(crate) failed: bool,
     /// Started by BEGIN rather than implicitly for one statement.
-        pub(crate) explicit: bool,
+    pub(crate) explicit: bool,
     /// The implicit transaction around a multi-statement string. It acts
     /// like a block while the string runs and ends with it, unless a BEGIN
     /// inside the string takes it over.
@@ -277,7 +284,15 @@ pub struct Session {
     pub(crate) state: SessionState,
     pub(crate) txn: Option<TxnState>,
     /// Statements created by SQL `PREPARE`.
-    pub(crate) named: HashMap<String, Arc<Prepared>>,
+        pub(crate) named: HashMap<String, Arc<Prepared>>,
+        /// The committed catalog as of the last time this session looked.
+    catalog_cache: Arc<Catalog>,
+    /// Current plans of prepared statements whose original plan went
+    /// stale, keyed by the address of the original (which is kept alive
+    /// alongside, so the address cannot be reused).
+        replans: HashMap<usize, (Arc<Prepared>, Arc<Prepared>)>,
+    /// The transaction object of the last finished transaction.
+    spare_txn: Option<Txn>,
 }
 
 fn now_micros() -> i64 {
@@ -290,7 +305,8 @@ pub(crate) fn feature(what: &str) -> Error {
 
 impl Session {
     pub fn new(shared: Arc<Shared>) -> Session {
-        let pid = shared.next_pid.fetch_add(1, Ordering::Relaxed);
+                let pid = shared.next_pid.fetch_add(1, Ordering::Relaxed);
+        let catalog_cache = shared.catalog.read().clone();
         Session {
             shared,
             state: SessionState {
@@ -305,7 +321,10 @@ impl Session {
                 pid,
             },
             txn: None,
-            named: HashMap::new(),
+                                    named: HashMap::new(),
+            catalog_cache,
+                        replans: HashMap::new(),
+            spare_txn: None,
         }
     }
 
@@ -331,11 +350,32 @@ impl Session {
     }
 
     /// The catalog visible to the next statement.
-    pub(crate) fn catalog(&self) -> Arc<Catalog> {
+        pub(crate) fn catalog(&self) -> Arc<Catalog> {
         match &self.txn {
             Some(t) if t.dirty || t.txn.isolation() != Isolation::ReadCommitted => t.catalog.clone(),
+            _ if self.catalog_cache.version == self.shared.catalog_version.load(Ordering::Acquire) => {
+                self.catalog_cache.clone()
+            }
             _ => self.shared.catalog.read().clone(),
         }
+    }
+
+    /// Version of the catalog the next statement will see.
+    fn catalog_version(&self) -> u64 {
+        match &self.txn {
+            Some(t) if t.dirty || t.txn.isolation() != Isolation::ReadCommitted => t.catalog.version,
+            _ => self.shared.catalog_version.load(Ordering::Acquire),
+        }
+    }
+
+    /// The latest committed catalog, through the session's own reference.
+    fn latest_catalog(&mut self) -> Arc<Catalog> {
+                if self.catalog_cache.version != self.shared.catalog_version.load(Ordering::Acquire) {
+            // A private copy: its reference count is then only touched by
+            // this session, not by every session on every statement.
+            self.catalog_cache = Arc::new((**self.shared.catalog.read()).clone());
+        }
+        self.catalog_cache.clone()
     }
 
     // ---------------------------------------------------------------
@@ -345,7 +385,8 @@ impl Session {
     /// Parses and plans one statement. `param_types` gives the types of
     /// `$n` parameters where the client knows them.
     pub fn prepare(&mut self, sql: &str, param_types: &[Option<Type>]) -> Result<Arc<Prepared>> {
-        let mut stmts = parse_sql(sql)?;
+        let parsed = parse_sql(sql);
+        let mut stmts = self.abort_on_error(parsed)?;
         match stmts.len() {
             0 => Ok(Arc::new(self.empty_statement(sql))),
             1 => {
@@ -368,8 +409,24 @@ impl Session {
         }
     }
 
+    /// An error while parsing or analyzing a statement aborts the open
+    /// transaction, just like an error while running it.
+    fn abort_on_error<T>(&mut self, result: Result<T>) -> Result<T> {
+        if result.is_err() {
+            if let Some(t) = &mut self.txn {
+                t.failed = true;
+            }
+        }
+        result
+    }
+
     fn prepare_raw(&mut self, sql: &str, raw: pb::RawStmt, param_types: &[Option<Type>]) -> Result<Prepared> {
-                let Some(stmt) = raw.stmt.and_then(|s| s.node) else { return Ok(self.empty_statement(sql)) };
+        let prepared = self.analyze(sql, raw, param_types);
+        self.abort_on_error(prepared)
+    }
+
+    fn analyze(&mut self, sql: &str, raw: pb::RawStmt, param_types: &[Option<Type>]) -> Result<Prepared> {
+        let Some(stmt) = raw.stmt.and_then(|s| s.node) else { return Ok(self.empty_statement(sql)) };
         // In an aborted transaction nothing but transaction control is
         // analyzed, so the error is 25P02 rather than whatever the
         // statement would have failed with.
@@ -426,13 +483,13 @@ impl Session {
 
     /// Returns a plan for ad-hoc SQL, reusing a cached one when the
     /// catalog has not changed.
-        fn cache_lookup(&self, sql: &str) -> Option<Arc<Prepared>> {
+    fn cache_lookup(&self, sql: &str) -> Option<Arc<Prepared>> {
         if self.txn.as_ref().is_some_and(|t| t.dirty) {
             return None;
         }
         let key = format!("{}\u{0}{}", self.state.search_path.join(","), sql);
         let hit = self.shared.plan_cache.lock().get(&key).cloned()?;
-        (hit.catalog_version == self.catalog().version).then_some(hit)
+                (hit.catalog_version == self.catalog_version()).then_some(hit)
     }
 
     fn cached(&mut self, sql: &str) -> Result<Arc<Prepared>> {
@@ -477,19 +534,20 @@ impl Session {
     /// Like [`execute`](Session::execute), but hands every statement's
     /// result to `on_result` as soon as it is available, so that results
     /// of the statements before a failing one are not lost.
-        pub fn execute_each(&mut self, sql: &str, on_result: &mut dyn FnMut(QueryResult) -> Result<()>) -> Result<()> {
+    pub fn execute_each(&mut self, sql: &str, on_result: &mut dyn FnMut(QueryResult) -> Result<()>) -> Result<()> {
         // A cache hit means the text is a single, already planned statement:
         // skip parsing altogether.
         if let Some(prepared) = self.cache_lookup(sql) {
             return on_result(self.execute_prepared(&prepared, &[])?);
         }
-        let stmts = parse_sql(sql)?;
+        let parsed = parse_sql(sql);
+        let stmts = self.abort_on_error(parsed)?;
         if stmts.len() <= 1 {
             let prepared = self.cached(sql)?;
             return on_result(self.execute_prepared(&prepared, &[])?);
         }
         let implicit_block = self.txn.is_none();
-                if implicit_block {
+        if implicit_block {
             self.begin(None, false)?;
             let t = self.txn.as_mut().unwrap();
             t.explicit = true;
@@ -507,7 +565,7 @@ impl Session {
                 break;
             }
         }
-                // The string may have ended its transaction itself (COMMIT) or
+        // The string may have ended its transaction itself (COMMIT) or
         // opened a real block (BEGIN), which then stays open.
         if let Some(t) = self.txn.as_ref().filter(|t| implicit_block && t.batch) {
             if outcome.is_ok() && !t.failed {
@@ -548,7 +606,7 @@ impl Session {
                         crate::expr::enum_value(ty, other.as_str().unwrap_or_default())?
                     }
                 },
-                                (v, Some(t)) if v.type_of() == t.base() => v.clone(),
+                (v, Some(t)) if v.type_of() == t.base() => v.clone(),
                 (v, Some(t)) => crate::value::cast(v.clone(), &t.base(), &ctx)?,
             });
         }
@@ -563,18 +621,40 @@ impl Session {
     /// Runs a prepared statement.
     pub fn execute_prepared(&mut self, stmt: &Arc<Prepared>, params: &[Value]) -> Result<QueryResult> {
         // Re-plan if the schema or the search path changed since planning.
-        let catalog = self.catalog();
+                let current_version = self.catalog_version();
         let stale = match &stmt.kind {
-            Kind::Plan { .. } => stmt.catalog_version != catalog.version || stmt.search_path != self.state.search_path,
+            Kind::Plan { .. } => stmt.catalog_version != current_version || stmt.search_path != self.state.search_path,
             _ => false,
         };
-        let replanned;
+                let replanned;
         let stmt = if stale {
-            let types: Vec<Option<Type>> = stmt.param_types.iter().cloned().map(Some).collect();
-            replanned = self.prepare(&stmt.sql, &types)?;
-            if replanned.columns.iter().map(|c| &c.ty).ne(stmt.columns.iter().map(|c| &c.ty)) {
-                return Err(Error::new(sqlstate::FEATURE_NOT_SUPPORTED, "cached plan must not change result type"));
-            }
+            // The caller keeps its handle to the outdated plan, so remember
+            // the new one instead of planning again on every execution.
+            let key = Arc::as_ptr(stmt) as usize;
+            let reusable = self.replans.get(&key).filter(|(original, new)| {
+                Arc::ptr_eq(original, stmt)
+                    && new.catalog_version == current_version
+                    && new.search_path == self.state.search_path
+            });
+            replanned = match reusable {
+                Some((_, new)) => new.clone(),
+                None => {
+                    let types: Vec<Option<Type>> = stmt.param_types.iter().cloned().map(Some).collect();
+                    let new = self.prepare(&stmt.sql, &types)?;
+                    if new.columns.iter().map(|c| &c.ty).ne(stmt.columns.iter().map(|c| &c.ty)) {
+                        return Err(Error::new(sqlstate::FEATURE_NOT_SUPPORTED, "cached plan must not change result type"));
+                    }
+                    if self.replans.len() >= 1024 {
+                        self.replans.clear();
+                    }
+                    // Plans made inside a transaction that changed the
+                    // schema are only valid there.
+                    if !self.txn.as_ref().is_some_and(|t| t.dirty) {
+                        self.replans.insert(key, (stmt.clone(), new.clone()));
+                    }
+                    new
+                }
+            };
             &replanned
         } else {
             stmt
@@ -638,10 +718,12 @@ impl Session {
     /// Makes sure a transaction is open and its snapshot and catalog are
     /// current for a new statement.
     pub(crate) fn start_statement(&mut self) -> Result<&mut TxnState> {
-        if self.txn.is_none() {
+                if self.txn.is_none() {
+            // A new transaction starts with the latest snapshot and catalog.
             self.begin(None, false)?;
+            return Ok(self.txn.as_mut().unwrap());
         }
-        let latest = self.shared.catalog.read().clone();
+        let latest = self.latest_catalog();
         let t = self.txn.as_mut().unwrap();
         t.txn.refresh_snapshot();
         if !t.dirty && t.txn.isolation() == Isolation::ReadCommitted {
@@ -694,15 +776,22 @@ impl Session {
     // ---------------------------------------------------------------
 
     pub(crate) fn begin(&mut self, isolation: Option<Isolation>, explicit: bool) -> Result<()> {
-        let isolation = isolation.unwrap_or(self.state.default_isolation);
-        let catalog = self.shared.catalog.read().clone();
-        let txn = self.shared.store.begin(isolation);
+                let isolation = isolation.unwrap_or(self.state.default_isolation);
+                let catalog = self.latest_catalog();
+        // Reuse the previous transaction object where there is one.
+        let txn = match self.spare_txn.take() {
+            Some(mut txn) => {
+                txn.restart(isolation);
+                txn
+            }
+            None => self.shared.store.begin(isolation),
+        };
         self.txn = Some(TxnState {
             txn,
             catalog,
             dirty: false,
             failed: false,
-                        explicit,
+            explicit,
             batch: false,
             savepoints: Vec::new(),
             start_time: now_micros(),
@@ -716,8 +805,10 @@ impl Session {
         if t.failed {
             return Ok(());
         }
-        let TxnState { txn, catalog, dirty, .. } = t;
-        txn.commit()?;
+                let TxnState { mut txn, catalog, dirty, .. } = t;
+        let result = txn.end(true);
+        self.spare_txn = Some(txn);
+        result?;
         if dirty {
             self.shared.publish_catalog(catalog);
         }
@@ -725,8 +816,9 @@ impl Session {
     }
 
     pub(crate) fn rollback(&mut self) {
-        if let Some(t) = self.txn.take() {
-            t.txn.rollback();
+        if let Some(mut t) = self.txn.take() {
+            let _ = t.txn.end(false);
+            self.spare_txn = Some(t.txn);
             for id in t.reset_counters {
                 let _ = self.shared.reset_counter(id);
             }
@@ -801,8 +893,14 @@ impl Session {
                 None => Arc::new(Catalog::bootstrap()),
             };
         }
-        let mut catalog = (*t.catalog).clone();
+                let mut catalog = (*t.catalog).clone();
+        let before = catalog.to_bytes();
         let result = f(&mut catalog, &mut t.txn, &shared, &mut self.state)?;
+        // A statement that changed nothing (`IF NOT EXISTS` on an existing
+        // object) must not invalidate every cached plan.
+        if catalog.to_bytes() == before {
+            return Ok(result);
+        }
         catalog.version += 1;
         t.txn.put_blind(CATALOG_KEY, &catalog.to_bytes())?;
         t.catalog = Arc::new(catalog);

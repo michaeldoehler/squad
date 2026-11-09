@@ -1,0 +1,16 @@
+[package]
+name = "squad-bench"
+description = "Benchmarks comparing squad with PostgreSQL and SQLite."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+squad.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+postgres = "0.19"
+tempfile = "3"

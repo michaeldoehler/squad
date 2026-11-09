@@ -50,7 +50,9 @@ pub struct Txn {
     inner: Arc<Inner>,
     id: u64,
     isolation: Isolation,
-    snapshot: u64,
+        snapshot: u64,
+    /// Registration of `snapshot` with the store.
+    slot: crate::store::SnapshotSlot,
     read_only: bool,
     writes: BTreeMap<Vec<u8>, Write>,
     /// Undo journal for savepoints: previous state of each overwritten key.
@@ -81,6 +83,28 @@ fn in_range(key: &[u8], (lo, hi): &Range) -> bool {
     })
 }
 
+/// Hands out transaction ids from a per-thread block, so that starting a
+/// transaction does not write to a counter shared by all threads.
+fn next_id(inner: &Arc<Inner>) -> u64 {
+    use std::cell::Cell;
+    const BLOCK: u64 = 1024;
+    thread_local! {
+        /// (store the block belongs to, next id, end of block)
+        static IDS: Cell<(usize, u64, u64)> = const { Cell::new((0, 0, 0)) };
+    }
+    let store = Arc::as_ptr(inner) as usize;
+    IDS.with(|ids| {
+        let (owner, next, end) = ids.get();
+        if owner == store && next < end {
+            ids.set((owner, next + 1, end));
+            return next;
+        }
+        let start = inner.next_txn_id.fetch_add(BLOCK, Ordering::Relaxed);
+        ids.set((store, start + 1, start + BLOCK));
+        start
+    })
+}
+
 fn ts_of(enc: &[u8]) -> u64 {
     !u64::from_be_bytes(enc[enc.len() - 8..].try_into().unwrap())
 }
@@ -90,13 +114,14 @@ impl Txn {
         if isolation == Isolation::Serializable {
             inner.serializable_live.fetch_add(1, Ordering::SeqCst);
         }
-        let snapshot = inner.register_snapshot();
-        let id = inner.next_txn_id.fetch_add(1, Ordering::Relaxed);
+                        let id = next_id(&inner);
+        let (snapshot, slot) = inner.register_snapshot(id);
         Txn {
             inner,
             id,
             isolation,
-            snapshot,
+                        snapshot,
+            slot,
             read_only: false,
             writes: BTreeMap::new(),
             journal: Vec::new(),
@@ -139,9 +164,7 @@ impl Txn {
     /// every statement; under the other levels it is a no-op.
     pub fn refresh_snapshot(&mut self) {
         if self.isolation == Isolation::ReadCommitted {
-            let new = self.inner.register_snapshot();
-            self.inner.unregister_snapshot(self.snapshot);
-            self.snapshot = new;
+                        self.snapshot = self.inner.advance_snapshot(&mut self.slot);
         }
     }
 
@@ -455,9 +478,13 @@ impl Txn {
         if self.finished {
             return;
         }
-        self.finished = true;
-        self.inner.locks.release_all(self.id, self.locks.keys());
-        self.inner.unregister_snapshot(self.snapshot);
+                self.finished = true;
+        // Most transactions hold no row locks; do not touch the shared
+        // lock table for them.
+        if !self.locks.is_empty() {
+            self.inner.locks.release_all(self.id, self.locks.keys());
+        }
+                self.inner.unregister_snapshot(&self.slot);
         if self.isolation == Isolation::Serializable {
             self.inner.serializable_live.fetch_sub(1, Ordering::SeqCst);
         }
@@ -528,12 +555,43 @@ impl Txn {
         Ok(())
     }
 
-    /// Makes all buffered writes durable and visible. On error nothing was
+        /// Makes all buffered writes durable and visible. On error nothing was
     /// applied and the transaction is rolled back.
     pub fn commit(mut self) -> Result<()> {
-        let result = self.commit_inner();
+        self.end(true)
+    }
+
+    /// Ends the transaction in place, by commit or rollback, so that the
+    /// object can be reused with [`restart`](Txn::restart). Sessions that
+    /// run one short transaction after another avoid setting up a new
+    /// transaction object for each.
+    pub fn end(&mut self, commit: bool) -> Result<()> {
+        let result = if commit && !self.finished { self.commit_inner() } else { Ok(()) };
         self.finish();
         result
+    }
+
+    /// Starts a new transaction in an object whose previous transaction
+    /// has ended.
+    pub fn restart(&mut self, isolation: Isolation) {
+        assert!(self.finished, "restart of a transaction that is still running");
+        if isolation == Isolation::Serializable {
+            self.inner.serializable_live.fetch_add(1, Ordering::SeqCst);
+        }
+        self.id = next_id(&self.inner);
+        let (snapshot, slot) = self.inner.register_snapshot(self.id);
+        self.isolation = isolation;
+        self.snapshot = snapshot;
+        self.slot = slot;
+        self.read_only = false;
+        self.writes.clear();
+        self.journal.clear();
+        self.journaling = false;
+        self.locks.clear();
+        let reads = self.reads.get_mut();
+        reads.keys.clear();
+        reads.ranges.clear();
+        self.finished = false;
     }
 
     /// Discards all buffered writes and releases all locks.

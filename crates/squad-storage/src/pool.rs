@@ -10,16 +10,25 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 
 use crate::page::{self, PageBuf, PAGE_SIZE};
 use crate::vfs::VfsFile;
 use crate::{Result, StorageError};
 
-const SHARDS: usize = 16;
+const SHARDS: usize = 64;
+
+/// Cache hits are counted per thread and added to the shared counter in
+/// batches, so that readers do not write to a shared cache line on every
+/// page access.
+const HIT_BATCH: u64 = 1024;
+thread_local! {
+    static LOCAL_HITS: Cell<u64> = const { Cell::new(0) };
+}
 
 #[derive(Default)]
 struct IdHasher(u64);
@@ -43,7 +52,9 @@ struct Entry {
     page: Arc<PageBuf>,
     /// 0 when clean, otherwise the pool epoch of the last modification.
     dirty_epoch: u64,
-    referenced: bool,
+    /// Set on access, cleared by the eviction clock. Atomic so that
+    /// readers can set it under the shared lock.
+    referenced: AtomicBool,
 }
 
 #[derive(Default)]
@@ -52,7 +63,6 @@ struct Shard {
     slots: Vec<Option<Entry>>,
     free: Vec<usize>,
     hand: usize,
-    hits: u64,
 }
 
 impl Shard {
@@ -84,8 +94,7 @@ impl Shard {
                 if e.dirty_epoch != 0 {
                     continue;
                 }
-                if e.referenced {
-                    e.referenced = false;
+                if e.referenced.swap(false, Ordering::Relaxed) {
                     continue;
                 }
                 let pid = e.pid;
@@ -99,23 +108,25 @@ impl Shard {
 }
 
 pub struct Pool {
-    shards: Vec<Mutex<Shard>>,
+    shards: Vec<RwLock<Shard>>,
     file: Arc<dyn VfsFile>,
     cap_per_shard: usize,
     epoch: AtomicU64,
     dirty: AtomicU64,
     misses: AtomicU64,
+    hits: AtomicU64,
 }
 
 impl Pool {
     pub fn new(file: Arc<dyn VfsFile>, cache_pages: usize) -> Pool {
         Pool {
-            shards: (0..SHARDS).map(|_| Mutex::new(Shard::default())).collect(),
+            shards: (0..SHARDS).map(|_| RwLock::new(Shard::default())).collect(),
             file,
             cap_per_shard: (cache_pages / SHARDS).max(4),
             epoch: AtomicU64::new(1),
             dirty: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
         }
     }
 
@@ -137,20 +148,32 @@ impl Pool {
     pub fn get(&self, pid: u32) -> Result<Arc<PageBuf>> {
         let shard = &self.shards[pid as usize % SHARDS];
         {
-            let mut s = shard.lock();
+            // Hot path: a shared lock and no writes to shared memory other
+            // than the page's reference count.
+            let s = shard.read();
             if let Some(&i) = s.map.get(&pid) {
-                s.hits += 1;
-                let e = s.slots[i].as_mut().unwrap();
-                e.referenced = true;
+                let e = s.slots[i].as_ref().unwrap();
+                if !e.referenced.load(Ordering::Relaxed) {
+                    e.referenced.store(true, Ordering::Relaxed);
+                }
+                LOCAL_HITS.with(|h| {
+                    let n = h.get() + 1;
+                    if n == HIT_BATCH {
+                        self.hits.fetch_add(HIT_BATCH, Ordering::Relaxed);
+                        h.set(0);
+                    } else {
+                        h.set(n);
+                    }
+                });
                 return Ok(e.page.clone());
             }
         }
         let page = self.load(pid)?;
-        let mut s = shard.lock();
+        let mut s = shard.write();
         if let Some(&i) = s.map.get(&pid) {
             return Ok(s.slots[i].as_ref().unwrap().page.clone());
         }
-        s.insert(Entry { pid, page: page.clone(), dirty_epoch: 0, referenced: true }, self.cap_per_shard);
+        s.insert(Entry { pid, page: page.clone(), dirty_epoch: 0, referenced: AtomicBool::new(true) }, self.cap_per_shard);
         Ok(page)
     }
 
@@ -158,13 +181,13 @@ impl Pool {
     /// touch the pool.
     pub fn update<R>(&self, pid: u32, f: impl FnOnce(&mut PageBuf) -> R) -> Result<R> {
         let shard = &self.shards[pid as usize % SHARDS];
-        let mut s = shard.lock();
+        let mut s = shard.write();
         if !s.map.contains_key(&pid) {
             drop(s);
             let page = self.load(pid)?;
-            s = shard.lock();
+            s = shard.write();
             if !s.map.contains_key(&pid) {
-                s.insert(Entry { pid, page, dirty_epoch: 0, referenced: true }, self.cap_per_shard);
+                s.insert(Entry { pid, page, dirty_epoch: 0, referenced: AtomicBool::new(true) }, self.cap_per_shard);
             }
         }
         let i = s.map[&pid];
@@ -173,25 +196,25 @@ impl Pool {
             self.dirty.fetch_add(1, Ordering::Relaxed);
         }
         e.dirty_epoch = self.epoch.load(Ordering::Relaxed);
-        e.referenced = true;
+        e.referenced.store(true, Ordering::Relaxed);
         Ok(f(Arc::make_mut(&mut e.page)))
     }
 
     /// Installs a new image for page `pid` and marks it dirty.
     pub fn put(&self, pid: u32, page: PageBuf) {
         let epoch = self.epoch.load(Ordering::Relaxed);
-        let mut s = self.shards[pid as usize % SHARDS].lock();
+        let mut s = self.shards[pid as usize % SHARDS].write();
         if let Some(&i) = s.map.get(&pid) {
             let e = s.slots[i].as_mut().unwrap();
             if e.dirty_epoch == 0 {
                 self.dirty.fetch_add(1, Ordering::Relaxed);
             }
             e.dirty_epoch = epoch;
-            e.referenced = true;
+            e.referenced.store(true, Ordering::Relaxed);
             e.page = Arc::new(page);
         } else {
             self.dirty.fetch_add(1, Ordering::Relaxed);
-            s.insert(Entry { pid, page: Arc::new(page), dirty_epoch: epoch, referenced: true }, self.cap_per_shard);
+            s.insert(Entry { pid, page: Arc::new(page), dirty_epoch: epoch, referenced: AtomicBool::new(true) }, self.cap_per_shard);
         }
     }
 
@@ -201,7 +224,7 @@ impl Pool {
     pub fn collect_dirty(&self) -> (u64, Vec<(u32, Arc<PageBuf>)>) {
         let mut out = Vec::new();
         for shard in &self.shards {
-            let s = shard.lock();
+            let s = shard.read();
             for e in s.slots.iter().flatten() {
                 if e.dirty_epoch != 0 {
                     out.push((e.pid, e.page.clone()));
@@ -215,7 +238,7 @@ impl Pool {
     /// Marks pages clean unless they were modified after `epoch`.
     pub fn mark_clean(&self, pids: impl Iterator<Item = u32>, epoch: u64) {
         for pid in pids {
-            let mut s = self.shards[pid as usize % SHARDS].lock();
+            let mut s = self.shards[pid as usize % SHARDS].write();
             if let Some(&i) = s.map.get(&pid) {
                 let e = s.slots[i].as_mut().unwrap();
                 if e.dirty_epoch != 0 && e.dirty_epoch <= epoch {
@@ -233,12 +256,9 @@ impl Pool {
     /// (cached pages, cache hits, cache misses)
     pub fn counters(&self) -> (u64, u64, u64) {
         let mut cached = 0;
-        let mut hits = 0;
         for shard in &self.shards {
-            let s = shard.lock();
-            cached += s.map.len() as u64;
-            hits += s.hits;
+            cached += shard.read().map.len() as u64;
         }
-        (cached, hits, self.misses.load(Ordering::Relaxed))
+        (cached, self.hits.load(Ordering::Relaxed), self.misses.load(Ordering::Relaxed))
     }
 }

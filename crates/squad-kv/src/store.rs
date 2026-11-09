@@ -14,6 +14,48 @@ use crate::Result;
 /// Write set of one commit: `(commit timestamp, keys written)`.
 pub(crate) type CommitRecord = (u64, Arc<Vec<Vec<u8>>>);
 
+/// Number of snapshots that can be registered without taking a lock.
+const SNAPSHOT_SLOTS: usize = 128;
+
+/// One registered snapshot: `0` when free, otherwise its timestamp plus
+/// one. Padded so that transactions on different cores do not share a
+/// cache line.
+#[repr(align(64))]
+pub(crate) struct Slot(AtomicU64);
+
+/// Registry of the snapshots in use, which bound what garbage collection
+/// may remove. Registration is lock-free in the common case, because
+/// every statement of every session passes through it.
+pub(crate) struct Snapshots {
+    slots: Box<[Slot]>,
+    /// Timestamps with reference counts, used when all slots are taken.
+    overflow: Mutex<BTreeMap<u64, usize>>,
+}
+
+impl Snapshots {
+    fn new() -> Snapshots {
+        Snapshots {
+            slots: (0..SNAPSHOT_SLOTS).map(|_| Slot(AtomicU64::new(0))).collect(),
+            overflow: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+/// Handle of a registered snapshot.
+pub(crate) enum SnapshotSlot {
+    Fast(usize),
+    Overflow(u64),
+}
+
+fn release_overflow(overflow: &mut BTreeMap<u64, usize>, ts: u64) {
+    if let Some(n) = overflow.get_mut(&ts) {
+        *n -= 1;
+        if *n == 0 {
+            overflow.remove(&ts);
+        }
+    }
+}
+
 pub(crate) struct Inner {
     pub(crate) engine: Arc<dyn Engine>,
     /// Serializes validation, timestamp assignment and batch application.
@@ -21,7 +63,7 @@ pub(crate) struct Inner {
     /// Newest commit timestamp visible to new snapshots.
     pub(crate) last_committed: AtomicU64,
     /// Snapshot timestamps in use, with reference counts.
-    pub(crate) active: Mutex<BTreeMap<u64, usize>>,
+        pub(crate) snapshots: Snapshots,
     pub(crate) locks: LockManager,
     pub(crate) next_txn_id: AtomicU64,
     /// Number of live serializable transactions; commits only record their
@@ -32,28 +74,84 @@ pub(crate) struct Inner {
 }
 
 impl Inner {
-    pub(crate) fn register_snapshot(&self) -> u64 {
-        let mut active = self.active.lock();
+        /// Takes a snapshot at the latest commit and registers it so that the
+    /// versions it can see are kept. `hint` spreads transactions over the
+    /// registry. Returns the timestamp and the registration to release.
+    pub(crate) fn register_snapshot(&self, hint: u64) -> (u64, SnapshotSlot) {
+        let n = self.snapshots.slots.len();
+        for probe in 0..n {
+            let i = (hint as usize).wrapping_add(probe) % n;
+            let ts = self.last_committed.load(Ordering::SeqCst);
+            let slot = &self.snapshots.slots[i].0;
+            if slot.compare_exchange(0, ts + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                return (self.settle(slot, ts), SnapshotSlot::Fast(i));
+            }
+        }
+        // More concurrent transactions than slots.
+        let mut overflow = self.snapshots.overflow.lock();
         let ts = self.last_committed.load(Ordering::SeqCst);
-        *active.entry(ts).or_insert(0) += 1;
-        ts
+        *overflow.entry(ts).or_insert(0) += 1;
+        (ts, SnapshotSlot::Overflow(ts))
     }
 
-    pub(crate) fn unregister_snapshot(&self, ts: u64) {
-        let mut active = self.active.lock();
-        if let Some(n) = active.get_mut(&ts) {
-            *n -= 1;
-            if *n == 0 {
-                active.remove(&ts);
+    /// Makes sure the timestamp published in `slot` is the latest commit.
+    ///
+    /// A garbage collector computes its horizon either before the slot was
+    /// published — then from a `last_committed` that is not newer than the
+    /// value confirmed here — or after, in which case it sees the slot.
+    /// Either way it keeps everything this snapshot reads.
+    fn settle(&self, slot: &AtomicU64, mut ts: u64) -> u64 {
+        loop {
+            let now = self.last_committed.load(Ordering::SeqCst);
+            if now == ts {
+                return ts;
             }
+            ts = now;
+            slot.store(ts + 1, Ordering::SeqCst);
+        }
+    }
+
+    /// Moves a registered snapshot forward to the latest commit.
+    pub(crate) fn advance_snapshot(&self, slot: &mut SnapshotSlot) -> u64 {
+        match slot {
+            SnapshotSlot::Fast(i) => {
+                let slot = &self.snapshots.slots[*i].0;
+                let ts = self.last_committed.load(Ordering::SeqCst);
+                slot.store(ts + 1, Ordering::SeqCst);
+                self.settle(slot, ts)
+            }
+            SnapshotSlot::Overflow(old) => {
+                let mut overflow = self.snapshots.overflow.lock();
+                release_overflow(&mut overflow, *old);
+                let ts = self.last_committed.load(Ordering::SeqCst);
+                *overflow.entry(ts).or_insert(0) += 1;
+                *old = ts;
+                ts
+            }
+        }
+    }
+
+    pub(crate) fn unregister_snapshot(&self, slot: &SnapshotSlot) {
+        match slot {
+            SnapshotSlot::Fast(i) => self.snapshots.slots[*i].0.store(0, Ordering::SeqCst),
+            SnapshotSlot::Overflow(ts) => release_overflow(&mut self.snapshots.overflow.lock(), *ts),
         }
     }
 
     /// Oldest timestamp any current or future snapshot may read at.
     pub(crate) fn oldest_snapshot(&self) -> u64 {
-        let active = self.active.lock();
-        let last = self.last_committed.load(Ordering::SeqCst);
-        active.keys().next().copied().unwrap_or(last).min(last)
+        let overflow = self.snapshots.overflow.lock();
+        let mut oldest = self.last_committed.load(Ordering::SeqCst);
+        for slot in self.snapshots.slots.iter() {
+            match slot.0.load(Ordering::SeqCst) {
+                0 => {}
+                published => oldest = oldest.min(published - 1),
+            }
+        }
+        match overflow.keys().next() {
+            Some(ts) => oldest.min(*ts),
+            None => oldest,
+        }
     }
 }
 
@@ -78,7 +176,7 @@ impl Store {
                 engine,
                 commit_lock: Mutex::new(()),
                 last_committed: AtomicU64::new(last),
-                active: Mutex::new(BTreeMap::new()),
+                                snapshots: Snapshots::new(),
                 locks: LockManager::default(),
                 next_txn_id: AtomicU64::new(1),
                 serializable_live: AtomicUsize::new(0),
