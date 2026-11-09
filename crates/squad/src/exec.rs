@@ -490,7 +490,10 @@ impl<'p> ScanNode<'p> {
         if plan.index.is_none() && plan.eq.len() == plan.table.pk.len() {
             return Ok(ScanNode { plan, state: ScanState::Point(base) });
         }
-        let mut bound = |b: &Option<(Expr, bool)>| -> Result<Option<Option<(Vec<u8>, bool)>>> {
+                // `None`: the bound is NULL, so nothing can match. `Some(None)`:
+        // the scan is open on that side.
+        type KeyBound = Option<(Vec<u8>, bool)>;
+        let mut bound = |b: &Option<(Expr, bool)>| -> Result<Option<KeyBound>> {
             match b {
                 None => Ok(Some(None)),
                 Some((e, inclusive)) => {

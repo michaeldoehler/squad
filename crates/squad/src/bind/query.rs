@@ -979,7 +979,7 @@ impl<'a> Binder<'a> {
             self.outer_scopes.push(l.clone());
             self.correlated.push(false);
         }
-        let bound = (|| -> Result<(Plan, Vec<(String, Type)>, String)> {
+        let bound = (|| -> Result<(Plan, super::expr::Columns, String)> {
             match node(call)? {
                 N::FuncCall(f) => {
                     let fname = name_list(&f.funcname)?.pop().unwrap_or_default().to_ascii_lowercase();

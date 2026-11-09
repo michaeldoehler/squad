@@ -11,6 +11,9 @@ use crate::{sqlstate, Error, Result};
 
 pub(crate) type Typed = (Expr, Type);
 
+/// Names and types of the columns a set-returning function produces.
+pub(crate) type Columns = Vec<(String, Type)>;
+
 fn agg_func(name: &str) -> Option<AggFunc> {
     Some(match name {
         "count" => AggFunc::Count,
@@ -156,7 +159,7 @@ impl<'a> Binder<'a> {
         }
     }
 
-    fn to_bool(&mut self, (e, t): Typed, what: &str) -> Result<Expr> {
+        fn boolean(&mut self, (e, t): Typed, what: &str) -> Result<Expr> {
         match t {
             Type::Bool => Ok(e),
             Type::Unknown => self.coerce(e, &t, &Type::Bool),
@@ -513,7 +516,7 @@ impl<'a> Binder<'a> {
                 Some(op) => {
                     let rhs = self.bind_expr(when, scope)?;
                     let cmp = self.bind_op("=", Some(op.clone()), rhs)?;
-                    self.to_bool(cmp, "CASE/WHEN")?
+                    self.boolean(cmp, "CASE/WHEN")?
                 }
                 None => self.bind_bool(when, scope, "CASE/WHEN")?,
             };
@@ -698,8 +701,8 @@ impl<'a> Binder<'a> {
         &mut self,
         kind: &Srf,
         name: &str,
-        args: Vec<Typed>,
-    ) -> Result<(Vec<Expr>, Vec<(String, Type)>)> {
+                args: Vec<Typed>,
+    ) -> Result<(Vec<Expr>, Columns)> {
         let types: Vec<Type> = args.iter().map(|(_, t)| t.clone()).collect();
         let bad = || undefined_function(name, &types);
         let coerce_all = |b: &mut Self, want: &[Type]| -> Result<Vec<Expr>> {
@@ -762,15 +765,15 @@ impl<'a> Binder<'a> {
                 if types.len() != 1 {
                     return Err(bad());
                 }
-                (coerce_all(self, &[src.clone()])?, vec![("value".to_string(), if *text { Type::Text } else { src })])
+                (coerce_all(self, std::slice::from_ref(&src))?, vec![("value".to_string(), if *text { Type::Text } else { src })])
             }
             Srf::JsonEach { text } => {
                 let src = if name.starts_with("json_") { Type::Json } else { Type::Jsonb };
                 if types.len() != 1 {
                     return Err(bad());
                 }
-                (
-                    coerce_all(self, &[src.clone()])?,
+                                (
+                    coerce_all(self, std::slice::from_ref(&src))?,
                     vec![("key".to_string(), Type::Text), ("value".to_string(), if *text { Type::Text } else { src })],
                 )
             }

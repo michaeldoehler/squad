@@ -1462,6 +1462,80 @@ fn alter_table_cmd(sess: &mut Session, rv: &pb::RangeVar, cmd: &pb::AlterTableCm
                 _ => Err(feature("this kind of constraint")),
             }
         }
+        A::AtAddIdentity => {
+            // ALTER COLUMN ... ADD GENERATED ... AS IDENTITY, as written by
+            // pg_dump: creates the sequence and makes it the default.
+            let idx = column(&cmd.name)?;
+            let Some(N::Constraint(con)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
+                return Err(Error::internal("ADD IDENTITY without definition"));
+            };
+            if !table.columns[idx].ty.is_integer() {
+                return Err(Error::new(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "identity column type must be smallint, integer, or bigint",
+                ));
+            }
+            if table.columns[idx].default.is_some() {
+                return Err(Error::new(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!("column \"{}\" of relation \"{}\" already has a default value", cmd.name, table.name),
+                ));
+            }
+            // The sequence name may be given explicitly.
+            let mut seq_name: Option<Vec<String>> = None;
+            let mut options = Vec::new();
+            for o in &con.options {
+                match o.node.as_ref() {
+                    Some(N::DefElem(d)) if d.defname == "sequence_name" => {
+                        seq_name = match d.arg.as_ref().and_then(|a| a.node.as_ref()) {
+                            Some(N::List(l)) => Some(name_list(&l.items)?),
+                            Some(N::RangeVar(rv)) => {
+                                let (schema, name) = range_var_name(rv);
+                                Some(schema.into_iter().chain([name]).map(str::to_string).collect())
+                            }
+                            _ => None,
+                        };
+                    }
+                    _ => options.push(o.clone()),
+                }
+            }
+            let always = con.generated_when == "a";
+            sess.alter_catalog(|catalog, _, shared, _| {
+                let mut t = (*table).clone();
+                let (schema, name) = match &seq_name {
+                    Some(parts) => {
+                        let (schema, name) = qualified(parts);
+                        (creation_schema(catalog, schema, path)?, name.to_string())
+                    }
+                    None => {
+                        let base = format!("{}_{}_seq", t.name, cmd.name);
+                        (t.schema.clone(), free_name(catalog, &t.schema, &base, &[]))
+                    }
+                };
+                if catalog.relation_name_taken(&schema, &name) {
+                    return Err(duplicate_relation(&name));
+                }
+                let mut seq = Sequence {
+                    id: catalog.alloc_id(),
+                    schema: schema.clone(),
+                    name: name.clone(),
+                    start: 1,
+                    increment: 1,
+                    min: 1,
+                    max: int_max(&t.columns[idx].ty),
+                    cycle: false,
+                    owned_by: Some((t.id, cmd.name.clone())),
+                };
+                sequence_options(&mut seq, &options, &mut None)?;
+                shared.reset_counter(seq.id)?;
+                catalog.sequences.insert((schema.clone(), name.clone()), Arc::new(seq));
+                t.columns[idx].default = Some(format!("nextval('{}'::regclass)", quote_qualified(&schema, &name)));
+                t.columns[idx].not_null = true;
+                t.columns[idx].identity_always = always;
+                put_table(catalog, t);
+                Ok(())
+            })
+        }
         A::AtDropConstraint => {
             let name = &cmd.name;
             let is_index = table.indexes.iter().position(|ix| ix.constraint && ix.name == *name);
@@ -2181,10 +2255,8 @@ fn explain(sess: &mut Session, stmt: &pb::ExplainStmt) -> Result<QueryResult> {
         let on = arg.and_then(const_text).is_none_or(|v| !matches!(v.as_str(), "false" | "off" | "0"));
         match name {
             "analyze" => analyze = on,
-            "format" => {
-                if arg.and_then(const_text).is_some_and(|v| !v.eq_ignore_ascii_case("text")) {
-                    return Err(feature("EXPLAIN formats other than TEXT"));
-                }
+                        "format" if arg.and_then(const_text).is_some_and(|v| !v.eq_ignore_ascii_case("text")) => {
+                return Err(feature("EXPLAIN formats other than TEXT"));
             }
             _ => {}
         }

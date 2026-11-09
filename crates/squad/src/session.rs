@@ -90,19 +90,22 @@ impl Shared {
         cache: i64,
         name: &str,
     ) -> Result<i64> {
-        let mut seqs = self.sequences.lock();
-        if !seqs.contains_key(&id) {
-            let txn = self.store.begin(Isolation::ReadCommitted);
-            let state = match txn.get(&sequence_key(id))? {
-                Some(v) if v.len() == 8 => {
-                    let hwm = i64::from_be_bytes(v.try_into().unwrap());
-                    SeqState { next: hwm.saturating_add(increment), reserved: hwm }
-                }
-                _ => SeqState { next: start, reserved: start.saturating_sub(increment) },
-            };
-            seqs.insert(id, state);
-        }
-        let state = seqs.get_mut(&id).unwrap();
+                let mut seqs = self.sequences.lock();
+        let state = match seqs.entry(id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                // First use in this process: continue after the persisted
+                // high-water mark, or start fresh.
+                let txn = self.store.begin(Isolation::ReadCommitted);
+                e.insert(match txn.get(&sequence_key(id))? {
+                    Some(v) if v.len() == 8 => {
+                        let hwm = i64::from_be_bytes(v.try_into().unwrap());
+                        SeqState { next: hwm.saturating_add(increment), reserved: hwm }
+                    }
+                    _ => SeqState { next: start, reserved: start.saturating_sub(increment) },
+                })
+            }
+        };
         let exhausted = |v: i64| if increment > 0 { v > max } else { v < min };
         if exhausted(state.next) {
             if !cycle {
@@ -191,6 +194,7 @@ pub enum Tag {
     Other(&'static str),
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Kind {
     /// A planned query or DML statement.
     Plan {

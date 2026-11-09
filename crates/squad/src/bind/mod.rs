@@ -14,7 +14,7 @@ use crate::catalog::{Catalog, Table};
 use crate::expr::{Expr, FuncRef};
 use crate::plan::{AggCall, WindowCall};
 use crate::types::{Type, Value};
-use crate::value::{self, CastContext};
+use crate::value;
 use crate::{sqlstate, Error, Result};
 
 pub use query::OutputColumn;
@@ -322,7 +322,7 @@ impl<'a> Binder<'a> {
                         decl = format!("{decl}({n})");
                     }
                     (Type::Numeric, [p]) => {
-                        typmod = ((p << 16) | 0) + 4;
+                        typmod = (p << 16) + 4;
                         decl = format!("numeric({p},0)");
                     }
                     (Type::Numeric, [p, s]) => {
@@ -432,22 +432,7 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Implicit coercion that fails with 42804 when Postgres would not
-    /// apply it.
-    pub(crate) fn coerce_checked(
-        &mut self,
-        expr: Expr,
-        from: &Type,
-        to: &Type,
-        ctx: CastContext,
-        what: &str,
-    ) -> Result<Expr> {
-        if from != to && !matches!(from, Type::Unknown) && !value::can_cast(from, to, ctx) {
-            return Err(Error::type_mismatch(format!("{what} is of type {to} but expression is of type {from}"))
-                .with_hint("You will need to rewrite or cast the expression."));
-        }
-        self.coerce(expr, from, to)
-    }
+    
 
     pub(crate) fn alloc_subquery_id(&mut self) -> usize {
         self.next_subquery_id += 1;

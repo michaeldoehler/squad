@@ -29,6 +29,7 @@ mod agg;
 mod api;
 pub mod bind;
 pub mod catalog;
+pub mod copy;
 mod convert;
 mod ddl;
 mod dml;
