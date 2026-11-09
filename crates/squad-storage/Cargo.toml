@@ -1,0 +1,18 @@
+[package]
+name = "squad-storage"
+description = "Durable ordered key-value storage engine for the squad database: page-based B+tree, buffer pool, WAL and crash recovery."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+thiserror.workspace = true
+crc32c = "0.6"
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
