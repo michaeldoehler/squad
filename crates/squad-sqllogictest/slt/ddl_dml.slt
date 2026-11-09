@@ -1,0 +1,294 @@
+# Tables, constraints, INSERT / UPDATE / DELETE.
+
+statement ok
+CREATE TABLE person (id int PRIMARY KEY, name text NOT NULL, age int CHECK (age >= 0), email text UNIQUE, city text DEFAULT 'Berlin')
+
+statement ok
+INSERT INTO person VALUES (1, 'Ada', 36, 'ada@example.org', 'London')
+
+statement ok
+INSERT INTO person (id, name, age) VALUES (2, 'Bob', 25), (3, 'Cy', 51), (4, 'Dee', NULL)
+
+statement ok
+INSERT INTO person (id, name, email) VALUES (5, 'Eve', 'eve@example.org')
+
+query ITITT
+SELECT * FROM person ORDER BY id
+----
+1 Ada 36 ada@example.org London
+2 Bob 25 NULL Berlin
+3 Cy 51 NULL Berlin
+4 Dee NULL NULL Berlin
+5 Eve NULL eve@example.org Berlin
+
+query I
+SELECT count(*) FROM person
+----
+5
+
+statement error (23505)
+INSERT INTO person VALUES (1, 'Dup', 1, NULL, NULL)
+
+statement error (23505)
+INSERT INTO person (id, name, email) VALUES (6, 'Dup', 'ada@example.org')
+
+statement error (23502)
+INSERT INTO person (id, age) VALUES (6, 1)
+
+statement error (23514)
+INSERT INTO person (id, name, age) VALUES (6, 'Neg', -1)
+
+statement error (22P02)
+INSERT INTO person (id, name, age) VALUES (6, 'Bad', 'x')
+
+statement error (42601)
+INSERT INTO person (id, name) VALUES (6, 'a', 'b')
+
+statement error (42703)
+INSERT INTO person (id, nosuch) VALUES (6, 1)
+
+statement error (42P01)
+INSERT INTO nosuch VALUES (1)
+
+query I
+SELECT count(*) FROM person
+----
+5
+
+statement ok
+UPDATE person SET age = age + 1 WHERE age IS NOT NULL
+
+query II
+SELECT id, age FROM person ORDER BY id
+----
+1 37
+2 26
+3 52
+4 NULL
+5 NULL
+
+statement ok
+UPDATE person SET city = 'Paris', name = upper(name) WHERE id IN (2, 3)
+
+query ITT
+SELECT id, name, city FROM person ORDER BY id
+----
+1 Ada London
+2 BOB Paris
+3 CY Paris
+4 Dee Berlin
+5 Eve Berlin
+
+statement error (23505)
+UPDATE person SET id = 1 WHERE id = 2
+
+statement error (23505)
+UPDATE person SET email = 'ada@example.org' WHERE id = 3
+
+statement error (23514)
+UPDATE person SET age = -5 WHERE id = 3
+
+statement error (23502)
+UPDATE person SET name = NULL WHERE id = 3
+
+statement error (42703)
+UPDATE person SET nosuch = 1
+
+statement ok
+UPDATE person SET age = NULL, city = DEFAULT WHERE id = 3
+
+query IIT
+SELECT id, age, city FROM person WHERE id = 3
+----
+3 NULL Berlin
+
+statement ok
+UPDATE person SET id = id + 10
+
+query I
+SELECT id FROM person ORDER BY id
+----
+11
+12
+13
+14
+15
+
+statement ok
+UPDATE person SET id = id - 10
+
+statement ok
+DELETE FROM person WHERE age > 40
+
+statement ok
+DELETE FROM person WHERE id = 99
+
+query I
+SELECT id FROM person ORDER BY id
+----
+1
+2
+3
+4
+5
+
+statement ok
+DELETE FROM person
+
+query I
+SELECT count(*) FROM person
+----
+0
+
+# Defaults, serial columns and multi-row inserts from a query.
+
+statement ok
+CREATE TABLE item (id serial PRIMARY KEY, label text DEFAULT 'none', qty int NOT NULL DEFAULT 1, price numeric(8,2))
+
+statement ok
+INSERT INTO item DEFAULT VALUES
+
+statement ok
+INSERT INTO item (label, price) VALUES ('a', 1.5), ('b', 2.25), ('c', NULL)
+
+statement ok
+INSERT INTO item (label, qty, price) SELECT label || '2', qty + 1, price * 2 FROM item WHERE price IS NOT NULL
+
+query ITIR
+SELECT * FROM item ORDER BY id
+----
+1 none 1 NULL
+2 a 1 1.500
+3 b 1 2.250
+4 c 1 NULL
+5 a2 2 3.000
+6 b2 2 4.500
+
+statement error (23502)
+INSERT INTO item (qty) VALUES (NULL)
+
+statement ok
+INSERT INTO item (label, qty) VALUES (DEFAULT, DEFAULT)
+
+query I
+SELECT max(id) FROM item
+----
+8
+
+# Composite keys and foreign keys.
+
+statement ok
+CREATE TABLE orders (id int PRIMARY KEY, item_id int NOT NULL REFERENCES item (id), n int)
+
+statement ok
+CREATE TABLE order_line (order_id int REFERENCES orders (id) ON DELETE CASCADE, line int, note text, PRIMARY KEY (order_id, line))
+
+statement ok
+INSERT INTO orders VALUES (1, 1, 5), (2, 2, 7)
+
+statement error (23503)
+INSERT INTO orders VALUES (3, 999, 1)
+
+statement ok
+INSERT INTO order_line VALUES (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z')
+
+statement error (23505)
+INSERT INTO order_line VALUES (1, 2, 'dup')
+
+statement error (23503)
+INSERT INTO order_line VALUES (9, 1, 'orphan')
+
+statement error (23503)
+DELETE FROM item WHERE id = 1
+
+statement ok
+DELETE FROM orders WHERE id = 1
+
+query IIT
+SELECT * FROM order_line ORDER BY 1, 2
+----
+2 1 z
+
+statement error (23503)
+UPDATE orders SET item_id = 999 WHERE id = 2
+
+# Schema changes.
+
+statement ok
+ALTER TABLE item ADD COLUMN tag text
+
+statement ok
+ALTER TABLE item ADD COLUMN stock int NOT NULL DEFAULT 10
+
+query ITI
+SELECT id, tag, stock FROM item WHERE id <= 2 ORDER BY id
+----
+1 NULL 10
+2 NULL 10
+
+statement ok
+ALTER TABLE item DROP COLUMN tag
+
+statement ok
+ALTER TABLE item RENAME COLUMN stock TO on_hand
+
+query I
+SELECT sum(on_hand) FROM item
+----
+70
+
+statement error (42703)
+SELECT tag FROM item
+
+statement ok
+CREATE INDEX item_label_idx ON item (label)
+
+statement error (23505)
+CREATE UNIQUE INDEX item_label_uq ON item (label, qty)
+
+query T
+SELECT label FROM item WHERE label = 'b'
+----
+b
+
+query T
+SELECT label FROM item WHERE label >= 'b' ORDER BY label
+----
+b
+b2
+c
+none
+none
+
+statement ok
+DROP INDEX item_label_idx
+
+statement ok
+DROP TABLE order_line
+
+statement error (2BP01)
+DROP TABLE item
+
+statement ok
+DROP TABLE orders
+
+statement ok
+DROP TABLE item
+
+statement error (42P01)
+DROP TABLE item
+
+statement ok
+DROP TABLE IF EXISTS item
+
+statement error (42P07)
+CREATE TABLE person (id int)
+
+statement ok
+CREATE TABLE IF NOT EXISTS person (id int)
+
+statement ok
+TRUNCATE person
+
+statement ok
+DROP TABLE person

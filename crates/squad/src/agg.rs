@@ -54,7 +54,9 @@ enum Acc {
     JsonArray(Vec<Json>),
     JsonObject(serde_json::Map<String, Json>),
     /// count, sum, sum of squares
-    Moments(f64, f64, f64),
+    /// Count, sum and sum of squares as floats, plus the exact sum and
+    /// sum of squares for integer and numeric input while they fit.
+    Moments(f64, f64, f64, Option<(Decimal, Decimal)>),
 }
 
 #[derive(Clone)]
@@ -91,7 +93,9 @@ impl<'p> Runner<'p> {
             AggFunc::ArrayAgg => Acc::Array(Vec::new()),
             AggFunc::JsonAgg { .. } => Acc::JsonArray(Vec::new()),
             AggFunc::JsonObjectAgg { .. } => Acc::JsonObject(serde_json::Map::new()),
-            AggFunc::Variance { .. } => Acc::Moments(0.0, 0.0, 0.0),
+            AggFunc::Variance { .. } => {
+                Acc::Moments(0.0, 0.0, 0.0, (call.ret == Type::Numeric).then_some((Decimal::ZERO, Decimal::ZERO)))
+            }
         };
         Runner { call, func, acc, n: 0, distinct: call.distinct.then(HashSet::new), ordered: Vec::new() }
     }
@@ -203,11 +207,16 @@ impl<'p> Runner<'p> {
                 let v = args.next().unwrap_or(Value::Null);
                 map.insert(key, to_json(&v, cx)?);
             }
-            Acc::Moments(n, sum, sq) => {
+            Acc::Moments(n, sum, sq, exact) => {
                 let x = first.as_f64().ok_or_else(|| Error::internal("variance over non-numeric value"))?;
                 *n += 1.0;
                 *sum += x;
                 *sq += x * x;
+                if let Some((s, q)) = exact {
+                    let next =
+                        first.as_decimal().and_then(|d| Some((s.checked_add(d)?, q.checked_add(d.checked_mul(d)?)?)));
+                    *exact = next;
+                }
             }
         }
         Ok(())
@@ -279,11 +288,42 @@ impl<'p> Runner<'p> {
             Acc::JsonArray(items) => json_result(Json::Array(items), ret),
             Acc::JsonObject(map) if map.is_empty() && self.n == 0 => Value::Null,
             Acc::JsonObject(map) => json_result(Json::Object(map), ret),
-            Acc::Moments(n, sum, sq) => {
+            Acc::Moments(n, sum, sq, exact) => {
                 let AggFunc::Variance { sample, stddev } = self.func else { unreachable!() };
                 let denom = if *sample { n - 1.0 } else { n };
                 if denom <= 0.0 {
                     return Ok(Value::Null);
+                }
+                // Exact arithmetic, as Postgres does for numeric input:
+                // (N * sum(x^2) - sum(x)^2) / (N * (N - 1)).
+                let count = Decimal::from(self.n);
+                let exact = exact.and_then(|(s, q)| {
+                    let numerator = count.checked_mul(q)?.checked_sub(s.checked_mul(s)?)?;
+                    let divisor = count.checked_mul(if *sample { count - Decimal::ONE } else { count })?;
+                    Some((numerator.max(Decimal::ZERO), divisor))
+                });
+                if let Some((numerator, divisor)) = exact {
+                    if numerator.is_zero() {
+                        return Ok(Value::Numeric(Decimal::ZERO));
+                    }
+                    let var = numeric_div()(&cx.fn_ctx, &[Value::Numeric(numerator), Value::Numeric(divisor)])?;
+                    let Value::Numeric(v) = var else { return Ok(var) };
+                    if !*stddev {
+                        return Ok(Value::Numeric(v));
+                    }
+                    // The square root is reported at the variance's scale.
+                    let sqrt = value::resolve_function("sqrt", &[Type::Numeric])?;
+                    return Ok(match (sqrt.eval)(&cx.fn_ctx, &[Value::Numeric(v)])? {
+                        Value::Numeric(root) => {
+                            let mut r = root.round_dp_with_strategy(
+                                v.scale(),
+                                rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                            );
+                            r.rescale(v.scale());
+                            Value::Numeric(r)
+                        }
+                        other => other,
+                    });
                 }
                 let var = ((sq - sum * sum / n) / denom).max(0.0);
                 let v = if *stddev { var.sqrt() } else { var };

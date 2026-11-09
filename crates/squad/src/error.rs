@@ -142,7 +142,7 @@ impl Error {
         Error::new(sqlstate::SYNTAX_ERROR, message)
     }
     pub fn unsupported(what: impl fmt::Display) -> Error {
-        Error::new(sqlstate::FEATURE_NOT_SUPPORTED, format!("{what} is not supported"))
+        Error::new(sqlstate::FEATURE_NOT_SUPPORTED, format!("not supported: {what}"))
     }
     pub fn internal(message: impl Into<String>) -> Error {
         Error::new(sqlstate::INTERNAL_ERROR, message)

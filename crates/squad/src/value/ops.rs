@@ -53,23 +53,76 @@ cmp_ops!(ts_eq, ts_ne, ts_lt, ts_le, ts_gt, ts_ge, Value::Timestamp);
 cmp_ops!(tstz_eq, tstz_ne, tstz_lt, tstz_le, tstz_gt, tstz_ge, Value::TimestampTz);
 cmp_ops!(uuid_eq, uuid_ne, uuid_lt, uuid_le, uuid_gt, uuid_ge, Value::Uuid);
 
+/// Ordering of two values for the generic comparison operators. Rows
+/// compare field by field as SQL prescribes: the first pair of fields
+/// that differs decides, and a NULL field met before that makes the
+/// result unknown (`None`).
+fn gen_order(a: &Value, b: &Value) -> Option<Ordering> {
+    match (a, b) {
+        (Value::Record(x), Value::Record(y)) => {
+            for (i, j) in x.iter().zip(y) {
+                if i.is_null() || j.is_null() {
+                    return None;
+                }
+                match gen_order(i, j)? {
+                    Ordering::Equal => {}
+                    other => return Some(other),
+                }
+            }
+            Some(x.len().cmp(&y.len()))
+        }
+        _ => Some(compare(a, b)),
+    }
+}
+
+/// Row equality: false as soon as one pair of fields differs, unknown if
+/// no pair differs but some field is NULL.
+fn gen_equal(a: &Value, b: &Value) -> Option<bool> {
+    match (a, b) {
+        (Value::Record(x), Value::Record(y)) if x.len() == y.len() => {
+            let mut unknown = false;
+            for (i, j) in x.iter().zip(y) {
+                if i.is_null() || j.is_null() {
+                    unknown = true;
+                } else {
+                    match gen_equal(i, j) {
+                        Some(false) => return Some(false),
+                        None => unknown = true,
+                        Some(true) => {}
+                    }
+                }
+            }
+            if unknown {
+                None
+            } else {
+                Some(true)
+            }
+        }
+        _ => Some(compare(a, b) == Ordering::Equal),
+    }
+}
+
+fn tri(b: Option<bool>) -> Result<Value> {
+    Ok(b.map_or(Value::Null, Value::Bool))
+}
+
 fn gen_eq(_: &FnCtx, a: &[Value]) -> Result<Value> {
-    Ok(Value::Bool(compare(&a[0], &a[1]) == Ordering::Equal))
+    tri(gen_equal(&a[0], &a[1]))
 }
 fn gen_ne(_: &FnCtx, a: &[Value]) -> Result<Value> {
-    Ok(Value::Bool(compare(&a[0], &a[1]) != Ordering::Equal))
+    tri(gen_equal(&a[0], &a[1]).map(|e| !e))
 }
 fn gen_lt(_: &FnCtx, a: &[Value]) -> Result<Value> {
-    Ok(Value::Bool(compare(&a[0], &a[1]) == Ordering::Less))
+    tri(gen_order(&a[0], &a[1]).map(|o| o == Ordering::Less))
 }
 fn gen_le(_: &FnCtx, a: &[Value]) -> Result<Value> {
-    Ok(Value::Bool(compare(&a[0], &a[1]) != Ordering::Greater))
+    tri(gen_order(&a[0], &a[1]).map(|o| o != Ordering::Greater))
 }
 fn gen_gt(_: &FnCtx, a: &[Value]) -> Result<Value> {
-    Ok(Value::Bool(compare(&a[0], &a[1]) == Ordering::Greater))
+    tri(gen_order(&a[0], &a[1]).map(|o| o == Ordering::Greater))
 }
 fn gen_ge(_: &FnCtx, a: &[Value]) -> Result<Value> {
-    Ok(Value::Bool(compare(&a[0], &a[1]) != Ordering::Less))
+    tri(gen_order(&a[0], &a[1]).map(|o| o != Ordering::Less))
 }
 
 const GENERIC: [(&str, FuncImpl); 6] =

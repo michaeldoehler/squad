@@ -1,0 +1,204 @@
+# Scalar, IN, EXISTS and quantified subqueries, correlated and not.
+
+statement ok
+CREATE TABLE a (x int PRIMARY KEY, y text)
+
+statement ok
+CREATE TABLE b (p int, q int)
+
+statement ok
+INSERT INTO a VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, NULL)
+
+statement ok
+INSERT INTO b VALUES (1, 10), (1, 11), (2, 20), (NULL, 99), (5, 50)
+
+query I
+SELECT x FROM a WHERE x IN (SELECT p FROM b) ORDER BY x
+----
+1
+2
+
+query I
+SELECT x FROM a WHERE x NOT IN (SELECT p FROM b WHERE p IS NOT NULL) ORDER BY x
+----
+3
+4
+
+query I
+SELECT x FROM a WHERE x NOT IN (SELECT p FROM b) ORDER BY x
+----
+
+query I
+SELECT x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.p = a.x) ORDER BY x
+----
+1
+2
+
+query I
+SELECT x FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.p = a.x) ORDER BY x
+----
+3
+4
+
+query II
+SELECT x, (SELECT count(*) FROM b WHERE b.p = a.x) FROM a ORDER BY x
+----
+1 2
+2 1
+3 0
+4 0
+
+query II
+SELECT x, (SELECT max(q) FROM b WHERE b.p = a.x) FROM a ORDER BY x
+----
+1 11
+2 20
+3 NULL
+4 NULL
+
+query II
+SELECT x, (SELECT q FROM b WHERE b.p = a.x ORDER BY q DESC LIMIT 1) FROM a ORDER BY x
+----
+1 11
+2 20
+3 NULL
+4 NULL
+
+query TT
+SELECT (SELECT y FROM a WHERE x = 2), (SELECT y FROM a WHERE x = 99)
+----
+two NULL
+
+query I
+SELECT x FROM a WHERE x > (SELECT avg(p) FROM b) ORDER BY x
+----
+3
+4
+
+query I
+SELECT x FROM a WHERE x = (SELECT min(p) FROM b)
+----
+1
+
+query I
+SELECT x FROM a WHERE x = ANY (SELECT p FROM b) ORDER BY x
+----
+1
+2
+
+query I
+SELECT x FROM a WHERE x > ALL (SELECT p FROM b WHERE p < 3) ORDER BY x
+----
+3
+4
+
+query I
+SELECT x FROM a WHERE x < ANY (SELECT p FROM b) ORDER BY x
+----
+1
+2
+3
+4
+
+query I
+SELECT x FROM a WHERE x <> ALL (SELECT p FROM b WHERE p IS NOT NULL) ORDER BY x
+----
+3
+4
+
+query I
+SELECT x FROM a WHERE (x, y) IN (SELECT 1, 'one' UNION ALL SELECT 2, 'zwei') ORDER BY x
+----
+1
+
+query I
+SELECT x FROM a WHERE x IN (SELECT p FROM b WHERE q > (SELECT min(q) FROM b)) ORDER BY x
+----
+1
+2
+
+query I
+SELECT x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.p = a.x AND EXISTS (SELECT 1 FROM a a2 WHERE a2.x = b.q / 10)) ORDER BY x
+----
+1
+2
+
+query IT
+SELECT * FROM (SELECT x, y FROM a WHERE x < 3) s WHERE s.y LIKE 't%'
+----
+2 two
+
+query I
+SELECT s.x FROM (SELECT x FROM a ORDER BY x DESC LIMIT 2) s ORDER BY s.x
+----
+3
+4
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT p FROM b) s
+----
+4
+
+query II
+SELECT x, n FROM a JOIN (SELECT p, count(*) AS n FROM b GROUP BY p) s ON s.p = a.x ORDER BY x
+----
+1 2
+2 1
+
+query error (21000)
+SELECT x FROM a WHERE y = (SELECT y FROM a)
+
+query error (42601)
+SELECT (SELECT x, y FROM a WHERE x = 1)
+
+query error (42601)
+SELECT x FROM a WHERE x IN (SELECT p, q FROM b)
+
+query T
+SELECT EXISTS (SELECT 1 FROM a WHERE x > 3)
+----
+t
+
+query I
+SELECT x FROM a WHERE CASE WHEN x > 2 THEN x IN (SELECT p + 2 FROM b) ELSE false END ORDER BY x
+----
+3
+4
+
+query I
+UPDATE a SET y = (SELECT q::text FROM b WHERE p = a.x ORDER BY q LIMIT 1) WHERE x <= 2 RETURNING x
+----
+1
+2
+
+query IT
+SELECT x, y FROM a ORDER BY x
+----
+1 10
+2 20
+3 three
+4 NULL
+
+statement ok
+DELETE FROM a WHERE x IN (SELECT p FROM b WHERE q >= 20)
+
+query I
+SELECT x FROM a ORDER BY x
+----
+1
+3
+4
+
+statement ok
+INSERT INTO b SELECT x, x * 100 FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.p = a.x)
+
+query II
+SELECT * FROM b ORDER BY p NULLS LAST, q
+----
+1 10
+1 11
+2 20
+3 300
+4 400
+5 50
+NULL 99

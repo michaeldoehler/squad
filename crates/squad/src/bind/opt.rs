@@ -414,7 +414,7 @@ impl<'a> Binder<'a> {
         let mut joined = vec![false; n];
         let mut new_pos = vec![usize::MAX; types.len()];
         let mut cur_types: Vec<Type> = Vec::with_capacity(types.len());
-        let mut place = |leaf: usize, new_pos: &mut Vec<usize>, cur_types: &mut Vec<Type>| {
+        let place = |leaf: usize, new_pos: &mut Vec<usize>, cur_types: &mut Vec<Type>| {
             let (start, width) = spans[leaf];
             for c in start..start + width {
                 new_pos[c] = cur_types.len();
@@ -653,7 +653,12 @@ fn flatten_inner_joins(
     conds: &mut Vec<Expr>,
 ) {
     match plan {
-        Plan::NestedLoop { left, right, kind: JoinKind::Inner, on, lateral: false, index_join: false, right_width } => {
+        // A correlated subquery in an ON clause addresses the columns of
+        // its own join by position, so such a join can only be taken
+        // apart where those positions equal the ones in the complete row.
+        Plan::NestedLoop { left, right, kind: JoinKind::Inner, on, lateral: false, index_join: false, right_width }
+            if offset == 0 || !on.as_ref().is_some_and(opaque) =>
+        {
             let left_width = width - right_width;
             flatten_inner_joins(*left, offset, left_width, leaves, conds);
             flatten_inner_joins(*right, offset + left_width, right_width, leaves, conds);

@@ -152,11 +152,17 @@ pub struct Binder<'a> {
     outer_scopes: Vec<Scope>,
     /// Parallel to `outer_scopes`: whether the query level bound inside it
     /// referenced that scope or anything further out.
-        correlated: Vec<bool>,
+    correlated: Vec<bool>,
     /// Levels of `outer_scopes` that are currently not visible: the FROM
     /// items to the left of a JOIN, which only LATERAL items inside the
     /// join may reference.
     hidden_levels: Vec<usize>,
+    /// Nesting depth of the expression being bound within its query level.
+    expr_depth: usize,
+    /// Nesting depth of the query being bound (1 = the statement itself).
+    select_depth: usize,
+    /// Constant function calls whose evaluation failed while planning.
+    const_errors: Vec<(Expr, Error)>,
     ctes: Vec<CteBinding>,
     agg_levels: Vec<AggLevel>,
     next_subquery_id: usize,
@@ -212,9 +218,12 @@ pub(crate) fn deparse_expr(expr: &pb::Node) -> Result<String> {
     let target = pb::Node {
         node: Some(N::ResTarget(Box::new(pb::ResTarget { val: Some(Box::new(expr.clone())), ..Default::default() }))),
     };
-    let select =
-        pb::SelectStmt { target_list: vec![target], op: pb::SetOperation::SetopNone as i32,
-        limit_option: pb::LimitOption::Default as i32, ..Default::default() };
+    let select = pb::SelectStmt {
+        target_list: vec![target],
+        op: pb::SetOperation::SetopNone as i32,
+        limit_option: pb::LimitOption::Default as i32,
+        ..Default::default()
+    };
     let sql = deparse_stmt(&pb::Node { node: Some(N::SelectStmt(Box::new(select))) })?;
     Ok(sql.strip_prefix("SELECT ").unwrap_or(&sql).to_string())
 }
@@ -268,8 +277,11 @@ impl<'a> Binder<'a> {
             search_path,
             param_types,
             outer_scopes: Vec::new(),
-                        correlated: Vec::new(),
+            correlated: Vec::new(),
             hidden_levels: Vec::new(),
+            expr_depth: 0,
+            select_depth: 0,
+            const_errors: Vec::new(),
             ctes: Vec::new(),
             agg_levels: Vec::new(),
             next_subquery_id: 0,
@@ -297,7 +309,7 @@ impl<'a> Binder<'a> {
             })
             .collect();
         let lower = name.to_ascii_lowercase();
-                let builtin = match schema {
+        let builtin = match schema {
             // Unquoted CHAR arrives as pg_catalog.bpchar; the bare name
             // "char" is the single-byte catalog type.
             None | Some("pg_catalog") if lower == "char" => Some(Type::Char),
@@ -308,7 +320,7 @@ impl<'a> Binder<'a> {
             Some(ty) => {
                 let (decl, oid) = match lower.as_str() {
                     "varchar" | "character varying" => ("character varying".to_string(), 1043),
-                                        "bpchar" | "character" => ("character".to_string(), 1042),
+                    "bpchar" | "character" => ("character".to_string(), 1042),
                     "name" => ("name".to_string(), 19),
                     "oid" | "regclass" | "regtype" | "regproc" => ("oid".to_string(), 26),
                     _ => (ty.name(), ty.oid()),
@@ -366,7 +378,7 @@ impl<'a> Binder<'a> {
     /// Wraps an expression so that its value conforms to a type modifier
     /// (`varchar(n)`, `numeric(p,s)`). `explicit` casts truncate strings
     /// silently; assignments raise 22001.
-        pub(crate) fn apply_typmod(&self, expr: Expr, decl: &DeclaredType, explicit: bool) -> Result<Expr> {
+    pub(crate) fn apply_typmod(&self, expr: Expr, decl: &DeclaredType, explicit: bool) -> Result<Expr> {
         if decl.typmod < 0 {
             return Ok(expr);
         }
@@ -375,7 +387,7 @@ impl<'a> Binder<'a> {
             (Type::Text, 1043) => (typmod::varchar_check, "varchar"),
             (Type::Text, 1042) if explicit => (typmod::bpchar_truncate, "bpchar"),
             (Type::Text, 1042) => (typmod::bpchar_check, "bpchar"),
-                        (Type::Numeric, _) => (typmod::numeric_typmod, "numeric"),
+            (Type::Numeric, _) => (typmod::numeric_typmod, "numeric"),
             _ => return Ok(expr),
         };
         // A constant is checked while planning, as Postgres does when it
@@ -428,7 +440,17 @@ impl<'a> Binder<'a> {
             Type::Array(elem) if matches!(**elem, Type::Enum(_)) => {
                 return Err(Error::unsupported("casting to an array of enums"))
             }
-            _ => Expr::Cast(Box::new(expr), to.clone()),
+            _ => {
+                // Casts among numbers, booleans and text do not depend on
+                // session settings: fold them for constants.
+                let plain = |t: &Type| t.is_numeric() || matches!(t, Type::Bool | Type::Text);
+                if let (Expr::Const(v), true, true) = (&expr, plain(from), plain(to)) {
+                    if let Ok(folded) = value::cast(v.clone(), to, &crate::types::FnCtx::default()) {
+                        return Ok(Expr::Const(folded));
+                    }
+                }
+                Expr::Cast(Box::new(expr), to.clone())
+            }
         })
     }
 
@@ -449,8 +471,6 @@ impl<'a> Binder<'a> {
             _ => value::parse_value(text, ty, &crate::types::FnCtx::default()),
         }
     }
-
-    
 
     pub(crate) fn alloc_subquery_id(&mut self) -> usize {
         self.next_subquery_id += 1;
@@ -482,7 +502,7 @@ mod typmod {
         (args[0].as_str().unwrap_or_default(), n)
     }
 
-        /// `char(n)` values are stored without their padding: trailing spaces
+    /// `char(n)` values are stored without their padding: trailing spaces
     /// are insignificant for the type, and every operation that converts
     /// to text drops them anyway.
     fn unpadded(s: &str) -> Value {
@@ -497,14 +517,14 @@ mod typmod {
         }
         // Excess characters may be dropped only if they are all spaces.
         let cut = s.char_indices().nth(n).map_or(s.len(), |(i, _)| i);
-                if s[cut..].chars().all(|c| c == ' ') {
+        if s[cut..].chars().all(|c| c == ' ') {
             Ok(if bpchar { unpadded(&s[..cut]) } else { Value::Text(s[..cut].to_string()) })
         } else {
             Err(too_long(kind, n))
         }
     }
 
-        fn truncate(args: &[Value], bpchar: bool) -> Result<Value> {
+    fn truncate(args: &[Value], bpchar: bool) -> Result<Value> {
         let (s, n) = parts(args);
         let cut = s.char_indices().nth(n).map_or(s.len(), |(i, _)| i);
         Ok(if bpchar { unpadded(&s[..cut]) } else { Value::Text(s[..cut].to_string()) })

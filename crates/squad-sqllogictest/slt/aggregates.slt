@@ -1,0 +1,190 @@
+# Aggregate functions, GROUP BY and HAVING.
+
+statement ok
+CREATE TABLE s (id int PRIMARY KEY, grp text, kind text, n int, amt numeric(8,2))
+
+statement ok
+INSERT INTO s VALUES (1, 'a', 'x', 10, 1.50), (2, 'a', 'y', 5, 2.00), (3, 'b', 'x', 7, 1.60), (4, 'b', 'x', NULL, 1.55), (5, 'c', 'z', 1, 9.99), (6, NULL, 'z', 2, 9.50)
+
+query IIII
+SELECT count(*), count(n), count(DISTINCT kind), count(DISTINCT grp) FROM s
+----
+6 5 3 3
+
+query IRII
+SELECT sum(n), avg(n), min(n), max(n) FROM s
+----
+25 5.000 1 10
+
+query RRRR
+SELECT sum(amt), avg(amt), min(amt), max(amt) FROM s
+----
+26.140 4.357 1.500 9.990
+
+query TT
+SELECT min(grp), max(kind) FROM s
+----
+a z
+
+query TII
+SELECT grp, count(*), sum(n) FROM s GROUP BY grp ORDER BY grp NULLS FIRST
+----
+NULL 1 2
+a 2 15
+b 2 7
+c 1 1
+
+query TTR
+SELECT grp, kind, sum(n * amt) FROM s GROUP BY grp, kind ORDER BY 1 NULLS LAST, 2
+----
+a x 15.000
+a y 10.000
+b x 11.200
+c z 9.990
+NULL z 19.000
+
+query TI
+SELECT kind, count(*) FROM s GROUP BY kind HAVING count(*) > 1 ORDER BY kind
+----
+x 3
+z 2
+
+query TI
+SELECT kind, sum(n) FROM s WHERE grp IS NOT NULL GROUP BY 1 HAVING sum(n) >= 10 ORDER BY 2 DESC
+----
+x 17
+
+query TR
+SELECT upper(kind) AS k, max(amt) FROM s GROUP BY k ORDER BY k
+----
+X 1.600
+Y 2.000
+Z 9.990
+
+query II
+SELECT n % 2 AS odd, count(*) FROM s WHERE n IS NOT NULL GROUP BY n % 2 ORDER BY 1
+----
+0 2
+1 3
+
+query TT
+SELECT grp, string_agg(kind, ',' ORDER BY id) FROM s GROUP BY grp ORDER BY grp NULLS LAST
+----
+a x,y
+b x,x
+c z
+NULL z
+
+query TT
+SELECT array_agg(n ORDER BY id), array_agg(DISTINCT kind ORDER BY kind) FROM s
+----
+{10,5,7,NULL,1,2} {x,y,z}
+
+query TTT
+SELECT bool_and(n > 0), bool_or(n > 9), every(amt > 1) FROM s
+----
+t t t
+
+query II
+SELECT count(*) FILTER (WHERE grp = 'a'), sum(n) FILTER (WHERE kind = 'x') FROM s
+----
+2 17
+
+query II
+SELECT sum(n), count(*) FROM s WHERE false
+----
+NULL 0
+
+query TI
+SELECT grp, sum(n) FROM s WHERE false GROUP BY grp
+----
+
+query I
+SELECT count(*) FROM s GROUP BY ()
+----
+6
+
+query IT
+SELECT s.id, s.grp FROM s GROUP BY s.id ORDER BY s.id LIMIT 2
+----
+1 a
+2 a
+
+query TI
+SELECT grp, sum(n) FROM s GROUP BY grp ORDER BY sum(n) DESC NULLS LAST, grp LIMIT 2
+----
+a 15
+b 7
+
+query TI
+SELECT grp, max(n) - min(n) FROM s GROUP BY grp ORDER BY grp NULLS LAST
+----
+a 5
+b 0
+c 0
+NULL 0
+
+query TR
+SELECT kind, sum(amt) / count(*) FROM s GROUP BY kind ORDER BY kind
+----
+x 1.550
+y 2.000
+z 9.745
+
+query I
+SELECT sum(c) FROM (SELECT count(*) AS c FROM s GROUP BY kind) t
+----
+6
+
+query TI
+SELECT kind, count(*) FROM s GROUP BY kind HAVING max(n) IS NOT NULL AND min(amt) < 2 ORDER BY 1
+----
+x 3
+
+query I
+SELECT count(DISTINCT n % 3) FROM s
+----
+2
+
+query R
+SELECT round(avg(n), 2) FROM s
+----
+5.000
+
+query R
+SELECT round(stddev_samp(n), 3) FROM s
+----
+3.674
+
+query TI
+SELECT coalesce(grp, '?') AS g, count(*) FROM s GROUP BY g ORDER BY g
+----
+? 1
+a 2
+b 2
+c 1
+
+query TI
+SELECT CASE WHEN n > 5 THEN 'big' ELSE 'small' END AS size, count(*) FROM s GROUP BY size ORDER BY size
+----
+big 2
+small 4
+
+query error (42803)
+SELECT kind, n FROM s GROUP BY kind
+
+query error (42883)
+SELECT sum(kind) FROM s
+
+query error (42803)
+SELECT count(*) FROM s WHERE sum(n) > 1
+
+query error (42803)
+SELECT max(sum(n)) FROM s
+
+query error (42P10)
+SELECT grp FROM s GROUP BY 9
+
+query I
+SELECT count(*) FROM s HAVING count(*) > 100
+----

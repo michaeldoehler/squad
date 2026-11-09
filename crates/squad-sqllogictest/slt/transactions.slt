@@ -1,0 +1,200 @@
+# Transactions, savepoints and transactional DDL in one session.
+
+statement ok
+CREATE TABLE acct (id int PRIMARY KEY, bal int NOT NULL CHECK (bal >= 0))
+
+statement ok
+INSERT INTO acct VALUES (1, 100), (2, 50)
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE acct SET bal = bal - 30 WHERE id = 1
+
+statement ok
+UPDATE acct SET bal = bal + 30 WHERE id = 2
+
+query II
+SELECT * FROM acct ORDER BY id
+----
+1 70
+2 80
+
+statement ok
+COMMIT
+
+query II
+SELECT * FROM acct ORDER BY id
+----
+1 70
+2 80
+
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM acct
+
+query I
+SELECT count(*) FROM acct
+----
+0
+
+statement ok
+ROLLBACK
+
+query I
+SELECT count(*) FROM acct
+----
+2
+
+statement ok
+BEGIN
+
+statement error (23514)
+UPDATE acct SET bal = bal - 500 WHERE id = 1
+
+query error (25P02)
+SELECT 1
+
+statement ok
+COMMIT
+
+query II
+SELECT * FROM acct ORDER BY id
+----
+1 70
+2 80
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO acct VALUES (3, 1)
+
+statement ok
+SAVEPOINT a
+
+statement ok
+INSERT INTO acct VALUES (4, 1)
+
+statement ok
+SAVEPOINT b
+
+statement error (23505)
+INSERT INTO acct VALUES (4, 1)
+
+statement ok
+ROLLBACK TO SAVEPOINT b
+
+statement ok
+INSERT INTO acct VALUES (5, 1)
+
+statement ok
+ROLLBACK TO a
+
+statement ok
+INSERT INTO acct VALUES (6, 1)
+
+statement ok
+RELEASE SAVEPOINT a
+
+statement error (3B001)
+ROLLBACK TO a
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO acct VALUES (3, 1)
+
+statement ok
+SAVEPOINT a
+
+statement ok
+INSERT INTO acct VALUES (4, 1)
+
+statement ok
+ROLLBACK TO a
+
+statement ok
+COMMIT
+
+query I
+SELECT id FROM acct ORDER BY id
+----
+1
+2
+3
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE tmp (x int)
+
+statement ok
+INSERT INTO tmp VALUES (1)
+
+statement ok
+ALTER TABLE acct ADD COLUMN note text
+
+query T
+SELECT note FROM acct WHERE id = 1
+----
+NULL
+
+statement ok
+ROLLBACK
+
+statement error (42P01)
+SELECT * FROM tmp
+
+statement error (42703)
+SELECT note FROM acct
+
+statement ok
+BEGIN
+
+statement ok
+DROP TABLE acct
+
+statement error (42P01)
+SELECT * FROM acct
+
+statement ok
+ROLLBACK
+
+query I
+SELECT count(*) FROM acct
+----
+3
+
+statement ok
+BEGIN READ ONLY
+
+query I
+SELECT count(*) FROM acct
+----
+3
+
+statement error (25006)
+INSERT INTO acct VALUES (9, 9)
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN ISOLATION LEVEL SERIALIZABLE
+
+query T
+SHOW transaction_isolation
+----
+serializable
+
+statement ok
+COMMIT

@@ -1,0 +1,283 @@
+# Inner, outer, cross, natural and lateral joins.
+
+statement ok
+CREATE TABLE dept (id int PRIMARY KEY, name text)
+
+statement ok
+CREATE TABLE emp (id int PRIMARY KEY, name text, dept_id int, boss int, pay int)
+
+statement ok
+CREATE INDEX emp_dept ON emp (dept_id)
+
+statement ok
+INSERT INTO dept VALUES (1, 'eng'), (2, 'ops'), (3, 'hr')
+
+statement ok
+INSERT INTO emp VALUES (1, 'ann', 1, NULL, 100), (2, 'bob', 1, 1, 80), (3, 'cat', 2, 1, 70), (4, 'dan', NULL, 3, 60), (5, 'eve', 2, 3, 90)
+
+query TT
+SELECT e.name, d.name FROM emp e JOIN dept d ON d.id = e.dept_id ORDER BY e.id
+----
+ann eng
+bob eng
+cat ops
+eve ops
+
+query TT
+SELECT e.name, d.name FROM emp e INNER JOIN dept d ON e.dept_id = d.id WHERE d.name = 'ops' ORDER BY e.id
+----
+cat ops
+eve ops
+
+query TT
+SELECT e.name, d.name FROM emp e LEFT JOIN dept d ON d.id = e.dept_id ORDER BY e.id
+----
+ann eng
+bob eng
+cat ops
+dan NULL
+eve ops
+
+query TT
+SELECT e.name, d.name FROM emp e RIGHT JOIN dept d ON d.id = e.dept_id ORDER BY d.id, e.id
+----
+ann eng
+bob eng
+cat ops
+eve ops
+NULL hr
+
+query TT
+SELECT e.name, d.name FROM emp e FULL JOIN dept d ON d.id = e.dept_id ORDER BY e.id NULLS LAST, d.id
+----
+ann eng
+bob eng
+cat ops
+dan NULL
+eve ops
+NULL hr
+
+query TT
+SELECT e.name, d.name FROM dept d LEFT JOIN emp e ON d.id = e.dept_id AND e.pay > 75 ORDER BY d.id, e.id
+----
+ann eng
+bob eng
+eve ops
+NULL hr
+
+query TT
+SELECT e.name, d.name FROM dept d LEFT JOIN emp e ON d.id = e.dept_id WHERE e.pay > 75 ORDER BY d.id, e.id
+----
+ann eng
+bob eng
+eve ops
+
+query T
+SELECT d.name FROM dept d LEFT JOIN emp e ON d.id = e.dept_id WHERE e.id IS NULL
+----
+hr
+
+query I
+SELECT count(*) FROM emp CROSS JOIN dept
+----
+15
+
+query I
+SELECT count(*) FROM emp, dept WHERE emp.dept_id = dept.id
+----
+4
+
+query TT
+SELECT e.name, b.name FROM emp e JOIN emp b ON b.id = e.boss ORDER BY e.id
+----
+bob ann
+cat ann
+dan cat
+eve cat
+
+query TT
+SELECT e.name, b.name FROM emp e LEFT JOIN emp b ON b.id = e.boss ORDER BY e.id
+----
+ann NULL
+bob ann
+cat ann
+dan cat
+eve cat
+
+query TTT
+SELECT e.name, b.name, d.name FROM emp e JOIN emp b ON b.id = e.boss JOIN dept d ON d.id = b.dept_id ORDER BY e.id
+----
+bob ann eng
+cat ann eng
+dan cat ops
+eve cat ops
+
+query TTT
+SELECT e.name, b.name, d.name FROM emp e LEFT JOIN emp b ON b.id = e.boss LEFT JOIN dept d ON d.id = b.dept_id ORDER BY e.id
+----
+ann NULL NULL
+bob ann eng
+cat ann eng
+dan cat ops
+eve cat ops
+
+query TI
+SELECT d.name, count(e.id) FROM dept d LEFT JOIN emp e ON e.dept_id = d.id GROUP BY d.name ORDER BY d.name
+----
+eng 2
+hr 0
+ops 2
+
+query TI
+SELECT d.name, sum(e.pay) FROM dept d JOIN emp e ON e.dept_id = d.id GROUP BY d.name HAVING sum(e.pay) > 170 ORDER BY 1
+----
+eng 180
+
+query TT
+SELECT a.name, b.name FROM emp a JOIN emp b ON a.pay < b.pay AND a.dept_id = b.dept_id ORDER BY 1, 2
+----
+bob ann
+cat eve
+
+query IT
+SELECT id, name FROM dept JOIN (SELECT dept_id AS id, count(*) AS n FROM emp GROUP BY dept_id) s USING (id) ORDER BY id
+----
+1 eng
+2 ops
+
+query ITTIII
+SELECT * FROM dept JOIN emp USING (id) ORDER BY id
+----
+1 eng ann 1 NULL 100
+2 ops bob 1 1 80
+3 hr cat 2 1 70
+
+query ITI
+SELECT * FROM dept NATURAL JOIN (SELECT dept_id AS id, max(pay) AS top FROM emp GROUP BY dept_id) s ORDER BY id
+----
+1 eng 100
+2 ops 90
+
+query TTI
+SELECT d.name, t.name, t.pay FROM dept d, LATERAL (SELECT name, pay FROM emp WHERE dept_id = d.id ORDER BY pay DESC LIMIT 1) t ORDER BY d.id
+----
+eng ann 100
+ops eve 90
+
+query TT
+SELECT d.name, t.name FROM dept d LEFT JOIN LATERAL (SELECT name FROM emp WHERE dept_id = d.id ORDER BY pay LIMIT 1) t ON true ORDER BY d.id
+----
+eng bob
+ops cat
+hr NULL
+
+query TI
+SELECT d.name, g FROM dept d, generate_series(1, d.id) g ORDER BY 1, 2
+----
+eng 1
+hr 1
+hr 2
+hr 3
+ops 1
+ops 2
+
+query T
+SELECT e.name FROM emp e JOIN dept d ON e.dept_id = d.id JOIN dept d2 ON d2.id = d.id + 1 ORDER BY 1
+----
+ann
+bob
+cat
+eve
+
+query I
+SELECT count(*) FROM emp a, emp b, emp c WHERE a.id = b.boss AND b.id = c.boss
+----
+2
+
+query I
+SELECT count(*) FROM emp a JOIN emp b ON true JOIN emp c ON c.id = a.id
+----
+25
+
+query TT
+SELECT e.name, d.name FROM emp e JOIN dept d ON d.id = e.dept_id WHERE e.id = 3
+----
+cat ops
+
+query error (42702)
+SELECT name FROM emp JOIN dept ON emp.dept_id = dept.id
+
+query error (42703)
+SELECT e.name FROM emp e JOIN dept d ON d.id = e.nosuch
+
+query error (42804)
+SELECT e.name FROM emp e JOIN dept d ON 1
+
+query error (42703)
+SELECT e.name FROM emp e JOIN dept d USING (nosuch)
+
+# Join order: relations are listed in an order in which neighbours are
+# not connected. The join must follow the predicates, not the list.
+
+statement ok
+CREATE TABLE c1 (a int PRIMARY KEY, b int)
+
+statement ok
+CREATE TABLE c2 (a int PRIMARY KEY, b int)
+
+statement ok
+CREATE TABLE c3 (a int PRIMARY KEY, b int)
+
+statement ok
+CREATE TABLE c4 (a int PRIMARY KEY, b int)
+
+statement ok
+CREATE TABLE c5 (a int PRIMARY KEY, b int)
+
+statement ok
+CREATE TABLE c6 (a int PRIMARY KEY, b int)
+
+statement ok
+INSERT INTO c1 SELECT g, g % 100 + 1 FROM generate_series(1, 300) g
+
+statement ok
+INSERT INTO c2 SELECT g, (g * 7) % 100 + 1 FROM generate_series(1, 300) g
+
+statement ok
+INSERT INTO c3 SELECT g, (g * 3) % 100 + 1 FROM generate_series(1, 300) g
+
+statement ok
+INSERT INTO c4 SELECT g, (g * 11) % 100 + 1 FROM generate_series(1, 300) g
+
+statement ok
+INSERT INTO c5 SELECT g, (g * 13) % 100 + 1 FROM generate_series(1, 300) g
+
+statement ok
+INSERT INTO c6 SELECT g, (g * 17) % 100 + 1 FROM generate_series(1, 300) g
+
+query IIIIII
+SELECT c1.a, c2.a, c3.a, c4.a, c5.a, c6.a FROM c1, c4, c2, c6, c3, c5 WHERE c5.a = c4.b AND c2.a = c1.b AND c6.a = c5.b AND c3.a = c2.b AND c4.a = c3.b AND c1.a = 7
+----
+7 8 57 72 93 10
+
+query I
+SELECT count(*) FROM c6, c1, c5, c2, c4, c3 WHERE c1.b = c2.a AND c2.b = c3.a AND c3.b = c4.a AND c4.b = c5.a AND c5.b = c6.a
+----
+300
+
+query II
+SELECT count(*), sum(c3.b) FROM c1, c2, c3 WHERE c3.a = c1.b AND c2.a < 3 AND c1.a <= 10
+----
+20 410
+
+query III rowsort
+SELECT x.a, y.a, z.a FROM c1 x, c2 y, c3 z WHERE x.a = z.b AND y.a = z.a AND z.a < 4
+----
+10 3 3
+4 1 1
+7 2 2
+
+query I
+SELECT count(*) FROM c1 JOIN c2 ON true JOIN c3 ON c3.a = c1.b AND c3.b = c2.a WHERE c1.a < 50
+----
+49

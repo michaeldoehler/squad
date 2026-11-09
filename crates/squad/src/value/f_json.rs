@@ -260,7 +260,7 @@ fn field<'a>(j: &'a J, key: &Value) -> Option<&'a J> {
 }
 fn op_get(_: &FnCtx, a: &[Value]) -> Result<Value> {
     // jsonb is the hot path; avoid cloning the whole document.
-        if let Value::Jsonb(j) = &a[0] {
+    if let Value::Jsonb(j) = &a[0] {
         // Postgres stores a top-level jsonb scalar as a one-element array,
         // so element 0 (or -1) of a scalar is the scalar itself.
         if let (false, Value::Int4(0 | -1)) = (j.is_array() || j.is_object(), &a[1]) {
@@ -479,19 +479,29 @@ fn text_path(v: &Value) -> Result<Vec<&str>> {
         })
         .collect()
 }
+/// Path-based edits apply to objects and arrays only.
+fn reject_scalar(j: &J, what: &str) -> Result<()> {
+    if j.is_object() || j.is_array() {
+        return Ok(());
+    }
+    Err(Error::new(sqlstate::INVALID_PARAMETER_VALUE, format!("cannot {what} in scalar")))
+}
 fn jsonb_set(_: &FnCtx, a: &[Value]) -> Result<Value> {
+    reject_scalar(jb(&a[0])?, "set path")?;
     let mut j = jb(&a[0])?.clone();
     let create = a.get(3).and_then(Value::as_bool).unwrap_or(true);
     edit(&mut j, &text_path(&a[1])?, &Edit::Set { value: jb(&a[2])?, create })?;
     Ok(jsonb(j))
 }
 fn jsonb_insert(_: &FnCtx, a: &[Value]) -> Result<Value> {
+    reject_scalar(jb(&a[0])?, "set path")?;
     let mut j = jb(&a[0])?.clone();
     let after = a.get(3).and_then(Value::as_bool).unwrap_or(false);
     edit(&mut j, &text_path(&a[1])?, &Edit::Insert { value: jb(&a[2])?, after })?;
     Ok(jsonb(j))
 }
 fn op_delete_path(_: &FnCtx, a: &[Value]) -> Result<Value> {
+    reject_scalar(jb(&a[0])?, "delete path")?;
     let mut j = jb(&a[0])?.clone();
     edit(&mut j, &text_path(&a[1])?, &Edit::Delete)?;
     Ok(jsonb(j))

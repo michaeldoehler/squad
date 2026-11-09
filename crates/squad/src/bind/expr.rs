@@ -175,7 +175,92 @@ impl<'a> Binder<'a> {
         for ((e, t), want) in args.into_iter().zip(&f.args) {
             out.push(self.coerce(e, &t, want)?);
         }
-        Ok((Expr::Call(FuncRef { name: name.into(), eval: f.eval, strict: f.strict, ret: f.ret.clone() }, out), f.ret))
+        // Constant folding: an immutable function of constants is computed
+        // once, while planning.
+        let foldable = f.volatility == value::Volatility::Immutable && out.iter().all(Expr::is_const);
+        let folded = if !foldable {
+            None
+        } else if f.strict && out.iter().any(|a| matches!(a, Expr::Const(Value::Null))) {
+            Some(Ok(Value::Null))
+        } else {
+            let vals: Vec<Value> = out
+                .iter()
+                .map(|a| match a {
+                    Expr::Const(v) => v.clone(),
+                    _ => Value::Null,
+                })
+                .collect();
+            Some((f.eval)(&crate::types::FnCtx::default(), &vals))
+        };
+        let call = Expr::Call(FuncRef { name: name.into(), eval: f.eval, strict: f.strict, ret: f.ret.clone() }, out);
+        match folded {
+            Some(Ok(v)) => Ok((Expr::Const(v), f.ret)),
+            Some(Err(e)) => {
+                // Whether the failure is reported depends on where the
+                // expression sits (see `check_constant_errors`); until then
+                // it stays a call that fails when evaluated.
+                self.const_errors.push((call.clone(), e));
+                Ok((call, f.ret))
+            }
+            None => Ok((call, f.ret)),
+        }
+    }
+
+    /// Reports the failure of a constant subexpression the way Postgres
+    /// does when it simplifies expressions while planning: also for rows
+    /// that are never produced, but not inside branches that constant
+    /// conditions rule out.
+    fn check_constant_errors(&self, e: &Expr) -> Result<()> {
+        match e {
+            Expr::And(args) | Expr::Or(args) => {
+                let decisive = matches!(e, Expr::Or(_));
+                for a in args {
+                    self.check_constant_errors(a)?;
+                    if constant_value(a) == Some(Value::Bool(decisive)) {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            Expr::Case(whens, els) => {
+                for (cond, result) in whens {
+                    self.check_constant_errors(cond)?;
+                    match constant_value(cond) {
+                        Some(Value::Bool(true)) => return self.check_constant_errors(result),
+                        // Constant false or NULL: the branch is unreachable.
+                        Some(_) => {}
+                        None => self.check_constant_errors(result)?,
+                    }
+                }
+                match els {
+                    Some(e) => self.check_constant_errors(e),
+                    None => Ok(()),
+                }
+            }
+            Expr::Coalesce(args) => {
+                for a in args {
+                    self.check_constant_errors(a)?;
+                    if constant_value(a).is_some_and(|v| !v.is_null()) {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            other => {
+                if let Expr::Call(..) = other {
+                    if let Some((_, err)) = self.const_errors.iter().find(|(call, _)| call == other) {
+                        return Err(err.clone());
+                    }
+                }
+                let mut result = Ok(());
+                other.for_each_child(&mut |c| {
+                    if result.is_ok() {
+                        result = self.check_constant_errors(c);
+                    }
+                });
+                result
+            }
+        }
     }
 
     pub(crate) fn bind_op(&mut self, op: &str, left: Option<Typed>, right: Typed) -> Result<Typed> {
@@ -196,6 +281,26 @@ impl<'a> Binder<'a> {
     }
 
     pub(crate) fn bind_expr(&mut self, n: &pb::Node, scope: &Scope) -> Result<Typed> {
+        self.expr_depth += 1;
+        let result = self.bind_expr_node(n, scope);
+        self.expr_depth -= 1;
+        let mut typed = result?;
+        // Logical connectives over constants are constants themselves.
+        if !matches!(typed.0, Expr::Const(_) | Expr::Column(_) | Expr::Call(..)) {
+            if let Some(v) = constant_value(&typed.0) {
+                typed.0 = Expr::Const(v);
+            }
+        }
+        // Output columns of nested queries are skipped: Postgres drops the
+        // ones the outer query does not use before simplifying them.
+        let nested_output = self.select_depth > 1 && self.clause == "SELECT";
+        if self.expr_depth == 0 && !self.const_errors.is_empty() && !nested_output {
+            self.check_constant_errors(&typed.0)?;
+        }
+        Ok(typed)
+    }
+
+    fn bind_expr_node(&mut self, n: &pb::Node, scope: &Scope) -> Result<Typed> {
         match node(n)? {
             N::ColumnRef(c) => self.bind_column(c, scope),
             N::AConst(c) => Ok(bind_const(c)),
@@ -338,7 +443,7 @@ impl<'a> Binder<'a> {
             });
         }
         for depth in 1..=self.outer_scopes.len() {
-                        let level = self.outer_scopes.len() - depth;
+            let level = self.outer_scopes.len() - depth;
             if self.hidden_levels.contains(&level) {
                 continue;
             }
@@ -356,7 +461,7 @@ impl<'a> Binder<'a> {
             }
         }
         Err(match table {
-                        Some(t)
+            Some(t)
                 if !has_rel(scope, t)
                     && !self
                         .outer_scopes
@@ -392,10 +497,10 @@ impl<'a> Binder<'a> {
         }
 
         let decl = self.resolve_type(tn)?;
-                let (e, from) = self.bind_expr(arg, scope)?;
+        let (e, from) = self.bind_expr(arg, scope)?;
         let to = decl.ty.base();
         let e = self.explicit_cast(e, &from, &to)?;
-                Ok((self.apply_typmod(e, &decl, true)?, to))
+        Ok((self.apply_typmod(e, &decl, true)?, to))
     }
 
     pub(crate) fn explicit_cast(&mut self, e: Expr, from: &Type, to: &Type) -> Result<Expr> {
@@ -622,6 +727,17 @@ impl<'a> Binder<'a> {
         }
         if let Some(r) = self.bind_session_fn(&name, &mut args)? {
             return Ok(r);
+        }
+                if matches!(name.as_str(), "gen_random_uuid" | "uuid_generate_v4") && args.is_empty() {
+            fn random_uuid(_: &crate::types::FnCtx, _: &[Value]) -> Result<Value> {
+                let mut bytes: [u8; 16] = rand::random();
+                // Version 4, RFC 4122 variant.
+                bytes[6] = (bytes[6] & 0x0f) | 0x40;
+                bytes[8] = (bytes[8] & 0x3f) | 0x80;
+                Ok(Value::Uuid(bytes))
+            }
+            let func = FuncRef { name: name.as_str().into(), eval: random_uuid, strict: false, ret: Type::Uuid };
+            return Ok((Expr::Call(func, Vec::new()), Type::Uuid));
         }
         if name == "pg_typeof" && args.len() == 1 {
             return Ok((Expr::Const(Value::Text(args[0].1.name())), Type::Text));
@@ -866,6 +982,26 @@ impl<'a> Binder<'a> {
             let ret = agg_type(&func, name, &arg_types)?;
             let filter = f.agg_filter.as_ref().map(|n| self.bind_bool(n, scope, "FILTER")).transpose()?;
             let order_by = self.bind_sort_keys(&f.agg_order, scope)?;
+            // The arguments are replaced by a placeholder in the enclosing
+            // expression, so their constant parts are checked here.
+            if !self.const_errors.is_empty() {
+                for e in exprs.iter().chain(filter.iter()).chain(order_by.iter().map(|k| &k.expr)) {
+                    self.check_constant_errors(e)?;
+                }
+            }
+            // (Two bindings of the same subquery never compare equal, so
+            // sort keys containing one are given the benefit of the doubt.)
+            let has_subquery = |e: &Expr| {
+                let mut found = false;
+                e.walk(&mut |n| found |= matches!(n, Expr::Subquery(_)));
+                found
+            };
+            if f.agg_distinct && order_by.iter().any(|k| !exprs.contains(&k.expr) && !has_subquery(&k.expr)) {
+                return Err(Error::new(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list",
+                ));
+            }
             Ok(AggCall { func, args: exprs, distinct: f.agg_distinct, filter, order_by, ret })
         })();
         if let (Some(level), Some(allow)) = (self.agg_levels.last_mut(), saved) {
@@ -1196,6 +1332,96 @@ impl<'a> Binder<'a> {
             _ => Err(Error::unsupported("this kind of subquery expression")),
         }
     }
+}
+
+/// Value of an expression built only from constants and logical
+/// connectives, if it is one.
+fn constant_value(e: &Expr) -> Option<Value> {
+    let tri = |b: Option<bool>| b.map_or(Value::Null, Value::Bool);
+    Some(match e {
+        Expr::Const(v) => v.clone(),
+        Expr::Not(a) => tri(constant_value(a)?.as_bool().map(|b| !b)),
+        Expr::And(args) | Expr::Or(args) => {
+            // One decisive constant settles the result whatever the other
+            // operands are, as in Postgres' expression simplification.
+            let decisive = matches!(e, Expr::Or(_));
+            let (mut unknown, mut variable) = (false, false);
+            for a in args {
+                match constant_value(a) {
+                    None => variable = true,
+                    Some(v) => match v.as_bool() {
+                        Some(b) if b == decisive => return Some(Value::Bool(decisive)),
+                        Some(_) => {}
+                        None => unknown = true,
+                    },
+                }
+            }
+            if variable {
+                return None;
+            }
+            tri(if unknown { None } else { Some(!decisive) })
+        }
+        Expr::IsNull(a, negated) => match constant_value(a)? {
+            Value::Record(_) => return None,
+            v => Value::Bool(v.is_null() != *negated),
+        },
+        Expr::BoolTest(a, test) => {
+            let v = constant_value(a)?.as_bool();
+            Value::Bool(match test {
+                BoolTest::IsTrue => v == Some(true),
+                BoolTest::IsNotTrue => v != Some(true),
+                BoolTest::IsFalse => v == Some(false),
+                BoolTest::IsNotFalse => v != Some(false),
+                BoolTest::IsUnknown => v.is_none(),
+                BoolTest::IsNotUnknown => v.is_some(),
+            })
+        }
+        Expr::InList(a, list, negated) => {
+            let v = constant_value(a)?;
+            if v.is_null() {
+                return Some(Value::Null);
+            }
+            let mut unknown = false;
+            for item in list {
+                match crate::expr::sql_eq(&v, &constant_value(item)?) {
+                    Some(true) => return Some(Value::Bool(!negated)),
+                    Some(false) => {}
+                    None => unknown = true,
+                }
+            }
+            tri(if unknown { None } else { Some(*negated) })
+        }
+        Expr::Distinct(a, b, negated) => {
+            let (a, b) = (constant_value(a)?, constant_value(b)?);
+            let distinct = match (a.is_null(), b.is_null()) {
+                (true, true) => false,
+                (true, false) | (false, true) => true,
+                _ => crate::types::compare(&a, &b) != std::cmp::Ordering::Equal,
+            };
+            Value::Bool(distinct != *negated)
+        }
+        Expr::Coalesce(args) => {
+            for a in args {
+                let v = constant_value(a)?;
+                if !v.is_null() {
+                    return Some(v);
+                }
+            }
+            Value::Null
+        }
+        Expr::Case(whens, els) => {
+            for (cond, result) in whens {
+                if constant_value(cond)? == Value::Bool(true) {
+                    return constant_value(result);
+                }
+            }
+            match els {
+                Some(e) => constant_value(e)?,
+                None => Value::Null,
+            }
+        }
+        _ => return None,
+    })
 }
 
 pub(crate) fn sort_key(expr: Expr, s: &pb::SortBy) -> Result<SortKey> {

@@ -94,7 +94,17 @@ enum Conflict {
 }
 
 /// Locks the row's unique keys and reports the first one already taken.
-fn find_conflict(table: &Table, row: &[Value], key: &[u8], skip_pk: bool, cx: &mut ExecCx) -> Result<Option<Conflict>> {
+/// `current_key` is the key the row is stored under now (for an update
+/// that changes the primary key this differs from `key`): unique index
+/// entries owned by it belong to the row itself.
+fn find_conflict(
+    table: &Table,
+    row: &[Value],
+    key: &[u8],
+    current_key: &[u8],
+    skip_pk: bool,
+    cx: &mut ExecCx,
+) -> Result<Option<Conflict>> {
     let wait = cx.wait_policy();
     if !skip_pk {
         cx.txn.lock(key, LockMode::Exclusive, wait)?;
@@ -114,7 +124,7 @@ fn find_conflict(table: &Table, row: &[Value], key: &[u8], skip_pk: bool, cx: &m
         if let Some(owner) = cx.txn.get_current(&ikey)? {
             // An entry pointing at this very row is not a conflict (the
             // row is being updated in place).
-            if owner != key[4..] {
+            if owner != current_key[4..] {
                 return Ok(Some(Conflict::Index(i)));
             }
         }
@@ -371,7 +381,7 @@ fn update_row(table: &Arc<Table>, checks: &[(String, Expr)], old: &[Value], new:
     let old_key = row_key(table, old);
     let new_key = row_key(table, &new);
     let moved = old_key != new_key;
-    if let Some(conflict) = find_conflict(table, &new, &new_key, !moved, cx)? {
+    if let Some(conflict) = find_conflict(table, &new, &new_key, &old_key, !moved, cx)? {
         return Err(conflict_error(table, &conflict, &new, cx));
     }
     check_outgoing_fks(table, &new, Some(old), cx)?;
@@ -402,7 +412,7 @@ fn returning(exprs: &Option<Vec<Expr>>, row: &[Value], out: &mut Vec<Row>, cx: &
 }
 
 pub(crate) fn insert(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
-        let table = &plan.table;
+    let table = &plan.table;
     let mut out = Vec::new();
     // Rows this statement inserted or updated; ON CONFLICT DO UPDATE may
     // not touch any of them again.
@@ -420,7 +430,7 @@ pub(crate) fn insert(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
             Some(rows.into_iter())
         }
     };
-        let mut buffered = buffered;
+    let mut buffered = buffered;
     // Foreign keys are verified when the statement ends, as in Postgres:
     // rows of one statement may reference each other in any order, and
     // other constraint errors take precedence.
@@ -433,8 +443,8 @@ pub(crate) fn insert(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
         let Some(row) = row else { break };
         check_row(table, &plan.checks, &row, cx)?;
         let key = row_key(table, &row);
-        match find_conflict(table, &row, &key, false, cx)? {
-                        None => {
+        match find_conflict(table, &row, &key, &key, false, cx)? {
+            None => {
                 if !table.foreign_keys.is_empty() {
                     fk_pending.push(row.clone());
                 }
@@ -469,7 +479,7 @@ pub(crate) fn insert(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
                                 k
                             }
                         };
-                                                                        if touched.contains(&existing_key) {
+                        if touched.contains(&existing_key) {
                             return Err(Error::new(
                                 sqlstate::CARDINALITY_VIOLATION,
                                 "ON CONFLICT DO UPDATE command cannot affect row a second time",
@@ -495,12 +505,12 @@ pub(crate) fn insert(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
                         for (col, e) in set {
                             updated[*col] = e.eval(&both, cx)?;
                         }
-                                                update_row(table, &plan.checks, &existing, updated.clone(), cx)?;
+                        update_row(table, &plan.checks, &existing, updated.clone(), cx)?;
                         touched.insert(row_key(table, &updated));
                         cx.rows_affected += 1;
                         returning(&plan.returning, &updated, &mut out, cx)?;
                     }
-                                        _ => return Err(conflict_error(table, &conflict, &row, cx)),
+                    _ => return Err(conflict_error(table, &conflict, &row, cx)),
                 }
             }
         }
@@ -554,16 +564,26 @@ pub(crate) fn update(plan: &UpdatePlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
     let sources = collect(&plan.source, cx)?;
     let mut done = HashSet::new();
     let mut out = Vec::new();
-        // Compute every new row before writing any: the SET expressions (and
+    // Compute every new row before writing any: the SET expressions (and
     // subqueries in them) must see the table as it was when the statement
     // started, not rows this statement already changed.
     let mut changes = Vec::with_capacity(sources.len());
-    for src in sources {
+    // An error while computing a row is raised only after the rows before
+    // it were written, so that their constraint violations are reported
+    // first, as if the rows had been processed one at a time.
+    let mut failed = None;
+    'rows: for src in sources {
         let Some((_, src)) = lock_target(table, src, &plan.recheck, &mut done, cx)? else { continue };
         let old: Row = src[..width].to_vec();
         let mut new = old.clone();
         for (col, e) in &plan.set {
-            new[*col] = e.eval(&src, cx)?;
+            match e.eval(&src, cx) {
+                Ok(v) => new[*col] = v,
+                Err(e) => {
+                    failed = Some(e);
+                    break 'rows;
+                }
+            }
         }
         changes.push((src, old, new));
     }
@@ -574,6 +594,9 @@ pub(crate) fn update(plan: &UpdatePlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
             src.splice(..width, new);
             returning(&plan.returning, &src, &mut out, cx)?;
         }
+    }
+    if let Some(e) = failed {
+        return Err(e);
     }
     Ok(out)
 }

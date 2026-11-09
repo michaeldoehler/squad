@@ -83,7 +83,7 @@ impl<'a> Binder<'a> {
     /// Converts a value for storage into `column`: assignment cast plus
     /// length / precision enforcement.
     pub(crate) fn coerce_assign(&mut self, (e, from): Typed, column: &Column) -> Result<Expr> {
-                let (from, to) = (from.base(), column.ty.base());
+        let (from, to) = (from.base(), column.ty.base());
         let e = if from == to || from == Type::Unknown {
             self.coerce(e, &from, &to)?
         } else if value::can_cast(&from, &to, CastContext::Assignment) {
@@ -102,7 +102,7 @@ impl<'a> Binder<'a> {
             typmod: column.typmod,
             serial: false,
         };
-                self.apply_typmod(e, &decl, false)
+        self.apply_typmod(e, &decl, false)
     }
 
     fn column_of(&self, table: &Table, name: &str) -> Result<usize> {

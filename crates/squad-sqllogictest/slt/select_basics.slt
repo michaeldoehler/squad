@@ -1,0 +1,342 @@
+# Filtering, ordering, limits, DISTINCT and set operations.
+
+statement ok
+CREATE TABLE t (a int PRIMARY KEY, b int, c text)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y'), (3, 10, 'z'), (4, NULL, 'x'), (5, 30, NULL), (6, 20, 'y')
+
+query IIT
+SELECT * FROM t ORDER BY a
+----
+1 10 x
+2 20 y
+3 10 z
+4 NULL x
+5 30 NULL
+6 20 y
+
+query I
+SELECT a FROM t WHERE b = 10 ORDER BY a
+----
+1
+3
+
+query I
+SELECT a FROM t WHERE b <> 10 ORDER BY a
+----
+2
+5
+6
+
+query I
+SELECT a FROM t WHERE b IS NULL
+----
+4
+
+query I
+SELECT a FROM t WHERE b > 10 AND c = 'y' ORDER BY a
+----
+2
+6
+
+query I
+SELECT a FROM t WHERE b > 20 OR c = 'x' ORDER BY a
+----
+1
+4
+5
+
+query I
+SELECT a FROM t WHERE NOT (b > 10) ORDER BY a
+----
+1
+3
+
+query I
+SELECT a FROM t WHERE a BETWEEN 2 AND 4 ORDER BY a
+----
+2
+3
+4
+
+query I
+SELECT a FROM t WHERE a > 2 AND a <= 5 ORDER BY a DESC
+----
+5
+4
+3
+
+query I
+SELECT a FROM t WHERE c IN ('x', 'z') ORDER BY a
+----
+1
+3
+4
+
+query I
+SELECT a FROM t WHERE c NOT IN ('x', 'z') ORDER BY a
+----
+2
+6
+
+query I
+SELECT a FROM t WHERE c LIKE '%' ORDER BY a
+----
+1
+2
+3
+4
+6
+
+query I
+SELECT a FROM t WHERE a = 3
+----
+3
+
+query I
+SELECT a FROM t WHERE a = 99
+----
+
+query I
+SELECT a FROM t WHERE a IN (1, 3, 99) ORDER BY a
+----
+1
+3
+
+query II
+SELECT a, b FROM t ORDER BY b, a
+----
+1 10
+3 10
+2 20
+6 20
+5 30
+4 NULL
+
+query II
+SELECT a, b FROM t ORDER BY b DESC, a DESC
+----
+4 NULL
+5 30
+6 20
+2 20
+3 10
+1 10
+
+query II
+SELECT a, b FROM t ORDER BY b NULLS FIRST, a
+----
+4 NULL
+1 10
+3 10
+2 20
+6 20
+5 30
+
+query II
+SELECT a, b FROM t ORDER BY b DESC NULLS LAST, a
+----
+5 30
+2 20
+6 20
+1 10
+3 10
+4 NULL
+
+query IT
+SELECT a, c FROM t ORDER BY c, a
+----
+1 x
+4 x
+2 y
+6 y
+3 z
+5 NULL
+
+query I
+SELECT a FROM t ORDER BY 1 DESC
+----
+6
+5
+4
+3
+2
+1
+
+query II
+SELECT a, b * 2 AS d FROM t ORDER BY d, a
+----
+1 20
+3 20
+2 40
+6 40
+5 60
+4 NULL
+
+query I
+SELECT a FROM t ORDER BY b + a, a
+----
+1
+3
+2
+6
+5
+4
+
+query I
+SELECT a FROM t ORDER BY a LIMIT 2
+----
+1
+2
+
+query I
+SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 2
+----
+3
+4
+
+query I
+SELECT a FROM t ORDER BY a OFFSET 4
+----
+5
+6
+
+query I
+SELECT a FROM t ORDER BY a DESC LIMIT 1
+----
+6
+
+query I
+SELECT a FROM t ORDER BY a LIMIT 0
+----
+
+query I
+SELECT a FROM t ORDER BY a FETCH FIRST 3 ROWS ONLY
+----
+1
+2
+3
+
+query error (2201W)
+SELECT a FROM t LIMIT -1
+
+query I
+SELECT DISTINCT b FROM t ORDER BY b
+----
+10
+20
+30
+NULL
+
+query T
+SELECT DISTINCT c FROM t ORDER BY c NULLS FIRST
+----
+NULL
+x
+y
+z
+
+query IT
+SELECT DISTINCT b, c FROM t ORDER BY 1, 2
+----
+10 x
+10 z
+20 y
+30 NULL
+NULL x
+
+query II
+SELECT DISTINCT ON (b) b, a FROM t ORDER BY b, a DESC
+----
+10 3
+20 6
+30 5
+NULL 4
+
+query I
+SELECT a FROM t WHERE b = 10 UNION SELECT a FROM t WHERE c = 'x' ORDER BY 1
+----
+1
+3
+4
+
+query I
+SELECT b FROM t UNION ALL SELECT b FROM t ORDER BY 1
+----
+10
+10
+10
+10
+20
+20
+20
+20
+30
+30
+NULL
+NULL
+
+query I
+SELECT b FROM t INTERSECT SELECT a * 10 FROM t ORDER BY 1
+----
+10
+20
+30
+
+query I
+SELECT a FROM t EXCEPT SELECT a FROM t WHERE b > 10 ORDER BY 1
+----
+1
+3
+4
+
+query I
+SELECT b FROM t EXCEPT ALL SELECT 10 ORDER BY 1
+----
+10
+20
+20
+30
+NULL
+
+query I
+SELECT 1 UNION SELECT 1 UNION ALL SELECT 1
+----
+1
+1
+
+query error (42601)
+SELECT a FROM t UNION SELECT a, b FROM t
+
+query error (42804)
+SELECT a FROM t UNION SELECT c FROM t
+
+query I
+(SELECT a FROM t ORDER BY a LIMIT 1) UNION ALL (SELECT a FROM t ORDER BY a DESC LIMIT 1)
+----
+1
+6
+
+query II
+SELECT t.a, u.a FROM t, t u WHERE t.a + 1 = u.a AND t.b = u.b ORDER BY 1
+----
+
+query I
+SELECT t.* FROM t WHERE false
+----
+
+query error (42P01)
+SELECT nosuch.a FROM t
+
+query error (42712)
+SELECT a FROM t, t
+
+query error (42702)
+SELECT a FROM t x, t y
+
+query IT
+SELECT x.a, y.c FROM t x, t y WHERE x.a = y.a AND x.a < 3 ORDER BY 1
+----
+1 x
+2 y

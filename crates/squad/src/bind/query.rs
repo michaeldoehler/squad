@@ -54,6 +54,19 @@ fn bare_name(n: &pb::Node) -> Option<&str> {
     }
 }
 
+/// The name of a column reference or function call, looking through casts
+/// and subscripts; `None` for anything that only has a fallback name.
+fn strong_name(n: &pb::Node) -> Option<String> {
+    match n.node.as_ref()? {
+        N::ColumnRef(_) | N::FuncCall(_) => Some(target_name(n)).filter(|s| s != "?column?"),
+        N::TypeCast(c) => c.arg.as_ref().and_then(|a| strong_name(a)),
+        N::CollateClause(c) => c.arg.as_ref().and_then(|a| strong_name(a)),
+        N::AIndirection(i) => i.arg.as_ref().and_then(|a| strong_name(a)),
+        N::CaseExpr(c) => c.defresult.as_ref().and_then(|d| strong_name(d)),
+        _ => None,
+    }
+}
+
 /// Column name Postgres derives for an unaliased select-list expression.
 fn target_name(n: &pb::Node) -> String {
     match n.node.as_ref() {
@@ -77,7 +90,11 @@ fn target_name(n: &pb::Node) -> String {
         }
         Some(N::CollateClause(c)) => c.arg.as_ref().map(|a| target_name(a)),
         Some(N::AIndirection(i)) => i.arg.as_ref().map(|a| target_name(a)),
-        Some(N::CaseExpr(_)) => Some("case".into()),
+        // A CASE takes the name of its ELSE branch if that is a column or
+        // a function call (possibly under a cast).
+        Some(N::CaseExpr(c)) => {
+            Some(c.defresult.as_ref().and_then(|d| strong_name(d)).unwrap_or_else(|| "case".into()))
+        }
         Some(N::CoalesceExpr(_)) => Some("coalesce".into()),
         Some(N::AArrayExpr(_)) => Some("array".into()),
         Some(N::RowExpr(_)) => Some("row".into()),
@@ -128,6 +145,19 @@ fn output_scope(out: &[OutputColumn]) -> Scope {
 }
 
 impl Scope {
+    /// Joins two FROM scopes, rejecting a table name or alias used twice.
+    fn join_distinct(self, other: Scope) -> Result<Scope> {
+        // Subqueries without an alias share a placeholder name.
+        let clash = other.rels.iter().find(|r| r.alias != "subquery" && self.rels.iter().any(|l| l.alias == r.alias));
+        if let Some(r) = clash {
+            return Err(Error::new(
+                sqlstate::DUPLICATE_ALIAS,
+                format!("table name \"{}\" specified more than once", r.alias),
+            ));
+        }
+        Ok(self.join(other))
+    }
+
     fn unqualified(mut self) -> Scope {
         for c in &mut self.cols {
             c.table = None;
@@ -169,6 +199,9 @@ impl<'a> Binder<'a> {
 
     pub(crate) fn bind_select(&mut self, sel: &pb::SelectStmt) -> Result<(Plan, Vec<OutputColumn>)> {
         let cte_mark = self.ctes.len();
+        // Expressions of a nested query are top-level within that query.
+        let depth = std::mem::take(&mut self.expr_depth);
+        self.select_depth += 1;
         let result = (|| {
             let defs = match &sel.with_clause {
                 Some(with) => self.bind_with(with)?,
@@ -184,6 +217,8 @@ impl<'a> Binder<'a> {
             };
             Ok((if defs.is_empty() { plan } else { Plan::With { ctes: defs, body: Box::new(plan) } }, out))
         })();
+        self.select_depth -= 1;
+        self.expr_depth = depth;
         self.ctes.truncate(cte_mark);
         result
     }
@@ -194,6 +229,15 @@ impl<'a> Binder<'a> {
             let N::CommonTableExpr(cte) = node(c)? else { return Err(Error::internal("malformed WITH")) };
             let query = cte.ctequery.as_ref().ok_or_else(|| Error::internal("CTE without query"))?;
             let col_names = name_list(&cte.aliascolnames)?;
+            if with.ctes[..defs.len()]
+                .iter()
+                .any(|d| matches!(d.node.as_ref(), Some(N::CommonTableExpr(o)) if o.ctename == cte.ctename))
+            {
+                return Err(Error::new(
+                    sqlstate::DUPLICATE_ALIAS,
+                    format!("WITH query name \"{}\" specified more than once", cte.ctename),
+                ));
+            }
             let id = self.next_cte_id;
             self.next_cte_id += 1;
             let rename = |out: &mut Vec<OutputColumn>| {
@@ -394,7 +438,7 @@ impl<'a> Binder<'a> {
             for s in &sel.sort_clause {
                 let N::SortBy(sb) = node(s)? else { return Err(Error::internal("malformed ORDER BY")) };
                 let target = sb.node.as_ref().ok_or_else(|| Error::internal("ORDER BY without expression"))?;
-                                reject_constant_sort_key(target, int_const(target).is_some())?;
+                reject_constant_sort_key(target, int_const(target).is_some())?;
                 let expr = match int_const(target) {
                     Some(i) if i >= 1 && (i as usize) <= out.len() => Expr::Column(i as usize - 1),
                     Some(i) => {
@@ -662,7 +706,7 @@ impl<'a> Binder<'a> {
             let (expr, ty) = self.bind_expr(val, scope)?;
             // A plain column keeps its declared type (`oid`, `"char"`) in
             // the result description.
-                        let ty = match (&expr, val.node.as_ref()) {
+            let ty = match (&expr, val.node.as_ref()) {
                 (Expr::Column(i), _) => scope.cols[*i].ty.clone(),
                 // So does an explicit cast to one of those types.
                 (_, Some(N::TypeCast(c))) => match c.type_name.as_ref().map(|t| self.resolve_type(t)) {
@@ -730,7 +774,7 @@ impl<'a> Binder<'a> {
         for s in &sel.sort_clause {
             let N::SortBy(sb) = node(s)? else { return Err(Error::internal("malformed ORDER BY")) };
             let target = sb.node.as_ref().ok_or_else(|| Error::internal("ORDER BY without expression"))?;
-                        let by_position = int_const(target);
+            let by_position = int_const(target);
             reject_constant_sort_key(target, by_position.is_some())?;
             let by_name = bare_name(target).and_then(|n| {
                 let mut hits = names.iter().enumerate().filter(|(_, x)| *x == n);
@@ -860,7 +904,7 @@ impl<'a> Binder<'a> {
                             index_join: false,
                             right_width,
                         },
-                        ls.join(rs),
+                        ls.join_distinct(rs)?,
                     )
                 }
             });
@@ -882,7 +926,7 @@ impl<'a> Binder<'a> {
                     return Err(Error::internal("subquery in FROM without SELECT"));
                 };
                 let (plan, out, lateral) = match left {
-                                        Some(l) if rs.lateral => {
+                    Some(l) if rs.lateral => {
                         let hidden = std::mem::take(&mut self.hidden_levels);
                         let bound = self.bind_subquery(sel, l);
                         self.hidden_levels = hidden;
@@ -908,7 +952,7 @@ impl<'a> Binder<'a> {
             N::JoinExpr(j) => {
                 // Items to the left of this join (in a comma list) stay
                 // visible to LATERAL items inside it, one level further out.
-                                if let Some(l) = left {
+                if let Some(l) = left {
                     self.hidden_levels.push(self.outer_scopes.len());
                     self.outer_scopes.push(l.clone());
                     self.correlated.push(false);
@@ -964,7 +1008,7 @@ impl<'a> Binder<'a> {
                             };
                         pairs.push((find(&ls, "left")?, find(&rs, "right")?));
                     }
-                    let mut scope = ls.join(rs);
+                    let mut scope = ls.join_distinct(rs)?;
                     let mut conds = Vec::new();
                     for (li, ri) in pairs {
                         let ri = left_width + ri;
@@ -998,7 +1042,7 @@ impl<'a> Binder<'a> {
                     }
                     Ok((plan, scope))
                 })();
-                                let lateral = if left.is_some() {
+                let lateral = if left.is_some() {
                     self.outer_scopes.pop();
                     let level = self.outer_scopes.len();
                     self.hidden_levels.retain(|l| *l != level);
@@ -1023,7 +1067,7 @@ impl<'a> Binder<'a> {
         let empty = Scope::default();
 
         // Arguments may refer to FROM items on the left (implicit LATERAL).
-                let hidden = std::mem::take(&mut self.hidden_levels);
+        let hidden = std::mem::take(&mut self.hidden_levels);
         if let Some(l) = left {
             self.outer_scopes.push(l.clone());
             self.correlated.push(false);
@@ -1058,7 +1102,7 @@ impl<'a> Binder<'a> {
                 }
             }
         })();
-                let lateral = if left.is_some() {
+        let lateral = if left.is_some() {
             self.outer_scopes.pop();
             self.correlated.pop().unwrap_or(false)
         } else {
@@ -1126,7 +1170,7 @@ impl<'a> Binder<'a> {
                     return Err(Error::internal("stored view definition is not a SELECT"));
                 };
                 // A view body is bound in isolation from the referencing query.
-                                let hidden = std::mem::take(&mut self.hidden_levels);
+                let hidden = std::mem::take(&mut self.hidden_levels);
                 let outer = std::mem::take(&mut self.outer_scopes);
                 let correlated = std::mem::take(&mut self.correlated);
                 let ctes = std::mem::take(&mut self.ctes);
@@ -1134,7 +1178,7 @@ impl<'a> Binder<'a> {
                 self.view_stack.push(view.id);
                 let result = self.bind_select(sel);
                 self.view_stack.pop();
-                                self.outer_scopes = outer;
+                self.outer_scopes = outer;
                 self.hidden_levels = hidden;
                 self.correlated = correlated;
                 self.ctes = ctes;
