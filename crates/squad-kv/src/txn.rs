@@ -184,6 +184,17 @@ impl Txn {
         Ok(hit.pop().map(|(k, v)| (codec::decode_value(v), ts_of(&k))))
     }
 
+    /// The value a new transaction would see for `key` if this transaction
+    /// committed now: its own write if it has one, otherwise the newest
+    /// committed version regardless of the snapshot. Used for uniqueness
+    /// checks after taking a row lock.
+    pub fn get_current(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(w) = self.writes.get(key) {
+            return Ok(w.value.clone());
+        }
+        Ok(self.get_latest(key)?.and_then(|(v, _)| v))
+    }
+
     fn write(&mut self, key: &[u8], value: Option<Vec<u8>>, check_ts: Option<u64>) -> Result<()> {
         if self.read_only {
             return Err(KvError::ReadOnly);
