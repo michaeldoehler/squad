@@ -260,7 +260,12 @@ fn field<'a>(j: &'a J, key: &Value) -> Option<&'a J> {
 }
 fn op_get(_: &FnCtx, a: &[Value]) -> Result<Value> {
     // jsonb is the hot path; avoid cloning the whole document.
-    if let Value::Jsonb(j) = &a[0] {
+        if let Value::Jsonb(j) = &a[0] {
+        // Postgres stores a top-level jsonb scalar as a one-element array,
+        // so element 0 (or -1) of a scalar is the scalar itself.
+        if let (false, Value::Int4(0 | -1)) = (j.is_array() || j.is_object(), &a[1]) {
+            return Ok(a[0].clone());
+        }
         return Ok(field(j, &a[1]).map_or(Value::Null, |v| jsonb(v.clone())));
     }
     let t = tree(&a[0])?;

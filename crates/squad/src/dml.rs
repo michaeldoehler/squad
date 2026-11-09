@@ -402,8 +402,12 @@ fn returning(exprs: &Option<Vec<Expr>>, row: &[Value], out: &mut Vec<Row>, cx: &
 }
 
 pub(crate) fn insert(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
-    let table = &plan.table;
+        let table = &plan.table;
     let mut out = Vec::new();
+    // Rows this statement inserted or updated; ON CONFLICT DO UPDATE may
+    // not touch any of them again.
+    let mut touched: HashSet<Vec<u8>> = HashSet::new();
+    let track = matches!(plan.on_conflict, Some(OnConflict::Update { .. }));
     let mut source = crate::exec::open(&plan.source, cx)?;
     // Materialize when the source could observe this statement's writes.
     let buffered = match &plan.source {
@@ -416,7 +420,11 @@ pub(crate) fn insert(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
             Some(rows.into_iter())
         }
     };
-    let mut buffered = buffered;
+        let mut buffered = buffered;
+    // Foreign keys are verified when the statement ends, as in Postgres:
+    // rows of one statement may reference each other in any order, and
+    // other constraint errors take precedence.
+    let mut fk_pending: Vec<Row> = Vec::new();
     loop {
         let row = match &mut buffered {
             Some(it) => it.next(),
@@ -426,9 +434,14 @@ pub(crate) fn insert(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
         check_row(table, &plan.checks, &row, cx)?;
         let key = row_key(table, &row);
         match find_conflict(table, &row, &key, false, cx)? {
-            None => {
-                check_outgoing_fks(table, &row, None, cx)?;
+                        None => {
+                if !table.foreign_keys.is_empty() {
+                    fk_pending.push(row.clone());
+                }
                 store_row(table, &key, &row, cx)?;
+                if track {
+                    touched.insert(key);
+                }
                 cx.rows_affected += 1;
                 returning(&plan.returning, &row, &mut out, cx)?;
             }
@@ -456,6 +469,15 @@ pub(crate) fn insert(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
                                 k
                             }
                         };
+                                                                        if touched.contains(&existing_key) {
+                            return Err(Error::new(
+                                sqlstate::CARDINALITY_VIOLATION,
+                                "ON CONFLICT DO UPDATE command cannot affect row a second time",
+                            )
+                            .with_hint(
+                                "Ensure that no rows proposed for insertion within the same command have duplicate constrained values.",
+                            ));
+                        }
                         let wait = cx.wait_policy();
                         cx.txn.lock(&existing_key, LockMode::Exclusive, wait)?;
                         let Some(bytes) = cx.txn.get_current(&existing_key)? else {
@@ -473,14 +495,18 @@ pub(crate) fn insert(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
                         for (col, e) in set {
                             updated[*col] = e.eval(&both, cx)?;
                         }
-                        update_row(table, &plan.checks, &existing, updated.clone(), cx)?;
+                                                update_row(table, &plan.checks, &existing, updated.clone(), cx)?;
+                        touched.insert(row_key(table, &updated));
                         cx.rows_affected += 1;
                         returning(&plan.returning, &updated, &mut out, cx)?;
                     }
-                    _ => return Err(conflict_error(table, &conflict, &row, cx)),
+                                        _ => return Err(conflict_error(table, &conflict, &row, cx)),
                 }
             }
         }
+    }
+    for row in &fk_pending {
+        check_outgoing_fks(table, row, None, cx)?;
     }
     Ok(out)
 }
@@ -528,13 +554,20 @@ pub(crate) fn update(plan: &UpdatePlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
     let sources = collect(&plan.source, cx)?;
     let mut done = HashSet::new();
     let mut out = Vec::new();
+        // Compute every new row before writing any: the SET expressions (and
+    // subqueries in them) must see the table as it was when the statement
+    // started, not rows this statement already changed.
+    let mut changes = Vec::with_capacity(sources.len());
     for src in sources {
-        let Some((_, mut src)) = lock_target(table, src, &plan.recheck, &mut done, cx)? else { continue };
+        let Some((_, src)) = lock_target(table, src, &plan.recheck, &mut done, cx)? else { continue };
         let old: Row = src[..width].to_vec();
         let mut new = old.clone();
         for (col, e) in &plan.set {
             new[*col] = e.eval(&src, cx)?;
         }
+        changes.push((src, old, new));
+    }
+    for (mut src, old, new) in changes {
         update_row(table, &plan.checks, &old, new.clone(), cx)?;
         cx.rows_affected += 1;
         if plan.returning.is_some() {

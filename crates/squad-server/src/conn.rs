@@ -5,7 +5,7 @@ use std::io;
 use std::sync::Arc;
 
 use squad::copy::{self, CopyDecoder, CopyRequest};
-use squad::session::Prepared;
+use squad::session::{Prepared, TypeResolver};
 use squad::value::{decode_binary, encode_binary, format_value, parse_value};
 use squad::{sqlstate, Error, FnCtx, OutputColumn, QueryResult, Session, TxnStatus, Type, Value};
 
@@ -98,14 +98,14 @@ fn format_at(formats: &[i16], i: usize) -> i16 {
     }
 }
 
-fn row_description(io: &mut Io, columns: &[OutputColumn], formats: &[i16]) {
+fn row_description(io: &mut Io, columns: &[OutputColumn], formats: &[i16], types: &TypeResolver) {
     let m = io.begin(b'T');
     io.i16(columns.len() as i16);
     for (i, c) in columns.iter().enumerate() {
         io.cstr(&c.name);
         io.i32(0); // table OID
         io.i16(0); // column number
-        io.i32(c.ty.oid() as i32);
+                io.i32(types.oid(&c.ty) as i32);
         io.i16(type_len(&c.ty));
         io.i32(-1); // type modifier
         io.i16(format_at(formats, i));
@@ -519,11 +519,12 @@ impl Conn {
 
     /// Runs SQL text through the session, streaming every result.
     fn run_sql(&mut self, sql: &str) -> Step {
-        let ctx = self.fn_ctx();
+                let ctx = self.fn_ctx();
+        let types = self.session.types();
         let io = &mut self.io;
         self.session.execute_each(sql, &mut |r| {
             if !r.columns.is_empty() {
-                row_description(io, &r.columns, &[]);
+                row_description(io, &r.columns, &[], &types);
                 for row in &r.rows {
                     data_row(io, &r.columns, row, &[], &ctx)?;
                     if io.out.len() > FLUSH_THRESHOLD {
@@ -724,11 +725,12 @@ impl Conn {
         let mut r = Reader::new(body);
         let name = r.cstr()?.to_string();
         let sql = r.cstr()?;
-        let n = r.i16()?.max(0) as usize;
+                let n = r.i16()?.max(0) as usize;
+        let resolver = self.session.types();
         let mut types = Vec::with_capacity(n);
         for _ in 0..n {
             let oid = r.i32()? as u32;
-            types.push(if oid == 0 { None } else { Type::from_oid(oid).filter(|t| *t != Type::Unknown) });
+                        types.push(if oid == 0 { None } else { resolver.from_oid(oid).filter(|t| *t != Type::Unknown) });
         }
         if !name.is_empty() && self.stmts.contains_key(&name) {
             return Err(Error::new(
@@ -834,16 +836,17 @@ impl Conn {
                     StmtKind::Sql(p) => (&p.param_types, &p.columns),
                     StmtKind::Copy(_) => (&[], &[]),
                 };
+                                let types = self.session.types();
                 let m = self.io.begin(b't');
                 self.io.i16(params.len() as i16);
                 for t in params {
-                    self.io.i32(t.oid() as i32);
+                    self.io.i32(types.oid(t) as i32);
                 }
                 self.io.end(m);
                 if columns.is_empty() {
                     self.io.message(b'n', &[]);
                 } else {
-                    row_description(&mut self.io, columns, &[]);
+                    row_description(&mut self.io, columns, &[], &types);
                 }
             }
             b'P' => {
@@ -851,8 +854,8 @@ impl Conn {
                     Error::new(sqlstate::INVALID_CURSOR_NAME, format!("portal \"{name}\" does not exist"))
                 })?;
                 match &portal.kind {
-                    StmtKind::Sql(p) if !p.columns.is_empty() => {
-                        row_description(&mut self.io, &p.columns, &portal.formats)
+                                        StmtKind::Sql(p) if !p.columns.is_empty() => {
+                        row_description(&mut self.io, &p.columns, &portal.formats, &self.session.types())
                     }
                     _ => self.io.message(b'n', &[]),
                 }

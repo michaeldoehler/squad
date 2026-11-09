@@ -105,7 +105,9 @@ fn agg_type(func: &AggFunc, name: &str, args: &[Type]) -> Result<Type> {
             _ => return Err(undefined_function(name, args)),
         },
         AggFunc::Min | AggFunc::Max => match arg {
-            Type::Json | Type::Jsonb | Type::Record => return Err(undefined_function(name, args)),
+            Type::Json | Type::Jsonb | Type::Record | Type::Bool | Type::Uuid | Type::Bytea => {
+                return Err(undefined_function(name, args))
+            }
             t => t,
         },
         AggFunc::BoolAnd | AggFunc::BoolOr => match arg {
@@ -159,7 +161,7 @@ impl<'a> Binder<'a> {
         }
     }
 
-        fn boolean(&mut self, (e, t): Typed, what: &str) -> Result<Expr> {
+    fn boolean(&mut self, (e, t): Typed, what: &str) -> Result<Expr> {
         match t {
             Type::Bool => Ok(e),
             Type::Unknown => self.coerce(e, &t, &Type::Bool),
@@ -202,7 +204,7 @@ impl<'a> Binder<'a> {
                 if self.param_types.len() <= i {
                     self.param_types.resize(i + 1, None);
                 }
-                Ok((Expr::Param(i), self.param_types[i].clone().unwrap_or(Type::Unknown)))
+                Ok((Expr::Param(i), self.param_types[i].as_ref().map_or(Type::Unknown, Type::base)))
             }
             N::TypeCast(c) => self.bind_cast(c, scope),
             N::AExpr(e) => self.bind_a_expr(e, scope),
@@ -331,19 +333,22 @@ impl<'a> Binder<'a> {
         // Current scope first, then enclosing queries from the inside out.
         if let Some(found) = lookup(scope, table, name)? {
             return Ok(match found {
-                Found::Col(i) => (Expr::Column(i), scope.cols[i].ty.clone()),
+                Found::Col(i) => (Expr::Column(i), scope.cols[i].ty.base()),
                 Found::Row(start, len) => (Expr::Row((start..start + len).map(Expr::Column).collect()), Type::Record),
             });
         }
         for depth in 1..=self.outer_scopes.len() {
-            let level = self.outer_scopes.len() - depth;
+                        let level = self.outer_scopes.len() - depth;
+            if self.hidden_levels.contains(&level) {
+                continue;
+            }
             if let Some(found) = lookup(&self.outer_scopes[level], table, name)? {
                 for flag in &mut self.correlated[level..] {
                     *flag = true;
                 }
                 let outer = &self.outer_scopes[level];
                 return Ok(match found {
-                    Found::Col(i) => (Expr::Outer(depth, i), outer.cols[i].ty.clone()),
+                    Found::Col(i) => (Expr::Outer(depth, i), outer.cols[i].ty.base()),
                     Found::Row(start, len) => {
                         (Expr::Row((start..start + len).map(|i| Expr::Outer(depth, i)).collect()), Type::Record)
                     }
@@ -351,7 +356,14 @@ impl<'a> Binder<'a> {
             }
         }
         Err(match table {
-            Some(t) if !has_rel(scope, t) && !self.outer_scopes.iter().any(|s| has_rel(s, t)) => {
+                        Some(t)
+                if !has_rel(scope, t)
+                    && !self
+                        .outer_scopes
+                        .iter()
+                        .enumerate()
+                        .any(|(i, s)| !self.hidden_levels.contains(&i) && has_rel(s, t)) =>
+            {
                 Error::new(sqlstate::UNDEFINED_TABLE, format!("missing FROM-clause entry for table \"{t}\""))
             }
             Some(t) => Error::new(sqlstate::UNDEFINED_COLUMN, format!("column {t}.{name} does not exist")),
@@ -380,9 +392,10 @@ impl<'a> Binder<'a> {
         }
 
         let decl = self.resolve_type(tn)?;
-        let (e, from) = self.bind_expr(arg, scope)?;
-        let e = self.explicit_cast(e, &from, &decl.ty)?;
-        Ok((self.apply_typmod(e, &decl, true), decl.ty))
+                let (e, from) = self.bind_expr(arg, scope)?;
+        let to = decl.ty.base();
+        let e = self.explicit_cast(e, &from, &to)?;
+                Ok((self.apply_typmod(e, &decl, true)?, to))
     }
 
     pub(crate) fn explicit_cast(&mut self, e: Expr, from: &Type, to: &Type) -> Result<Expr> {
@@ -588,7 +601,8 @@ impl<'a> Binder<'a> {
         }
         if window_func(&name).is_some() {
             return Err(Error::new(
-                sqlstate::WRONG_OBJECT_TYPE, format!("window function {name} requires an OVER clause"),
+                sqlstate::WRONG_OBJECT_TYPE,
+                format!("window function {name} requires an OVER clause"),
             ));
         }
         if f.agg_distinct || !f.agg_order.is_empty() || f.agg_filter.is_some() {
@@ -697,12 +711,7 @@ impl<'a> Binder<'a> {
 
     /// Checks and coerces the arguments of a set-returning function and
     /// returns its output columns.
-    pub(crate) fn bind_srf_args(
-        &mut self,
-        kind: &Srf,
-        name: &str,
-                args: Vec<Typed>,
-    ) -> Result<(Vec<Expr>, Columns)> {
+    pub(crate) fn bind_srf_args(&mut self, kind: &Srf, name: &str, args: Vec<Typed>) -> Result<(Vec<Expr>, Columns)> {
         let types: Vec<Type> = args.iter().map(|(_, t)| t.clone()).collect();
         let bad = || undefined_function(name, &types);
         let coerce_all = |b: &mut Self, want: &[Type]| -> Result<Vec<Expr>> {
@@ -765,14 +774,17 @@ impl<'a> Binder<'a> {
                 if types.len() != 1 {
                     return Err(bad());
                 }
-                (coerce_all(self, std::slice::from_ref(&src))?, vec![("value".to_string(), if *text { Type::Text } else { src })])
+                (
+                    coerce_all(self, std::slice::from_ref(&src))?,
+                    vec![("value".to_string(), if *text { Type::Text } else { src })],
+                )
             }
             Srf::JsonEach { text } => {
                 let src = if name.starts_with("json_") { Type::Json } else { Type::Jsonb };
                 if types.len() != 1 {
                     return Err(bad());
                 }
-                                (
+                (
                     coerce_all(self, std::slice::from_ref(&src))?,
                     vec![("key".to_string(), Type::Text), ("value".to_string(), if *text { Type::Text } else { src })],
                 )
@@ -838,7 +850,7 @@ impl<'a> Binder<'a> {
                     (_, _, Type::Unknown) => Type::Text,
                     (_, _, t) => t.clone(),
                 };
-                                let e = match (&func, i) {
+                let e = match (&func, i) {
                     (AggFunc::StringAgg, _) if t != Type::Text && t != Type::Unknown => {
                         return Err(undefined_function(name, &types))
                     }
@@ -961,6 +973,16 @@ impl<'a> Binder<'a> {
                 }
                 let types: Vec<Type> = args.iter().map(|(_, t)| t.clone()).collect();
                 let bad = || undefined_function(name, &types);
+                // These are polymorphic: an untyped literal has no type to
+                // take the result type from.
+                let known = |t: Type| -> Result<Type> {
+                    if t == Type::Unknown {
+                        return Err(Error::type_mismatch(
+                            "could not determine polymorphic type because input has type unknown",
+                        ));
+                    }
+                    Ok(t)
+                };
                 let mut it = args.into_iter();
                 let (exprs, ret) = match func {
                     WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => {
@@ -981,7 +1003,7 @@ impl<'a> Binder<'a> {
                     }
                     WindowFunc::Lag | WindowFunc::Lead => {
                         let (e, t) = it.next().ok_or_else(bad)?;
-                        let ty = if t == Type::Unknown { Type::Text } else { t.clone() };
+                        let ty = known(t.clone())?;
                         let mut exprs = vec![self.coerce(e, &t, &ty)?];
                         if let Some((o, ot)) = it.next() {
                             exprs.push(self.coerce(o, &ot, &Type::Int4)?);
@@ -993,13 +1015,13 @@ impl<'a> Binder<'a> {
                     }
                     WindowFunc::FirstValue | WindowFunc::LastValue => {
                         let (e, t) = it.next().ok_or_else(bad)?;
-                        let ty = if t == Type::Unknown { Type::Text } else { t.clone() };
+                        let ty = known(t.clone())?;
                         (vec![self.coerce(e, &t, &ty)?], ty)
                     }
                     WindowFunc::NthValue => {
                         let (e, t) = it.next().ok_or_else(bad)?;
                         let (n, nt) = it.next().ok_or_else(bad)?;
-                        let ty = if t == Type::Unknown { Type::Text } else { t.clone() };
+                        let ty = known(t.clone())?;
                         (vec![self.coerce(e, &t, &ty)?, self.coerce(n, &nt, &Type::Int4)?], ty)
                     }
                     WindowFunc::Agg(_) => unreachable!(),
@@ -1099,7 +1121,7 @@ impl<'a> Binder<'a> {
         let (plan, out, correlated) = self.bind_subquery(sel, scope)?;
         let one_column = |out: &[super::OutputColumn]| -> Result<Type> {
             match out {
-                [c] => Ok(if c.ty == Type::Unknown { Type::Text } else { c.ty.clone() }),
+                [c] => Ok(if c.ty == Type::Unknown { Type::Text } else { c.ty.base() }),
                 _ => Err(Error::syntax("subquery must return only one column")),
             }
         };
@@ -1136,7 +1158,7 @@ impl<'a> Binder<'a> {
                 let mut casts: Vec<Option<Type>> = Vec::with_capacity(lefts.len());
                 let mut op = None;
                 for ((e, lt), col) in lefts.into_iter().zip(&out) {
-                    let rt = if col.ty == Type::Unknown { Type::Text } else { col.ty.clone() };
+                    let rt = if col.ty == Type::Unknown { Type::Text } else { col.ty.base() };
                     match &op_name {
                         Some(name) if name != "=" || out.len() > 1 && false => {
                             let f = value::resolve_operator(name, Some(&lt), &rt)?;

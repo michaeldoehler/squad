@@ -26,7 +26,12 @@ rand = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
 tokio-postgres = "0.7"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 bytes = "1"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "derive", "migrate", "chrono", "uuid", "json", "rust_decimal"] }
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
+rust_decimal = "1"

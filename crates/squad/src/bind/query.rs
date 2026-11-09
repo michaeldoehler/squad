@@ -35,6 +35,15 @@ fn int_const(n: &pb::Node) -> Option<i32> {
     }
 }
 
+/// Postgres rejects a bare constant other than an output position as a
+/// sort key.
+fn reject_constant_sort_key(n: &pb::Node, is_position: bool) -> Result<()> {
+    if !is_position && matches!(n.node.as_ref(), Some(N::AConst(_))) {
+        return Err(Error::syntax("non-integer constant in ORDER BY"));
+    }
+    Ok(())
+}
+
 fn bare_name(n: &pb::Node) -> Option<&str> {
     match n.node.as_ref()? {
         N::ColumnRef(c) if c.fields.len() == 1 => match c.fields[0].node.as_ref()? {
@@ -294,7 +303,7 @@ impl<'a> Binder<'a> {
         let (mut lcast, mut rcast) = (Vec::new(), Vec::new());
         let (mut lneed, mut rneed) = (false, false);
         for (i, (l, r)) in left_out.iter().zip(&right_out).enumerate() {
-            let ty = value::common_type(&[l.ty.clone(), r.ty.clone()], what)?;
+            let ty = if l.ty == r.ty { l.ty.clone() } else { value::common_type(&[l.ty.base(), r.ty.base()], what)? };
             lneed |= l.ty != ty && l.ty != Type::Unknown;
             rneed |= r.ty != ty && r.ty != Type::Unknown;
             lcast.push(if l.ty == Type::Unknown { Expr::Column(i) } else { self.coerce(Expr::Column(i), &l.ty, &ty)? });
@@ -385,6 +394,7 @@ impl<'a> Binder<'a> {
             for s in &sel.sort_clause {
                 let N::SortBy(sb) = node(s)? else { return Err(Error::internal("malformed ORDER BY")) };
                 let target = sb.node.as_ref().ok_or_else(|| Error::internal("ORDER BY without expression"))?;
+                                reject_constant_sort_key(target, int_const(target).is_some())?;
                 let expr = match int_const(target) {
                     Some(i) if i >= 1 && (i as usize) <= out.len() => Expr::Column(i as usize - 1),
                     Some(i) => {
@@ -649,7 +659,19 @@ impl<'a> Binder<'a> {
                     continue;
                 }
             }
-            targets.push(self.bind_expr(val, scope)?);
+            let (expr, ty) = self.bind_expr(val, scope)?;
+            // A plain column keeps its declared type (`oid`, `"char"`) in
+            // the result description.
+                        let ty = match (&expr, val.node.as_ref()) {
+                (Expr::Column(i), _) => scope.cols[*i].ty.clone(),
+                // So does an explicit cast to one of those types.
+                (_, Some(N::TypeCast(c))) => match c.type_name.as_ref().map(|t| self.resolve_type(t)) {
+                    Some(Ok(decl)) if decl.ty.base() == ty && decl.ty != ty => decl.ty,
+                    _ => ty,
+                },
+                _ => ty,
+            };
+            targets.push((expr, ty));
             names.push(if rt.name.is_empty() { target_name(val) } else { rt.name.clone() });
         }
 
@@ -708,7 +730,8 @@ impl<'a> Binder<'a> {
         for s in &sel.sort_clause {
             let N::SortBy(sb) = node(s)? else { return Err(Error::internal("malformed ORDER BY")) };
             let target = sb.node.as_ref().ok_or_else(|| Error::internal("ORDER BY without expression"))?;
-            let by_position = int_const(target);
+                        let by_position = int_const(target);
+            reject_constant_sort_key(target, by_position.is_some())?;
             let by_name = bare_name(target).and_then(|n| {
                 let mut hits = names.iter().enumerate().filter(|(_, x)| *x == n);
                 match (hits.next(), hits.next()) {
@@ -859,7 +882,12 @@ impl<'a> Binder<'a> {
                     return Err(Error::internal("subquery in FROM without SELECT"));
                 };
                 let (plan, out, lateral) = match left {
-                    Some(l) if rs.lateral => self.bind_subquery(sel, l)?,
+                                        Some(l) if rs.lateral => {
+                        let hidden = std::mem::take(&mut self.hidden_levels);
+                        let bound = self.bind_subquery(sel, l);
+                        self.hidden_levels = hidden;
+                        bound?
+                    }
                     _ => {
                         let (p, o) = self.bind_select(sel)?;
                         (p, o, false)
@@ -878,42 +906,51 @@ impl<'a> Binder<'a> {
             }
             N::RangeFunction(rf) => self.bind_range_function(rf, left),
             N::JoinExpr(j) => {
-                let larg = j.larg.as_ref().ok_or_else(|| Error::internal("join without left side"))?;
-                let rarg = j.rarg.as_ref().ok_or_else(|| Error::internal("join without right side"))?;
-                let (lp, ls, _) = self.bind_from_item(larg, None)?;
-                let (rp, rs, lateral) = self.bind_from_item(rarg, Some(&ls))?;
-                let kind = match pb::JoinType::try_from(j.jointype).unwrap_or(pb::JoinType::Undefined) {
-                    pb::JoinType::JoinInner => JoinKind::Inner,
-                    pb::JoinType::JoinLeft => JoinKind::Left,
-                    pb::JoinType::JoinRight => JoinKind::Right,
-                    pb::JoinType::JoinFull => JoinKind::Full,
-                    other => return Err(Error::unsupported(format!("join type {other:?}"))),
-                };
-                if lateral && matches!(kind, JoinKind::Right | JoinKind::Full) {
-                    return Err(Error::new(
+                // Items to the left of this join (in a comma list) stay
+                // visible to LATERAL items inside it, one level further out.
+                                if let Some(l) = left {
+                    self.hidden_levels.push(self.outer_scopes.len());
+                    self.outer_scopes.push(l.clone());
+                    self.correlated.push(false);
+                }
+                let result = (|| -> Result<(Plan, Scope)> {
+                    let larg = j.larg.as_ref().ok_or_else(|| Error::internal("join without left side"))?;
+                    let rarg = j.rarg.as_ref().ok_or_else(|| Error::internal("join without right side"))?;
+                    let (lp, ls, _) = self.bind_from_item(larg, None)?;
+                    let (rp, rs, lateral) = self.bind_from_item(rarg, Some(&ls))?;
+                    let kind = match pb::JoinType::try_from(j.jointype).unwrap_or(pb::JoinType::Undefined) {
+                        pb::JoinType::JoinInner => JoinKind::Inner,
+                        pb::JoinType::JoinLeft => JoinKind::Left,
+                        pb::JoinType::JoinRight => JoinKind::Right,
+                        pb::JoinType::JoinFull => JoinKind::Full,
+                        other => return Err(Error::unsupported(format!("join type {other:?}"))),
+                    };
+                    if lateral && matches!(kind, JoinKind::Right | JoinKind::Full) {
+                        return Err(Error::new(
                         sqlstate::INVALID_COLUMN_REFERENCE,
                         "invalid reference to FROM-clause entry: the combining JOIN type must be INNER or LEFT for a LATERAL reference",
                     ));
-                }
-                let (left_width, right_width) = (ls.cols.len(), rs.cols.len());
+                    }
+                    let (left_width, right_width) = (ls.cols.len(), rs.cols.len());
 
-                // USING / NATURAL: equate same-named columns and hide the
-                // duplicate from unqualified references and `*`.
-                let mut using = name_list(&j.using_clause)?;
-                if j.is_natural {
-                    using = ls
-                        .cols
-                        .iter()
-                        .filter(|c| !c.hidden && !c.merged)
-                        .filter(|c| rs.cols.iter().any(|r| !r.hidden && !r.merged && r.name == c.name))
-                        .map(|c| c.name.clone())
-                        .collect();
-                }
-                let mut pairs = Vec::with_capacity(using.len());
-                for name in &using {
-                    let find = |s: &Scope, side: &str| -> Result<usize> {
-                        let mut hits = s.cols.iter().enumerate().filter(|(_, c)| c.name == *name && !c.merged);
-                        match (hits.next(), hits.next()) {
+                    // USING / NATURAL: equate same-named columns and hide the
+                    // duplicate from unqualified references and `*`.
+                    let mut using = name_list(&j.using_clause)?;
+                    if j.is_natural {
+                        using = ls
+                            .cols
+                            .iter()
+                            .filter(|c| !c.hidden && !c.merged)
+                            .filter(|c| rs.cols.iter().any(|r| !r.hidden && !r.merged && r.name == c.name))
+                            .map(|c| c.name.clone())
+                            .collect();
+                    }
+                    let mut pairs = Vec::with_capacity(using.len());
+                    for name in &using {
+                        let find =
+                            |s: &Scope, side: &str| -> Result<usize> {
+                                let mut hits = s.cols.iter().enumerate().filter(|(_, c)| c.name == *name && !c.merged);
+                                match (hits.next(), hits.next()) {
                             (Some((i, _)), None) => Ok(i),
                             (None, _) => Err(Error::new(
                                 sqlstate::UNDEFINED_COLUMN,
@@ -924,42 +961,53 @@ impl<'a> Binder<'a> {
                                 format!("common column name \"{name}\" appears more than once in {side} table"),
                             )),
                         }
+                            };
+                        pairs.push((find(&ls, "left")?, find(&rs, "right")?));
+                    }
+                    let mut scope = ls.join(rs);
+                    let mut conds = Vec::new();
+                    for (li, ri) in pairs {
+                        let ri = left_width + ri;
+                        let l = (Expr::Column(li), scope.cols[li].ty.clone());
+                        let r = (Expr::Column(ri), scope.cols[ri].ty.clone());
+                        conds.push(self.bind_op("=", Some(l), r)?.0);
+                        let hide = if kind == JoinKind::Right { li } else { ri };
+                        scope.cols[hide].merged = true;
+                    }
+                    if let Some(q) = &j.quals {
+                        self.clause = "JOIN/ON";
+                        conds.push(self.bind_bool(q, &scope, "JOIN/ON")?);
+                        self.clause = "FROM";
+                    }
+                    let on = match conds.len() {
+                        0 => None,
+                        1 => conds.pop(),
+                        _ => Some(Expr::And(conds)),
                     };
-                    pairs.push((find(&ls, "left")?, find(&rs, "right")?));
-                }
-                let mut scope = ls.join(rs);
-                let mut conds = Vec::new();
-                for (li, ri) in pairs {
-                    let ri = left_width + ri;
-                    let l = (Expr::Column(li), scope.cols[li].ty.clone());
-                    let r = (Expr::Column(ri), scope.cols[ri].ty.clone());
-                    conds.push(self.bind_op("=", Some(l), r)?.0);
-                    let hide = if kind == JoinKind::Right { li } else { ri };
-                    scope.cols[hide].merged = true;
-                }
-                if let Some(q) = &j.quals {
-                    self.clause = "JOIN/ON";
-                    conds.push(self.bind_bool(q, &scope, "JOIN/ON")?);
-                    self.clause = "FROM";
-                }
-                let on = match conds.len() {
-                    0 => None,
-                    1 => conds.pop(),
-                    _ => Some(Expr::And(conds)),
+                    let plan = Plan::NestedLoop {
+                        left: Box::new(lp),
+                        right: Box::new(rp),
+                        kind,
+                        on,
+                        lateral,
+                        index_join: false,
+                        right_width,
+                    };
+                    if let Some(a) = &j.alias {
+                        scope = scope.rename(&a.aliasname, &name_list(&a.colnames)?);
+                    }
+                    Ok((plan, scope))
+                })();
+                                let lateral = if left.is_some() {
+                    self.outer_scopes.pop();
+                    let level = self.outer_scopes.len();
+                    self.hidden_levels.retain(|l| *l != level);
+                    self.correlated.pop().unwrap_or(false)
+                } else {
+                    false
                 };
-                let plan = Plan::NestedLoop {
-                    left: Box::new(lp),
-                    right: Box::new(rp),
-                    kind,
-                    on,
-                    lateral,
-                    index_join: false,
-                    right_width,
-                };
-                if let Some(a) = &j.alias {
-                    scope = scope.rename(&a.aliasname, &name_list(&a.colnames)?);
-                }
-                Ok((plan, scope, false))
+                let (plan, scope) = result?;
+                Ok((plan, scope, lateral))
             }
             other => Err(Error::unsupported(format!("{} in FROM", node_kind(other)))),
         }
@@ -975,6 +1023,7 @@ impl<'a> Binder<'a> {
         let empty = Scope::default();
 
         // Arguments may refer to FROM items on the left (implicit LATERAL).
+                let hidden = std::mem::take(&mut self.hidden_levels);
         if let Some(l) = left {
             self.outer_scopes.push(l.clone());
             self.correlated.push(false);
@@ -1009,12 +1058,13 @@ impl<'a> Binder<'a> {
                 }
             }
         })();
-        let lateral = if left.is_some() {
+                let lateral = if left.is_some() {
             self.outer_scopes.pop();
             self.correlated.pop().unwrap_or(false)
         } else {
             false
         };
+        self.hidden_levels = hidden;
         let (plan, mut cols, fname) = bound?;
         if rf.ordinality {
             if !matches!(plan, Plan::FuncScan { .. }) {
@@ -1076,6 +1126,7 @@ impl<'a> Binder<'a> {
                     return Err(Error::internal("stored view definition is not a SELECT"));
                 };
                 // A view body is bound in isolation from the referencing query.
+                                let hidden = std::mem::take(&mut self.hidden_levels);
                 let outer = std::mem::take(&mut self.outer_scopes);
                 let correlated = std::mem::take(&mut self.correlated);
                 let ctes = std::mem::take(&mut self.ctes);
@@ -1083,7 +1134,8 @@ impl<'a> Binder<'a> {
                 self.view_stack.push(view.id);
                 let result = self.bind_select(sel);
                 self.view_stack.pop();
-                self.outer_scopes = outer;
+                                self.outer_scopes = outer;
+                self.hidden_levels = hidden;
                 self.correlated = correlated;
                 self.ctes = ctes;
                 self.agg_levels = levels;

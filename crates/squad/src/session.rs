@@ -369,7 +369,13 @@ impl Session {
     }
 
     fn prepare_raw(&mut self, sql: &str, raw: pb::RawStmt, param_types: &[Option<Type>]) -> Result<Prepared> {
-        let Some(stmt) = raw.stmt.and_then(|s| s.node) else { return Ok(self.empty_statement(sql)) };
+                let Some(stmt) = raw.stmt.and_then(|s| s.node) else { return Ok(self.empty_statement(sql)) };
+        // In an aborted transaction nothing but transaction control is
+        // analyzed, so the error is 25P02 rather than whatever the
+        // statement would have failed with.
+        if !matches!(stmt, N::TransactionStmt(_)) {
+            self.check_not_failed()?;
+        }
         let catalog = self.catalog();
         let mut binder = Binder::new(&catalog, &self.state.search_path, param_types.to_vec());
         let finish_params = |b: &Binder| -> Vec<Type> {
@@ -542,8 +548,8 @@ impl Session {
                         crate::expr::enum_value(ty, other.as_str().unwrap_or_default())?
                     }
                 },
-                (v, Some(t)) if v.type_of() == *t => v.clone(),
-                (v, Some(t)) => crate::value::cast(v.clone(), t, &ctx)?,
+                                (v, Some(t)) if v.type_of() == t.base() => v.clone(),
+                (v, Some(t)) => crate::value::cast(v.clone(), &t.base(), &ctx)?,
             });
         }
         Ok(out)
@@ -989,5 +995,47 @@ impl ExecCx<'_> {
             }
             SessionFn::Catalog(name) => crate::system::catalog_fn(name, args, self)?,
         })
+    }
+}
+
+/// Maps between types and the OIDs clients see on the wire, including
+/// user-defined enum types, which get their OID from the catalog.
+#[derive(Clone)]
+pub struct TypeResolver(Arc<Catalog>);
+
+/// Array types of user-defined enums live above this OID.
+const ENUM_ARRAY_OID_BASE: u32 = 2_000_000_000;
+
+impl TypeResolver {
+    /// OID to report for a value of type `ty`.
+    pub fn oid(&self, ty: &Type) -> u32 {
+        let find = |name: &str| self.0.enums.values().find(|e| e.name == name);
+        match ty {
+            Type::Enum(name) => find(name).map_or(25, |e| crate::catalog::FIRST_USER_OID + e.id),
+            Type::Array(elem) => match &**elem {
+                Type::Enum(name) => find(name).map_or(1009, |e| ENUM_ARRAY_OID_BASE + e.id),
+                _ => ty.oid(),
+            },
+            _ => ty.oid(),
+        }
+    }
+
+    /// The type a client means by `oid`, if it is known.
+    pub fn from_oid(&self, oid: u32) -> Option<Type> {
+        if let Some(t) = Type::from_oid(oid) {
+            return Some(t);
+        }
+        let by_id = |id: u32| self.0.enums.values().find(|e| e.id == id).map(|e| Type::Enum(e.name.clone()));
+        if oid >= ENUM_ARRAY_OID_BASE {
+            return by_id(oid - ENUM_ARRAY_OID_BASE).map(|t| Type::Array(Box::new(t)));
+        }
+        oid.checked_sub(crate::catalog::FIRST_USER_OID).and_then(by_id)
+    }
+}
+
+impl Session {
+    /// A resolver for type OIDs against the catalog this session sees.
+    pub fn types(&self) -> TypeResolver {
+        TypeResolver(self.catalog())
     }
 }

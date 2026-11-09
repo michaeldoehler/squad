@@ -172,7 +172,9 @@ impl V for Vec<String> {
 
 fn spec_type(name: &str) -> Type {
     match name {
-        "oid" | "xid" | "int8" | "regclass" => Type::Int8,
+                "oid" => Type::Oid,
+        "char" => Type::Char,
+        "xid" | "int8" | "regclass" => Type::Int8,
         "int4" => Type::Int4,
         "int2" => Type::Int2,
         "bool" => Type::Bool,
@@ -181,7 +183,7 @@ fn spec_type(name: &str) -> Type {
         "timestamptz" => Type::TimestampTz,
         "interval" => Type::Interval,
         "bytea" => Type::Bytea,
-        "_oid" | "oidvector" => Type::Array(Box::new(Type::Int8)),
+                "_oid" | "oidvector" => Type::Array(Box::new(Type::Oid)),
         "_int2" | "int2vector" => Type::Array(Box::new(Type::Int2)),
         "_float4" => Type::Array(Box::new(Type::Float4)),
         "_text" | "_aclitem" | "_name" | "_char" | "_regtype" | "anyarray" | "_pg_statistic" => {

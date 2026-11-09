@@ -304,11 +304,15 @@ fn num2(a: &[Value]) -> Result<(Decimal, Decimal)> {
 
 fn num_add(_: &FnCtx, a: &[Value]) -> Result<Value> {
     let (x, y) = num2(a)?;
-    x.checked_add(y).map(|d| Value::Numeric(numeric::norm(d))).ok_or_else(numeric::overflow)
+    // The result carries the larger of the two scales, also when one
+    // operand is zero.
+    let scale = x.scale().max(y.scale());
+    x.checked_add(y).map(|d| Value::Numeric(numeric::rescale(d, scale))).ok_or_else(numeric::overflow)
 }
 fn num_sub(_: &FnCtx, a: &[Value]) -> Result<Value> {
     let (x, y) = num2(a)?;
-    x.checked_sub(y).map(|d| Value::Numeric(numeric::norm(d))).ok_or_else(numeric::overflow)
+    let scale = x.scale().max(y.scale());
+    x.checked_sub(y).map(|d| Value::Numeric(numeric::rescale(d, scale))).ok_or_else(numeric::overflow)
 }
 fn num_mul(_: &FnCtx, a: &[Value]) -> Result<Value> {
     let (x, y) = num2(a)?;

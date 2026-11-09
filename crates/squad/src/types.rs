@@ -35,9 +35,16 @@ pub enum Type {
     Enum(String),
     /// Row type of an anonymous record (`ROW(...)`, whole-row references).
     Record,
-    /// An untyped string literal or NULL whose type is decided by context.
+        /// An untyped string literal or NULL whose type is decided by context.
     Unknown,
     Void,
+    /// Object identifier, as found in the system catalogs. Values are
+    /// stored and computed as `int8`; the type only affects how a column
+    /// is described and encoded on the wire (4 bytes, type OID 26).
+    Oid,
+    /// The single-byte `"char"` type of the system catalogs. Values are
+    /// `text`; the type affects only description and wire encoding.
+    Char,
 }
 
 impl Type {
@@ -63,9 +70,13 @@ impl Type {
             Type::Numeric => 1700,
             Type::Uuid => 2950,
             Type::Jsonb => 3802,
-            Type::Record => 2249,
+                        Type::Record => 2249,
             Type::Void => 2278,
+            Type::Oid => 26,
+            Type::Char => 18,
             Type::Array(elem) => match **elem {
+                Type::Oid => 1028,
+                Type::Char => 1002,
                 Type::Bool => 1000,
                 Type::Bytea => 1001,
                 Type::Int2 => 1005,
@@ -92,9 +103,11 @@ impl Type {
     pub fn from_oid(oid: u32) -> Option<Type> {
         let scalar = |oid| {
             Some(match oid {
-                16 => Type::Bool,
+                                16 => Type::Bool,
                 17 => Type::Bytea,
-                20 | 26 => Type::Int8,
+                18 => Type::Char,
+                26 => Type::Oid,
+                20 => Type::Int8,
                 21 => Type::Int2,
                 23 => Type::Int4,
                 25 | 1042 | 1043 | 19 => Type::Text,
@@ -114,8 +127,10 @@ impl Type {
             })
         };
         scalar(oid).or_else(|| {
-            let elem = match oid {
+                        let elem = match oid {
                 1000 => 16,
+                1002 => 18,
+                1028 => 26,
                 1001 => 17,
                 1005 => 21,
                 1007 => 23,
@@ -161,8 +176,21 @@ impl Type {
             Type::Array(e) => format!("{}[]", e.name()),
             Type::Enum(n) => n.clone(),
             Type::Record => "record".into(),
-            Type::Unknown => "unknown".into(),
+                        Type::Unknown => "unknown".into(),
             Type::Void => "void".into(),
+            Type::Oid => "oid".into(),
+            Type::Char => "\"char\"".into(),
+        }
+    }
+
+    /// The type values of this type are computed as: the catalog-only
+    /// types `oid` and `"char"` behave like `int8` and `text`.
+    pub fn base(&self) -> Type {
+        match self {
+            Type::Oid => Type::Int8,
+            Type::Char => Type::Text,
+            Type::Array(elem) => Type::Array(Box::new(elem.base())),
+            other => other.clone(),
         }
     }
 
@@ -173,9 +201,8 @@ impl Type {
             "bool" | "boolean" => Type::Bool,
             "int2" | "smallint" | "smallserial" | "serial2" => Type::Int2,
             "int4" | "int" | "integer" | "serial" | "serial4" => Type::Int4,
-            "int8" | "bigint" | "bigserial" | "serial8" | "oid" | "regclass" | "regtype" | "regproc" | "xid" => {
-                Type::Int8
-            }
+                        "oid" => Type::Oid,
+            "int8" | "bigint" | "bigserial" | "serial8" | "regclass" | "regtype" | "regproc" | "xid" => Type::Int8,
             "float4" | "real" => Type::Float4,
             "float8" | "double precision" | "float" => Type::Float8,
             "numeric" | "decimal" => Type::Numeric,

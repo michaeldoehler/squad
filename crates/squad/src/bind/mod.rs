@@ -152,7 +152,11 @@ pub struct Binder<'a> {
     outer_scopes: Vec<Scope>,
     /// Parallel to `outer_scopes`: whether the query level bound inside it
     /// referenced that scope or anything further out.
-    correlated: Vec<bool>,
+        correlated: Vec<bool>,
+    /// Levels of `outer_scopes` that are currently not visible: the FROM
+    /// items to the left of a JOIN, which only LATERAL items inside the
+    /// join may reference.
+    hidden_levels: Vec<usize>,
     ctes: Vec<CteBinding>,
     agg_levels: Vec<AggLevel>,
     next_subquery_id: usize,
@@ -264,7 +268,8 @@ impl<'a> Binder<'a> {
             search_path,
             param_types,
             outer_scopes: Vec::new(),
-            correlated: Vec::new(),
+                        correlated: Vec::new(),
+            hidden_levels: Vec::new(),
             ctes: Vec::new(),
             agg_levels: Vec::new(),
             next_subquery_id: 0,
@@ -292,7 +297,10 @@ impl<'a> Binder<'a> {
             })
             .collect();
         let lower = name.to_ascii_lowercase();
-        let builtin = match schema {
+                let builtin = match schema {
+            // Unquoted CHAR arrives as pg_catalog.bpchar; the bare name
+            // "char" is the single-byte catalog type.
+            None | Some("pg_catalog") if lower == "char" => Some(Type::Char),
             None | Some("pg_catalog") => Type::from_name(&lower),
             _ => None,
         };
@@ -300,7 +308,7 @@ impl<'a> Binder<'a> {
             Some(ty) => {
                 let (decl, oid) = match lower.as_str() {
                     "varchar" | "character varying" => ("character varying".to_string(), 1043),
-                    "bpchar" | "char" | "character" => ("character".to_string(), 1042),
+                                        "bpchar" | "character" => ("character".to_string(), 1042),
                     "name" => ("name".to_string(), 19),
                     "oid" | "regclass" | "regtype" | "regproc" => ("oid".to_string(), 26),
                     _ => (ty.name(), ty.oid()),
@@ -358,22 +366,32 @@ impl<'a> Binder<'a> {
     /// Wraps an expression so that its value conforms to a type modifier
     /// (`varchar(n)`, `numeric(p,s)`). `explicit` casts truncate strings
     /// silently; assignments raise 22001.
-    pub(crate) fn apply_typmod(&self, expr: Expr, decl: &DeclaredType, explicit: bool) -> Expr {
+        pub(crate) fn apply_typmod(&self, expr: Expr, decl: &DeclaredType, explicit: bool) -> Result<Expr> {
         if decl.typmod < 0 {
-            return expr;
+            return Ok(expr);
         }
         let (eval, name): (value::FuncImpl, &str) = match (&decl.ty, decl.oid) {
             (Type::Text, 1043) if explicit => (typmod::varchar_truncate, "varchar"),
             (Type::Text, 1043) => (typmod::varchar_check, "varchar"),
             (Type::Text, 1042) if explicit => (typmod::bpchar_truncate, "bpchar"),
             (Type::Text, 1042) => (typmod::bpchar_check, "bpchar"),
-            (Type::Numeric, _) => (typmod::numeric_typmod, "numeric"),
-            _ => return expr,
+                        (Type::Numeric, _) => (typmod::numeric_typmod, "numeric"),
+            _ => return Ok(expr),
         };
-        Expr::Call(
+        // A constant is checked while planning, as Postgres does when it
+        // folds constants: a too-long literal is an error even if the
+        // statement ends up touching no rows.
+        if let Expr::Const(v) = &expr {
+            if v.is_null() {
+                return Ok(expr);
+            }
+            let ctx = crate::types::FnCtx::default();
+            return eval(&ctx, &[v.clone(), Value::Int4(decl.typmod)]).map(Expr::Const);
+        }
+        Ok(Expr::Call(
             FuncRef { name: name.into(), eval, strict: true, ret: decl.ty.clone() },
             vec![expr, Expr::Const(Value::Int4(decl.typmod))],
-        )
+        ))
     }
 
     /// Converts `expr` of type `from` to `to` as an implicit coercion.

@@ -277,7 +277,12 @@ pub fn parse_value(text: &str, ty: &Type, ctx: &FnCtx) -> Result<Value> {
         Type::Bool => Value::Bool(parse_bool(text)?),
         Type::Int2 => Value::Int2(parse_i16(text)?),
         Type::Int4 => Value::Int4(parse_i32(text)?),
-        Type::Int8 => Value::Int8(parse_i64(text)?),
+                Type::Int8 => Value::Int8(parse_i64(text)?),
+        Type::Oid => match parse_i64(text) {
+            Ok(v) if (0..=u32::MAX as i64).contains(&v) => Value::Int8(v),
+            _ => return Err(Error::invalid_text("oid", text)),
+        },
+        Type::Char => Value::Text(text.chars().take(1).collect()),
         Type::Float4 => Value::Float4(parse_float(text, "real", true)? as f32),
         Type::Float8 => Value::Float8(parse_float(text, "double precision", false)?),
         Type::Numeric => Value::Numeric(numeric::parse_numeric(text)?),

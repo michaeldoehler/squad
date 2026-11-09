@@ -73,7 +73,8 @@ enum KeyClass {
 
 fn key_class(t: &Type) -> Option<KeyClass> {
     Some(match t {
-        Type::Int2 | Type::Int4 | Type::Int8 => KeyClass::Int,
+        Type::Int2 | Type::Int4 | Type::Int8 | Type::Oid => KeyClass::Int,
+        Type::Char => KeyClass::Text,
         Type::Float4 | Type::Float8 => KeyClass::Float,
         Type::Numeric => KeyClass::Numeric,
         Type::Text => KeyClass::Text,
@@ -270,6 +271,11 @@ impl<'a> Binder<'a> {
                 conjuncts(f, &mut preds);
                 self.push(*input, preds, types)
             }
+            plan @ Plan::NestedLoop { kind: JoinKind::Inner, lateral: false, index_join: false, .. }
+                if inner_join_leaves(&plan) >= 3 =>
+            {
+                self.push_reordered(plan, preds, types)
+            }
             Plan::NestedLoop { left, right, kind, on, lateral, index_join: false, right_width } => {
                 let left_width = types.len() - right_width;
                 let (ltypes, rtypes) = types.split_at(left_width);
@@ -340,6 +346,135 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Plans a chain of three or more inner joins. The relations are
+    /// joined in an order in which every step is connected to what was
+    /// joined before by a join predicate wherever possible, rather than in
+    /// the order they are written: `FROM a, b, c WHERE a.x = c.x AND
+    /// c.y = b.y` must not start with the cross product of `a` and `b`.
+    /// A final projection restores the written column order.
+    fn push_reordered(&mut self, plan: Plan, mut preds: Vec<Expr>, types: &[Type]) -> Plan {
+        let mut leaves: Vec<(Plan, usize, usize)> = Vec::new();
+        flatten_inner_joins(plan, 0, types.len(), &mut leaves, &mut preds);
+        let n = leaves.len();
+        let leaf_of = |col: usize| leaves.iter().position(|(_, start, width)| col >= *start && col < start + width);
+
+        // Predicates over one relation are pushed into it, predicates over
+        // several become join conditions, and predicates that can only be
+        // evaluated on the complete row stay on top.
+        let mut local: Vec<Vec<Expr>> = vec![Vec::new(); n];
+        let mut joins: Vec<(Expr, Vec<usize>, bool)> = Vec::new();
+        let mut top: Vec<Expr> = Vec::new();
+        for p in preds {
+            if opaque(&p) {
+                top.push(p);
+                continue;
+            }
+            let mut used: Vec<usize> = Vec::new();
+            let mut unknown = false;
+            p.walk(&mut |e| {
+                if let Expr::Column(c) = e {
+                    match leaf_of(*c) {
+                        Some(l) if !used.contains(&l) => used.push(l),
+                        Some(_) => {}
+                        None => unknown = true,
+                    }
+                }
+            });
+            match used.as_slice() {
+                _ if unknown => top.push(p),
+                [] => local[0].push(p),
+                [l] => {
+                    let start = leaves[*l].1;
+                    local[*l].push(shift_down(p, start));
+                }
+                _ => {
+                    let equi = matches!(&p, Expr::Call(f, args) if &*f.name == "=" && args.len() == 2);
+                    joins.push((p, used, equi));
+                }
+            }
+        }
+
+        let mut planned: Vec<Option<Plan>> = Vec::with_capacity(n);
+        let mut rank: Vec<u8> = Vec::with_capacity(n);
+        let spans: Vec<(usize, usize)> = leaves.iter().map(|(_, s, w)| (*s, *w)).collect();
+        for ((leaf, start, width), preds) in leaves.into_iter().zip(local) {
+            let filtered = !preds.is_empty();
+            let plan = self.push(leaf, preds, &types[start..start + width]);
+            // How selective the relation looks, for choosing where to start.
+            rank.push(match &plan {
+                Plan::Scan(s) if s.is_unique_lookup() => 3,
+                Plan::Scan(s) if !s.eq.is_empty() || s.lower.is_some() || s.upper.is_some() => 2,
+                _ if filtered => 1,
+                _ => 0,
+            });
+            planned.push(Some(plan));
+        }
+
+        let first = (0..n).max_by_key(|&i| (rank[i], std::cmp::Reverse(i))).unwrap_or(0);
+        let mut joined = vec![false; n];
+        let mut new_pos = vec![usize::MAX; types.len()];
+        let mut cur_types: Vec<Type> = Vec::with_capacity(types.len());
+        let mut place = |leaf: usize, new_pos: &mut Vec<usize>, cur_types: &mut Vec<Type>| {
+            let (start, width) = spans[leaf];
+            for c in start..start + width {
+                new_pos[c] = cur_types.len();
+                cur_types.push(types[c].clone());
+            }
+        };
+        joined[first] = true;
+        place(first, &mut new_pos, &mut cur_types);
+        let mut current = planned[first].take().expect("leaf planned once");
+        let mut order = vec![first];
+        while order.len() < n {
+            // Prefer a relation connected by an equality, then by any
+            // predicate, then the most selective one that is left.
+            let connected = |k: usize, equi_only: bool| {
+                joins.iter().any(|(_, used, equi)| {
+                    (*equi || !equi_only) && used.contains(&k) && used.iter().all(|u| *u == k || joined[*u])
+                })
+            };
+            let remaining = (0..n).filter(|k| !joined[*k]);
+            let next = remaining
+                .max_by_key(|&k| (connected(k, true), connected(k, false), rank[k], std::cmp::Reverse(k)))
+                .expect("a relation is left");
+            let left_width = cur_types.len();
+            let left_types = cur_types.clone();
+            joined[next] = true;
+            place(next, &mut new_pos, &mut cur_types);
+            let mut conds = Vec::new();
+            let mut i = 0;
+            while i < joins.len() {
+                if joins[i].1.iter().all(|u| joined[*u]) {
+                    let (p, _, _) = joins.remove(i);
+                    conds.push(remap_columns(p, &new_pos));
+                } else {
+                    i += 1;
+                }
+            }
+            let right = planned[next].take().expect("leaf planned once");
+            let (start, width) = spans[next];
+            current = self.choose_join(
+                current,
+                right,
+                JoinKind::Inner,
+                conds,
+                false,
+                left_width,
+                width,
+                &left_types,
+                &types[start..start + width],
+            );
+            order.push(next);
+        }
+        if order.iter().enumerate().any(|(i, k)| i != *k) {
+            current = Plan::Project(Box::new(current), new_pos.iter().map(|p| Expr::Column(*p)).collect());
+        }
+        match and_all(top) {
+            Some(f) => Plan::Filter(Box::new(current), f),
+            None => current,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn choose_join(
         &mut self,
@@ -390,6 +525,21 @@ impl<'a> Binder<'a> {
             }
         }
         if equi.is_empty() {
+            // RIGHT and FULL joins must emit unmatched right rows padded to
+            // the left width, which only the hash join node knows. Without
+            // keys it degenerates into a nested loop over one bucket.
+            if matches!(kind, JoinKind::Right | JoinKind::Full) {
+                return Plan::HashJoin {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    kind,
+                    left_keys: Vec::new(),
+                    right_keys: Vec::new(),
+                    filter: and_all(conds),
+                    left_width,
+                    right_width,
+                };
+            }
             return nested(left, right, conds);
         }
 
@@ -480,6 +630,44 @@ impl<'a> Binder<'a> {
             None => Plan::Sort { input: Box::new(Plan::Scan(scan)), keys },
         }
     }
+}
+
+/// Number of relations joined by a tree of plain inner joins.
+fn inner_join_leaves(plan: &Plan) -> usize {
+    match plan {
+        Plan::NestedLoop { left, right, kind: JoinKind::Inner, lateral: false, index_join: false, .. } => {
+            inner_join_leaves(left) + inner_join_leaves(right)
+        }
+        _ => 1,
+    }
+}
+
+/// Takes a tree of plain inner joins apart into its relations, each with
+/// the position and number of its columns in the joined row, and collects
+/// the ON conditions (rewritten to positions in the joined row).
+fn flatten_inner_joins(
+    plan: Plan,
+    offset: usize,
+    width: usize,
+    leaves: &mut Vec<(Plan, usize, usize)>,
+    conds: &mut Vec<Expr>,
+) {
+    match plan {
+        Plan::NestedLoop { left, right, kind: JoinKind::Inner, on, lateral: false, index_join: false, right_width } => {
+            let left_width = width - right_width;
+            flatten_inner_joins(*left, offset, left_width, leaves, conds);
+            flatten_inner_joins(*right, offset + left_width, right_width, leaves, conds);
+            if let Some(on) = on {
+                conjuncts(on.shift_columns(offset), conds);
+            }
+        }
+        other => leaves.push((other, offset, width)),
+    }
+}
+
+fn remap_columns(e: Expr, new_pos: &[usize]) -> Expr {
+    e.rewrite(&mut |n| Ok(if let Expr::Column(i) = n { Some(Expr::Column(new_pos[*i])) } else { None }))
+        .expect("infallible")
 }
 
 /// Returns the scan adjusted to produce rows in the order of `keys`, if its

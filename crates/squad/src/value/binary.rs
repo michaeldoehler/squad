@@ -95,8 +95,12 @@ pub fn encode_binary(v: &Value, ty: &Type, out: &mut Vec<u8>) -> Result<()> {
         Value::Null => return Err(Error::internal("NULL has no binary representation")),
         Value::Bool(b) => out.push(*b as u8),
         Value::Int2(i) => out.extend_from_slice(&i.to_be_bytes()),
-        Value::Int4(i) => out.extend_from_slice(&i.to_be_bytes()),
+                Value::Int4(i) => out.extend_from_slice(&i.to_be_bytes()),
+        // An `oid` travels as four unsigned bytes.
+        Value::Int8(i) if *ty == Type::Oid => out.extend_from_slice(&(*i as u32).to_be_bytes()),
         Value::Int8(i) => out.extend_from_slice(&i.to_be_bytes()),
+        // `"char"` is a single byte.
+        Value::Text(s) if *ty == Type::Char => out.push(s.as_bytes().first().copied().unwrap_or(0)),
         Value::Float4(f) => out.extend_from_slice(&f.to_be_bytes()),
         Value::Float8(f) => out.extend_from_slice(&f.to_be_bytes()),
         Value::Numeric(d) => encode_numeric(d, out),
@@ -177,7 +181,13 @@ pub fn decode_binary(b: &[u8], ty: &Type) -> Result<Value> {
         Type::Bool => Value::Bool(*b.first().filter(|_| b.len() == 1).ok_or_else(e)? != 0),
         Type::Int2 => Value::Int2(i16::from_be_bytes(arr(b, e)?)),
         Type::Int4 => Value::Int4(i32::from_be_bytes(arr(b, e)?)),
-        Type::Int8 => Value::Int8(i64::from_be_bytes(arr(b, e)?)),
+                Type::Int8 => Value::Int8(i64::from_be_bytes(arr(b, e)?)),
+        Type::Oid => Value::Int8(u32::from_be_bytes(arr(b, e)?) as i64),
+        Type::Char => match b {
+            [0] | [] => Value::Text(String::new()),
+            [c] => Value::Text((*c as char).to_string()),
+            _ => return Err(e()),
+        },
         Type::Float4 => Value::Float4(f32::from_be_bytes(arr(b, e)?)),
         Type::Float8 => Value::Float8(f64::from_be_bytes(arr(b, e)?)),
         Type::Numeric => Value::Numeric(decode_numeric(b)?),
