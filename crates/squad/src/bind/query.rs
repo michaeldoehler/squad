@@ -556,7 +556,22 @@ impl<'a> Binder<'a> {
             if having.as_ref().is_some_and(super::opt::cannot_be_true) {
                 plan = self.push_filter(plan, Some(Expr::Const(crate::types::Value::Bool(false))), &scope.types())?;
             }
-            plan = Plan::Aggregate { input: Box::new(plan), groups, aggs: level.aggs };
+                        plan = match plan {
+                // Aggregations over one columnar table go to the column
+                // engine, which decides at run time whether it can
+                // express the filter.
+                Plan::Scan(scan) if scan.table.columnar.is_some() => Plan::ColumnarAgg {
+                    fallback: Box::new(Plan::Aggregate {
+                        input: Box::new(Plan::Scan(scan.clone())),
+                        groups: groups.clone(),
+                        aggs: level.aggs.clone(),
+                    }),
+                    scan,
+                    groups,
+                    aggs: level.aggs,
+                },
+                plan => Plan::Aggregate { input: Box::new(plan), groups, aggs: level.aggs },
+            };
             if let Some(h) = having {
                 plan = Plan::Filter(Box::new(plan), h);
             }

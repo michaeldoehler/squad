@@ -219,8 +219,27 @@ impl Store {
                 Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
                 Bound::Unbounded => Bound::Unbounded,
             };
-            let chunk = inner.engine.scan(lo_ref, Bound::Excluded(codec::DATA_HI), false, 1024)?;
+            let mut chunk = inner.engine.scan(lo_ref, Bound::Excluded(codec::DATA_HI), false, 1024)?;
             let done = chunk.len() < 1024;
+            // All versions of a key must be handled in one batch: removing
+            // a tombstone in one write and the versions it hides in the
+            // next would let a reader in between see the deleted value
+            // again. So the last key of a full chunk, whose versions may
+            // continue, is left for the next round.
+            let mut resume = None;
+            let mut split_key = false;
+            if !done {
+                let last_start = chunk.last().map(|(k, _)| k[..k.len() - 8].to_vec()).unwrap_or_default();
+                let cut = chunk.iter().position(|(k, _)| codec::same_key(k, &last_start)).unwrap_or(0);
+                if cut > 0 {
+                    chunk.truncate(cut);
+                    resume = Some(Bound::Included(last_start));
+                } else {
+                    // One key fills the whole chunk: trim its old versions
+                    // but keep any tombstone.
+                    split_key = true;
+                }
+            }
             let mut batch = WriteBatch::new();
             let mut last = None;
             for (ek, ev) in chunk {
@@ -236,7 +255,7 @@ impl Store {
                     // The newest version at or below the horizon is the one
                     // old snapshots read. A tombstone there hides nothing
                     // once everything older is gone, so drop it as well.
-                    if ev.first() != Some(&1) {
+                    if ev.first() != Some(&1) && !split_key {
                         batch.delete(ek.clone());
                     }
                 }
@@ -246,9 +265,15 @@ impl Store {
             if !batch.is_empty() {
                 inner.engine.write(batch)?;
             }
-            match (done, last) {
-                (false, Some(k)) => lo = Bound::Excluded(k),
-                _ => break,
+            match (done, resume, last) {
+                (true, ..) => break,
+                (false, Some(bound), _) => {
+                    lo = bound;
+                    cur_start.clear();
+                    covered = false;
+                }
+                (false, None, Some(k)) => lo = Bound::Excluded(k),
+                (false, None, None) => break,
             }
         }
         Ok(removed)

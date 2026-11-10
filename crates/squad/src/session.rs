@@ -37,7 +37,14 @@ pub struct Shared {
     pub catalog: RwLock<Arc<Catalog>>,
     sequences: Mutex<HashMap<u32, SeqState>>,
     /// Plans of ad-hoc statements, keyed by search path and SQL text.
-    plan_cache: Mutex<HashMap<String, Arc<Prepared>>>,
+        plan_cache: Mutex<HashMap<String, Arc<Prepared>>>,
+    /// Where segments of columnar tables are kept: a directory next to
+    /// the database, memory, or a remote bucket.
+    objects: RwLock<Arc<dyn squad_object::ObjectStore>>,
+    /// Opened segments.
+    pub(crate) segments: crate::columnar::SegmentCache,
+    /// Rows inserted into columnar tables since their last compaction.
+    pub(crate) delta_rows: Mutex<HashMap<u32, u64>>,
         next_pid: AtomicI32,
     pub database_name: String,
     /// Version of `catalog`, readable without taking its lock. Sessions
@@ -68,11 +75,25 @@ impl Shared {
             store,
             catalog: RwLock::new(Arc::new(catalog)),
             sequences: Mutex::new(HashMap::new()),
-            plan_cache: Mutex::new(HashMap::new()),
+                        plan_cache: Mutex::new(HashMap::new()),
+            objects: RwLock::new(Arc::new(squad_object::MemoryStore::new())),
+            segments: Default::default(),
+            delta_rows: Mutex::new(HashMap::new()),
                         next_pid: AtomicI32::new(1),
             database_name: database_name.to_string(),
             catalog_version: std::sync::atomic::AtomicU64::new(version),
         }))
+    }
+
+        /// The object store holding the segments of columnar tables.
+    pub fn objects(&self) -> Arc<dyn squad_object::ObjectStore> {
+        self.objects.read().clone()
+    }
+
+    /// Replaces the object store. Must happen before any columnar table
+    /// is used.
+    pub fn set_objects(&self, store: Arc<dyn squad_object::ObjectStore>) {
+        *self.objects.write() = store;
     }
 
     fn publish_catalog(&self, catalog: Arc<Catalog>) {
@@ -261,7 +282,11 @@ pub(crate) struct TxnState {
     pub(crate) savepoints: Vec<Savepoint>,
     pub(crate) start_time: i64,
     /// Counters to forget when the transaction ends either way.
-    pub(crate) reset_counters: Vec<u32>,
+        pub(crate) reset_counters: Vec<u32>,
+    /// Segment objects to delete once the transaction has committed.
+    pub(crate) dropped_objects: Vec<String>,
+    /// Rows this transaction inserted into columnar tables.
+    pub(crate) columnar_inserted: HashMap<u32, u64>,
 }
 
 pub(crate) struct Savepoint {
@@ -761,6 +786,11 @@ impl Session {
         let mut cx = ExecCx::new(&mut t.txn, &t.catalog, params, &mut self.state, &self.shared, fn_ctx, subqueries);
         let rows = collect(plan, &mut cx)?;
         let affected = cx.rows_affected;
+        let (dropped, inserted) = (std::mem::take(&mut cx.dropped_objects), std::mem::take(&mut cx.columnar_inserted));
+        t.dropped_objects.extend(dropped);
+        for (table, n) in inserted {
+            *t.columnar_inserted.entry(table).or_default() += n;
+        }
         let (tag, rows_affected) = match stmt.tag {
             Tag::Select => (format!("SELECT {}", rows.len()), rows.len() as u64),
             Tag::Insert => (format!("INSERT 0 {affected}"), affected),
@@ -795,7 +825,9 @@ impl Session {
             batch: false,
             savepoints: Vec::new(),
             start_time: now_micros(),
-            reset_counters: Vec::new(),
+                        reset_counters: Vec::new(),
+            dropped_objects: Vec::new(),
+            columnar_inserted: HashMap::new(),
         });
         Ok(())
     }
@@ -805,14 +837,67 @@ impl Session {
         if t.failed {
             return Ok(());
         }
-                let TxnState { mut txn, catalog, dirty, .. } = t;
+                let TxnState { mut txn, catalog, dirty, dropped_objects, columnar_inserted, .. } = t;
         let result = txn.end(true);
         self.spare_txn = Some(txn);
         result?;
         if dirty {
             self.shared.publish_catalog(catalog);
         }
+        // Segment objects the transaction replaced are no longer named by
+        // any manifest a new snapshot can read.
+        if !dropped_objects.is_empty() {
+            let store = self.shared.objects();
+            for key in &dropped_objects {
+                self.shared.segments.forget(key);
+                let _ = store.delete(key);
+            }
+        }
+        // Columnar tables with a large delta are compacted right away, by
+        // the session that pushed them over the threshold.
+        let mut due = Vec::new();
+        if !columnar_inserted.is_empty() {
+            let mut delta = self.shared.delta_rows.lock();
+            for (table, n) in columnar_inserted {
+                let total = delta.entry(table).or_default();
+                *total += n;
+                if *total >= crate::columnar::AUTO_COMPACT_ROWS {
+                    *total = 0;
+                    due.push(table);
+                }
+            }
+        }
+        for table in due {
+            // Best effort: a failure leaves the rows in the delta, where
+            // they stay correct and visible.
+            let _ = self.compact_table(table);
+        }
         Ok(())
+    }
+
+    /// Moves the delta of a columnar table into a segment and merges
+    /// small segments. Returns the number of rows moved.
+    pub fn compact_table(&mut self, table_id: u32) -> Result<u64> {
+        if self.txn.is_some() {
+            return Err(Error::new(sqlstate::ACTIVE_SQL_TRANSACTION, "compaction cannot run inside a transaction block"));
+        }
+        self.begin(Some(Isolation::ReadCommitted), false)?;
+        let catalog = self.txn.as_ref().unwrap().catalog.clone();
+        let Some(table) = catalog.table_by_id(table_id).filter(|t| t.columnar.is_some()).cloned() else {
+            self.rollback();
+            return Ok(0);
+        };
+        match self.with_cx(|cx| crate::columnar::compact(&table, cx)) {
+            Ok(n) => {
+                self.commit()?;
+                self.shared.delta_rows.lock().remove(&table_id);
+                Ok(n)
+            }
+            Err(e) => {
+                self.rollback();
+                Err(e)
+            }
+        }
     }
 
     pub(crate) fn rollback(&mut self) {
@@ -920,7 +1005,10 @@ impl Session {
         let fn_ctx = self.fn_ctx();
         let t = self.txn.as_mut().ok_or_else(|| Error::internal("no transaction"))?;
         let mut cx = ExecCx::new(&mut t.txn, &t.catalog, &[], &mut self.state, &self.shared, fn_ctx, 0);
-        f(&mut cx)
+        let result = f(&mut cx);
+        let dropped = std::mem::take(&mut cx.dropped_objects);
+        t.dropped_objects.extend(dropped);
+        result
     }
 }
 

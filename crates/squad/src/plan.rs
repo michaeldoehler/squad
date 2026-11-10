@@ -52,6 +52,11 @@ pub enum AggFunc {
     JsonObjectAgg {
         jsonb: bool,
     },
+        /// Distinct count that may be estimated (HyperLogLog on columnar
+    /// tables, exact elsewhere).
+    ApproxCountDistinct,
+    /// Percentile (0..=1) that may be estimated.
+    ApproxPercentile(f64),
     /// Variance / standard deviation; flags: (sample, sqrt).
     Variance {
         sample: bool,
@@ -292,6 +297,15 @@ pub enum Plan {
         input: Box<Plan>,
         groups: Vec<Expr>,
         aggs: Vec<AggCall>,
+    },
+        /// An aggregation over one columnar table that the column engine can
+    /// run. Same output as `Aggregate`; `fallback` is the ordinary plan,
+    /// used when the filter turns out not to be expressible at run time.
+    ColumnarAgg {
+        scan: ScanPlan,
+        groups: Vec<Expr>,
+        aggs: Vec<AggCall>,
+        fallback: Box<Plan>,
     },
     /// Output: input columns, then one column per window call.
     Window {

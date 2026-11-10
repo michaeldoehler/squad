@@ -29,6 +29,7 @@ mod agg;
 mod api;
 pub mod bind;
 pub mod catalog;
+mod columnar;
 pub mod copy;
 mod convert;
 mod ddl;
@@ -49,7 +50,11 @@ pub use bind::OutputColumn;
 pub use convert::{FromSql, ToSql};
 pub use error::{sqlstate, Error, Result};
 pub use session::{QueryResult, Session, TxnStatus};
-pub use squad_storage::{SyncMode, VerifyReport};
+pub use squad_storage::{RemoteConfig, RemoteSync, SyncMode, VerifyReport};
+
+/// Object stores for [`Config::remote`]: local directories, memory and
+/// (with the `s3` feature) S3-compatible services.
+pub use squad_object as object;
 pub use types::{FnCtx, Interval, Type, Value};
 
 /// Postgres version squad reports to clients and aims to be compatible

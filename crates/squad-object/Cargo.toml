@@ -1,0 +1,30 @@
+[package]
+name = "squad-object"
+description = "Object storage abstraction for the squad database: in-memory, local directory and S3-compatible stores."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["s3"]
+# The S3 client (HTTP, TLS, request signing).
+s3 = ["dep:ureq", "dep:sha2", "dep:hmac"]
+# An in-process S3 emulator for tests of this and dependent crates.
+test-util = ["s3"]
+
+[dependencies]
+parking_lot.workspace = true
+thiserror.workspace = true
+ureq = { version = "2", optional = true }
+sha2 = { version = "0.10", optional = true }
+hmac = { version = "0.12", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[test]]
+name = "conformance"
+required-features = ["test-util"]

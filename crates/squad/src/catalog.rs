@@ -91,8 +91,18 @@ pub struct Table {
     /// True if `pk` is the hidden row id rather than a declared key.
     pub rowid: bool,
     pub indexes: Vec<Index>,
-    pub checks: Vec<Check>,
+        pub checks: Vec<Check>,
     pub foreign_keys: Vec<ForeignKey>,
+    /// Set for tables created `USING columnar`.
+    #[serde(default)]
+    pub columnar: Option<Columnar>,
+}
+
+/// Options of a columnar table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Columnar {
+    /// Columns segments are sorted by; statistics prune best on them.
+    pub order_by: Vec<usize>,
 }
 
 impl Table {
@@ -364,6 +374,7 @@ mod tests {
                 indexes: vec![],
                 checks: vec![],
                 foreign_keys: vec![],
+                columnar: None,
             }),
         );
         let back = Catalog::from_bytes(&c.to_bytes()).unwrap();

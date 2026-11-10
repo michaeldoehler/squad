@@ -197,13 +197,14 @@ pub fn run_file(path: &Path, keep_failures: usize, record_verdicts: bool) -> Fil
         }
     };
     let name = path.to_string_lossy().into_owned();
-    let records: Vec<Record<DefaultColumnType>> = match sqllogictest::parse_with_name(&strip_condition_comments(&script), name) {
-        Ok(r) => r,
-        Err(e) => {
-            report.parse_error = Some(e.to_string());
-            return report;
-        }
-    };
+    let records: Vec<Record<DefaultColumnType>> =
+        match sqllogictest::parse_with_name(&strip_condition_comments(&script), name) {
+            Ok(r) => r,
+            Err(e) => {
+                report.parse_error = Some(e.to_string());
+                return report;
+            }
+        };
     let db = match Database::open_in_memory() {
         Ok(db) => db,
         Err(e) => {

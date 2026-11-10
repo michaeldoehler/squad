@@ -292,3 +292,66 @@ TRUNCATE person
 
 statement ok
 DROP TABLE person
+
+# Views and what depends on them.
+
+statement ok
+CREATE TABLE vt (id int PRIMARY KEY, n int)
+
+statement ok
+INSERT INTO vt VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+CREATE VIEW v1 AS SELECT id, n FROM vt WHERE n > 10
+
+statement ok
+CREATE VIEW v2 AS SELECT id FROM v1 WHERE id > 2
+
+query II
+SELECT * FROM v1 ORDER BY id
+----
+2 20
+3 30
+
+query I
+SELECT * FROM v2
+----
+3
+
+statement error (2BP01)
+DROP VIEW v1
+
+statement error (2BP01)
+DROP TABLE vt
+
+query I
+SELECT count(*) FROM v2
+----
+1
+
+statement ok
+DROP VIEW v2
+
+statement ok
+DROP VIEW v1
+
+statement ok
+CREATE VIEW v1 AS SELECT id FROM vt
+
+statement ok
+CREATE VIEW v2 AS SELECT id FROM v1
+
+statement ok
+DROP VIEW v1 CASCADE
+
+statement error (42P01)
+SELECT * FROM v2
+
+statement ok
+CREATE VIEW v1 AS SELECT id FROM vt
+
+statement ok
+DROP TABLE vt CASCADE
+
+statement error (42P01)
+SELECT * FROM v1

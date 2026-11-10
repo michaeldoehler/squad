@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use squad_kv::Store;
-use squad_storage::{DiskEngine, DiskOptions, Engine, EngineStats, MemEngine, SyncMode, VerifyReport};
+use squad_object::ObjectStore;
+use squad_storage::{
+    DiskEngine, DiskOptions, Engine, EngineStats, MemEngine, RemoteConfig, SyncMode, TieredEngine, VerifyReport,
+};
 
 use crate::bind::OutputColumn;
 use crate::convert::{FromSql, ToSql};
@@ -22,11 +25,15 @@ pub struct Config {
     pub cache_size: usize,
     /// Write-ahead log size that triggers an automatic checkpoint.
     pub checkpoint_wal_bytes: u64,
+    /// Keeps a complete copy of the database in an object store (a
+    /// directory or an S3-compatible bucket), from which it is restored
+    /// when the local directory is empty. `None`: local storage only.
+    pub remote: Option<RemoteConfig>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { sync_mode: SyncMode::Sync, cache_size: 128 << 20, checkpoint_wal_bytes: 64 << 20 }
+        Config { sync_mode: SyncMode::Sync, cache_size: 128 << 20, checkpoint_wal_bytes: 64 << 20, remote: None }
     }
 }
 
@@ -47,8 +54,31 @@ impl Database {
             checkpoint_wal_bytes: config.checkpoint_wal_bytes,
             ..DiskOptions::default()
         };
-        let engine = DiskEngine::open(path.as_ref(), options)?;
-        Database::with_engine(Arc::new(engine))
+        // Segments of columnar tables live in the remote store if there
+        // is one, otherwise in a directory next to the row store.
+        let (db, objects): (Database, Arc<dyn ObjectStore>) = match config.remote {
+            Some(remote) => {
+                let objects = remote.store.clone();
+                (Database::with_engine(Arc::new(TieredEngine::open(path.as_ref(), options, remote)?))?, objects)
+            }
+            None => {
+                let db = Database::with_engine(Arc::new(DiskEngine::open(path.as_ref(), options)?))?;
+                let local = squad_object::LocalStore::new(path.as_ref().join("objects"))
+                    .map_err(|e| Error::new(sqlstate::IO_ERROR, e.to_string()))?;
+                (db, Arc::new(local))
+            }
+        };
+        db.shared.set_objects(objects);
+        Ok(db)
+    }
+
+    /// Downloads the database kept in `store` into the empty or missing
+    /// directory `dir`, without becoming its writer. Afterwards the
+    /// directory is an ordinary local database. To continue the remote
+    /// copy instead, open the directory with [`Config::remote`] set.
+    pub fn restore_from(store: &dyn ObjectStore, dir: impl AsRef<Path>) -> Result<()> {
+        squad_storage::restore_from(store, dir.as_ref(), DiskOptions::default())?;
+        Ok(())
     }
 
     /// Opens a volatile database that lives in memory only.

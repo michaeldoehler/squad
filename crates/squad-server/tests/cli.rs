@@ -124,3 +124,48 @@ fn serve_with_password() {
     child.kill().unwrap();
     child.wait().unwrap();
 }
+
+#[test]
+fn remote_copy_and_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let remote = format!("file://{}", dir.path().join("remote").display());
+    let run = |args: &[&str], script: &str| {
+        let mut child = squad().args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let (ok, _, err) = run(
+        &["shell", data.to_str().unwrap(), "--remote", &remote, "--remote-sync", "sync"],
+        "CREATE TABLE t (id int PRIMARY KEY, v text);\nINSERT INTO t SELECT g, 'row ' || g FROM generate_series(1, 500) g;\n",
+    );
+    assert!(ok, "{err}");
+
+    // The machine is gone; a new one restores from the object store.
+    let copy = dir.path().join("copy");
+    let (ok, out, err) = output(squad().args(["restore", &remote, copy.to_str().unwrap()]));
+    assert!(ok && out.contains("database restored"), "{out}{err}");
+    let (ok, out, err) = run(&["shell", copy.to_str().unwrap()], "SELECT count(*), max(v) FROM t;\n");
+    assert!(ok && out.contains(" 500 ") && out.contains("row 99"), "{out}{err}");
+    let (ok, out, _) = output(squad().args(["verify", copy.to_str().unwrap()]));
+    assert!(ok && out.contains("no problems found"), "{out}");
+
+    // Opening an empty directory with --remote restores and continues.
+    let fresh = dir.path().join("fresh");
+    let (ok, out, err) = run(
+        &["shell", fresh.to_str().unwrap(), "--remote", &remote],
+        "INSERT INTO t VALUES (501, 'new');\nSELECT count(*) FROM t;\n",
+    );
+    assert!(ok && out.contains("501"), "{out}{err}");
+    // The first directory is now stale and is refused...
+    let (ok, _, err) = run(&["shell", data.to_str().unwrap(), "--remote", &remote], "SELECT 1;\n");
+    assert!(!ok && err.contains("restore"), "{err}");
+    // ...unless told to take the remote state.
+    let (ok, out, err) =
+        run(&["shell", data.to_str().unwrap(), "--remote", &remote, "--remote-restore"], "SELECT count(*) FROM t;\n");
+    assert!(ok && out.contains("501"), "{out}{err}");
+
+    let (ok, _, err) = output(squad().args(["serve", "--memory", "--remote-sync", "sometimes", "--remote", "memory://"]));
+    assert!(!ok && err.contains("invalid --remote-sync mode"), "{err}");
+}

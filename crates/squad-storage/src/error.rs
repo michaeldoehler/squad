@@ -23,6 +23,10 @@ pub enum StorageError {
     /// writes until it is reopened.
     #[error("storage engine is in a failed state: {0}")]
     Poisoned(String),
+    /// The remote object store failed, or another writer took over the
+    /// remote location.
+    #[error("remote storage: {0}")]
+    Remote(String),
     /// Invalid configuration or argument.
     #[error("invalid argument: {0}")]
     Invalid(String),

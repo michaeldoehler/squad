@@ -45,7 +45,11 @@ pub struct ExecCx<'a> {
     sub_cache: Vec<Option<SubCache>>,
     ctes: HashMap<usize, Rc<Vec<Row>>>,
     /// Rows changed by the data-modifying statements run so far.
-    pub rows_affected: u64,
+        pub rows_affected: u64,
+    /// Segment objects made obsolete by this statement.
+    pub dropped_objects: Vec<String>,
+    /// Rows inserted into columnar tables by this statement.
+    pub columnar_inserted: HashMap<u32, u64>,
 }
 
 impl<'a> ExecCx<'a> {
@@ -69,7 +73,9 @@ impl<'a> ExecCx<'a> {
             shared,
             sub_cache: (0..subqueries).map(|_| None).collect(),
             ctes: HashMap::new(),
-            rows_affected: 0,
+                        rows_affected: 0,
+            dropped_objects: Vec::new(),
+            columnar_inserted: HashMap::new(),
         }
     }
 
@@ -256,7 +262,16 @@ pub fn open<'p>(plan: &'p Plan, cx: &mut ExecCx) -> Result<Box<dyn Node + 'p>> {
             }
             rows(out)
         }
+                // A columnar table is its delta rows followed by its segments.
+        Plan::Scan(scan) if scan.table.columnar.is_some() => Box::new(ChainNode {
+            first: Some(Box::new(ScanNode::open(scan, cx)?)),
+            second: Box::new(crate::columnar::SegmentRows::open(scan, cx)?),
+        }),
         Plan::Scan(scan) => Box::new(ScanNode::open(scan, cx)?),
+        Plan::ColumnarAgg { scan, groups, aggs, fallback } => match crate::columnar::aggregate(scan, groups, aggs, cx)? {
+            Some(out) => rows(out),
+            None => open(fallback, cx)?,
+        },
         Plan::System(name) => rows(crate::system::scan(name, cx)?),
         Plan::Filter(input, pred) => Box::new(FilterNode { input: open(input, cx)?, pred }),
         Plan::Project(input, exprs) => Box::new(ProjectNode { input: open(input, cx)?, exprs }),
@@ -432,6 +447,12 @@ pub fn open<'p>(plan: &'p Plan, cx: &mut ExecCx) -> Result<Box<dyn Node + 'p>> {
         Plan::Update(p) => rows(crate::dml::update(p, cx)?),
         Plan::Delete(p) => rows(crate::dml::delete(p, cx)?),
     })
+}
+
+/// Scan of the row store part of a table (for a columnar table: its
+/// delta).
+pub(crate) fn row_store_scan<'p>(plan: &'p ScanPlan, cx: &mut ExecCx) -> Result<Box<dyn Node + 'p>> {
+    Ok(Box::new(ScanNode::open(plan, cx)?))
 }
 
 /// Smallest byte string greater than every string starting with `key`.
@@ -825,7 +846,7 @@ fn plan_width(plan: &Plan) -> usize {
             JoinKind::Semi | JoinKind::Anti => *left_width,
             _ => left_width + right_width,
         },
-        Plan::Aggregate { groups, aggs, .. } => groups.len() + aggs.len(),
+                Plan::Aggregate { groups, aggs, .. } | Plan::ColumnarAgg { groups, aggs, .. } => groups.len() + aggs.len(),
         Plan::Window { input, calls } => plan_width(input) + calls.len(),
         Plan::ProjectSet { input, funcs } => plan_width(input) + funcs.len(),
         Plan::SetOp { left, .. } => plan_width(left),

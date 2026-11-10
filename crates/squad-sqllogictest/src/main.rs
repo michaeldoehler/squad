@@ -81,9 +81,8 @@ fn main() {
                 let Some((_, file)) = files.get(i) else { break };
                 let start = Instant::now();
                 // A panic in the engine must not hide the other files.
-                let report = std::panic::catch_unwind(|| run_file(file, keep, log_verdicts)).unwrap_or_else(|_| FileReport {
-                    parse_error: Some("the engine panicked".to_string()),
-                    ..FileReport::default()
+                let report = std::panic::catch_unwind(|| run_file(file, keep, log_verdicts)).unwrap_or_else(|_| {
+                    FileReport { parse_error: Some("the engine panicked".to_string()), ..FileReport::default() }
                 });
                 let secs = start.elapsed().as_secs_f64();
                 eprintln!(
@@ -103,7 +102,8 @@ fn main() {
     let mut groups: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
     let mut total = (0usize, 0usize, 0usize);
     let mut dump_file = dump.map(|p| std::fs::File::create(p).expect("create dump file"));
-    let mut verdict_file = verdicts.map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("create verdict file")));
+    let mut verdict_file =
+        verdicts.map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("create verdict file")));
     println!();
     for ((root, file), result) in files.iter().zip(&results) {
         let Some((report, _)) = result else { continue };

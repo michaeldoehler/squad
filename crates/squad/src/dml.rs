@@ -413,6 +413,7 @@ fn returning(exprs: &Option<Vec<Expr>>, row: &[Value], out: &mut Vec<Row>, cx: &
 
 pub(crate) fn insert(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
     let table = &plan.table;
+    let affected_before = cx.rows_affected;
     let mut out = Vec::new();
     // Rows this statement inserted or updated; ON CONFLICT DO UPDATE may
     // not touch any of them again.
@@ -518,6 +519,9 @@ pub(crate) fn insert(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
     for row in &fk_pending {
         check_outgoing_fks(table, row, None, cx)?;
     }
+    if table.columnar.is_some() {
+        *cx.columnar_inserted.entry(table.id).or_default() += cx.rows_affected - affected_before;
+    }
     Ok(out)
 }
 
@@ -603,6 +607,18 @@ pub(crate) fn update(plan: &UpdatePlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
 
 pub(crate) fn delete(plan: &DeletePlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
     let table = &plan.table;
+    if table.columnar.is_some() {
+        // Segments are immutable: matching rows are removed by rewriting
+        // the segments that contain them.
+        let crate::plan::Plan::Scan(scan) = &plan.source else {
+            return Err(Error::unsupported("DELETE ... USING on columnar tables"));
+        };
+        if plan.returning.is_some() {
+            return Err(Error::unsupported("DELETE ... RETURNING on columnar tables"));
+        }
+        cx.rows_affected += crate::columnar::delete(scan, cx)?;
+        return Ok(Vec::new());
+    }
     let width = table.columns.len();
     let sources = collect(&plan.source, cx)?;
     let mut done = HashSet::new();

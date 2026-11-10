@@ -34,7 +34,10 @@ fn agg_func(name: &str) -> Option<AggFunc> {
         "variance" | "var_samp" => AggFunc::Variance { sample: true, stddev: false },
         "var_pop" => AggFunc::Variance { sample: false, stddev: false },
         "stddev" | "stddev_samp" => AggFunc::Variance { sample: true, stddev: true },
-        "stddev_pop" => AggFunc::Variance { sample: false, stddev: true },
+                "stddev_pop" => AggFunc::Variance { sample: false, stddev: true },
+        "approx_count_distinct" => AggFunc::ApproxCountDistinct,
+        // The percentile is filled in from the second argument.
+        "approx_percentile" => AggFunc::ApproxPercentile(0.5),
         _ => return None,
     })
 }
@@ -116,6 +119,11 @@ fn agg_type(func: &AggFunc, name: &str, args: &[Type]) -> Result<Type> {
         },
         AggFunc::BitAnd | AggFunc::BitOr => match arg {
             Type::Int2 | Type::Int4 | Type::Int8 => arg,
+            _ => return Err(undefined_function(name, args)),
+        },
+                AggFunc::ApproxCountDistinct => Type::Int8,
+        AggFunc::ApproxPercentile(_) => match arg {
+            Type::Int2 | Type::Int4 | Type::Int8 | Type::Numeric | Type::Float4 | Type::Float8 => Type::Float8,
             _ => return Err(undefined_function(name, args)),
         },
         AggFunc::StringAgg => Type::Text,
@@ -967,7 +975,7 @@ impl<'a> Binder<'a> {
             }
             let expected = match func {
                 AggFunc::CountStar => 0,
-                AggFunc::StringAgg | AggFunc::JsonObjectAgg { .. } => 2,
+                                AggFunc::StringAgg | AggFunc::JsonObjectAgg { .. } | AggFunc::ApproxPercentile(_) => 2,
                 _ => 1,
             };
             let types: Vec<Type> = args.iter().map(|(_, t)| t.clone()).collect();
@@ -996,6 +1004,26 @@ impl<'a> Binder<'a> {
                 exprs.push(e);
                 arg_types.push(want);
             }
+                        // approx_percentile(x, p): p is a constant between 0 and 1.
+            let func = match func {
+                AggFunc::ApproxPercentile(_) => {
+                    let p = match exprs.pop() {
+                        Some(Expr::Const(v)) => v.as_f64(),
+                        _ => None,
+                    };
+                    arg_types.pop();
+                    match p {
+                        Some(p) if (0.0..=1.0).contains(&p) => AggFunc::ApproxPercentile(p),
+                        _ => {
+                            return Err(Error::new(
+                                sqlstate::INVALID_PARAMETER_VALUE,
+                                "the percentile of approx_percentile must be a constant between 0 and 1",
+                            ))
+                        }
+                    }
+                }
+                other => other,
+            };
             let ret = agg_type(&func, name, &arg_types)?;
             let filter = f.agg_filter.as_ref().map(|n| self.bind_bool(n, scope, "FILTER")).transpose()?;
             let order_by = self.bind_sort_keys(&f.agg_order, scope)?;

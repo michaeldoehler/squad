@@ -17,7 +17,7 @@ use crate::{Error, Result};
 
 type Json = serde_json::Value;
 
-fn numeric_div() -> FuncImpl {
+pub(crate) fn numeric_div() -> FuncImpl {
     static DIV: OnceLock<FuncImpl> = OnceLock::new();
     *DIV.get_or_init(|| {
         value::resolve_operator("/", Some(&Type::Numeric), &Type::Numeric).expect("numeric division").eval
@@ -78,7 +78,8 @@ fn out_of_range(what: &str) -> Error {
 impl<'p> Runner<'p> {
     fn new(call: &'p AggCall, func: &'p AggFunc) -> Runner<'p> {
         let acc = match func {
-            AggFunc::CountStar | AggFunc::Count => Acc::Count(0),
+                        AggFunc::CountStar | AggFunc::Count | AggFunc::ApproxCountDistinct => Acc::Count(0),
+            AggFunc::ApproxPercentile(_) => Acc::Array(Vec::new()),
             AggFunc::Sum | AggFunc::Avg => match call.ret {
                 Type::Float4 | Type::Float8 => Acc::SumFloat(0.0),
                 Type::Interval => Acc::SumInterval(Interval::default()),
@@ -97,7 +98,9 @@ impl<'p> Runner<'p> {
                 Acc::Moments(0.0, 0.0, 0.0, (call.ret == Type::Numeric).then_some((Decimal::ZERO, Decimal::ZERO)))
             }
         };
-        Runner { call, func, acc, n: 0, distinct: call.distinct.then(HashSet::new), ordered: Vec::new() }
+                // Outside columnar tables an "approximate" distinct count is exact.
+        let distinct = call.distinct || matches!(func, AggFunc::ApproxCountDistinct);
+        Runner { call, func, acc, n: 0, distinct: distinct.then(HashSet::new), ordered: Vec::new() }
     }
 
     /// Feeds one input row.
@@ -282,6 +285,16 @@ impl<'p> Runner<'p> {
                 (Some(b), _) => Value::Int8(b),
             },
             Acc::Text(s) => s.map_or(Value::Null, Value::Text),
+                        Acc::Array(mut items) if matches!(self.func, AggFunc::ApproxPercentile(_)) => {
+                let AggFunc::ApproxPercentile(p) = self.func else { unreachable!() };
+                if items.is_empty() {
+                    return Ok(Value::Null);
+                }
+                // Exact here: the value at the percentile's rank.
+                items.sort_by(compare);
+                let rank = ((items.len() as f64 * p).ceil() as usize).clamp(1, items.len());
+                items[rank - 1].as_f64().map_or(Value::Null, Value::Float8)
+            }
             Acc::Array(items) if self.n == 0 && items.is_empty() => Value::Null,
             Acc::Array(items) => Value::Array(items),
             Acc::JsonArray(items) if items.is_empty() => Value::Null,

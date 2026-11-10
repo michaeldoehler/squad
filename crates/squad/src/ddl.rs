@@ -141,7 +141,7 @@ pub(crate) fn apply_setting(state: &mut SessionState, name: &str, value: Option<
                     .map(|s| s.trim().trim_matches('"').to_string())
                     .filter(|s| !s.is_empty() && s != "$user")
                     .collect(),
-                                None => vec!["public".to_string()],
+                None => vec!["public".to_string()],
             };
             // `SHOW search_path` echoes the list as it was set.
             match value {
@@ -558,6 +558,7 @@ fn create_table(sess: &mut Session, stmt: &pb::CreateStmt) -> Result<QueryResult
             indexes: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
+            columnar: None,
         };
         let mut specs = Vec::new();
         let mut table_constraints: Vec<pb::Constraint> = Vec::new();
@@ -586,16 +587,14 @@ fn create_table(sess: &mut Session, stmt: &pb::CreateStmt) -> Result<QueryResult
         }
 
         let mut taken: Vec<String> = Vec::new();
-        let index_name =
-            |catalog: &Catalog, given: &str, default: String, taken: &mut Vec<String>| -> Result<String> {
-                let name =
-                    if given.is_empty() { free_name(catalog, &schema, &default, taken) } else { given.to_string() };
-                if catalog.relation_name_taken(&schema, &name) || taken.contains(&name) {
-                    return Err(duplicate_relation(&name));
-                }
-                taken.push(name.clone());
-                Ok(name)
-            };
+        let index_name = |catalog: &Catalog, given: &str, default: String, taken: &mut Vec<String>| -> Result<String> {
+            let name = if given.is_empty() { free_name(catalog, &schema, &default, taken) } else { given.to_string() };
+            if catalog.relation_name_taken(&schema, &name) || taken.contains(&name) {
+                return Err(duplicate_relation(&name));
+            }
+            taken.push(name.clone());
+            Ok(name)
+        };
         let col_list = |table: &Table, cols: &[usize]| {
             cols.iter().map(|&c| table.columns[c].name.as_str()).collect::<Vec<_>>().join("_")
         };
@@ -749,6 +748,29 @@ fn create_table(sess: &mut Session, stmt: &pb::CreateStmt) -> Result<QueryResult
             }
         }
         shared.reset_counter(id)?;
+        // CREATE TABLE … USING columnar [WITH (order_by = 'a, b')]
+        match stmt.access_method.as_str() {
+            "" | "heap" => {}
+            "columnar" => {
+                if !table.rowid || !table.indexes.is_empty() || !table.foreign_keys.is_empty() {
+                    return Err(feature("primary key, unique and foreign key constraints on columnar tables"));
+                }
+                let mut order_by = Vec::new();
+                for (option, arg) in def_elems(&stmt.options) {
+                    if option != "order_by" {
+                        return Err(feature(&format!("columnar table option \"{option}\"")));
+                    }
+                    for col in arg.and_then(const_text).unwrap_or_default().split(',') {
+                        let col = col.trim();
+                        order_by.push(table.columns.iter().position(|c| c.name == col && !c.hidden).ok_or_else(|| {
+                            Error::new(sqlstate::UNDEFINED_COLUMN, format!("column \"{col}\" named in order_by does not exist"))
+                        })?);
+                    }
+                }
+                table.columnar = Some(crate::catalog::Columnar { order_by });
+            }
+            other => return Err(feature(&format!("table access method \"{other}\""))),
+        }
         catalog.tables.insert((schema, name.to_string()), Arc::new(table));
         Ok(())
     })?;
@@ -790,6 +812,9 @@ fn create_index(sess: &mut Session, stmt: &pb::IndexStmt) -> Result<QueryResult>
     let wait = WaitPolicy::Wait(sess.state.lock_timeout);
     let built = sess.alter_catalog(|catalog, txn, _, _| {
         let table = find_table(catalog, rv, &path)?;
+        if table.columnar.is_some() {
+            return Err(feature("indexes on columnar tables"));
+        }
         Session::lock_table_exclusive(txn, table.id, wait)?;
         let mut cols = Vec::with_capacity(stmt.index_params.len());
         for p in &stmt.index_params {
@@ -833,6 +858,52 @@ fn create_index(sess: &mut Session, stmt: &pb::IndexStmt) -> Result<QueryResult>
     done("CREATE INDEX")
 }
 
+fn view_binds(catalog: &Catalog, path: &[String], view: &View) -> bool {
+    let mut search = vec![view.schema.clone()];
+    search.extend(path.iter().cloned());
+    let Ok(stmts) = crate::bind::parse_sql(&view.sql) else { return false };
+    match stmts.first().and_then(|s| s.stmt.as_ref()).and_then(|s| s.node.as_ref()) {
+        Some(N::SelectStmt(sel)) => Binder::new(catalog, &search, Vec::new()).bind_query(sel).is_ok(),
+        _ => false,
+    }
+}
+
+/// Removes a relation from the catalog. Views that are defined on it
+/// (directly or through other views) block the removal unless `cascade`
+/// is set, in which case they are removed as well.
+fn remove_with_dependent_views(
+    catalog: &mut Catalog,
+    path: &[String],
+    kind: &str,
+    name: &str,
+    cascade: bool,
+    remove: impl Fn(&mut Catalog),
+) -> Result<()> {
+    let intact: Vec<Arc<View>> = catalog.views.values().filter(|v| view_binds(catalog, path, v)).cloned().collect();
+    remove(catalog);
+    loop {
+        let broken: Vec<Arc<View>> = intact
+            .iter()
+            .filter(|v| {
+                catalog.views.contains_key(&(v.schema.clone(), v.name.clone())) && !view_binds(catalog, path, v)
+            })
+            .cloned()
+            .collect();
+        let Some(first) = broken.first() else { return Ok(()) };
+        if !cascade {
+            return Err(Error::new(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                format!("cannot drop {kind} {name} because other objects depend on it"),
+            )
+            .with_detail(format!("view {} depends on {kind} {name}", first.name))
+            .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
+        }
+        for v in broken {
+            catalog.views.remove(&(v.schema.clone(), v.name.clone()));
+        }
+    }
+}
+
 fn drop_owned_sequences(catalog: &mut Catalog, table_id: u32, column: Option<&str>, sess_resets: &mut Vec<u32>) {
     let owned: Vec<(String, String)> = catalog
         .sequences
@@ -872,6 +943,7 @@ fn drop_objects(sess: &mut Session, stmt: &pb::DropStmt) -> Result<QueryResult> 
             _ => return Err(Error::internal("unexpected object name in DROP")),
         });
     }
+    let mut dropped_objects = Vec::new();
     let resets = sess.alter_catalog(|catalog, txn, _, _| {
         let mut resets = Vec::new();
         for parts in &names {
@@ -916,10 +988,14 @@ fn drop_objects(sess: &mut Session, stmt: &pb::DropStmt) -> Result<QueryResult> 
                         c.foreign_keys.retain(|f| f.name != fk.name);
                         put_table(catalog, c);
                     }
+                    let key = (table.schema.clone(), table.name.clone());
+                    remove_with_dependent_views(catalog, &path, "table", &table.name, cascade, |c| {
+                        c.tables.remove(&key);
+                    })?;
                     clear_table(&table, txn)?;
+                    crate::columnar::clear(&table, txn, &mut dropped_objects)?;
                     drop_owned_sequences(catalog, table.id, None, &mut resets);
                     resets.push(table.id);
-                    catalog.tables.remove(&(table.schema.clone(), table.name.clone()));
                 }
                 O::ObjectIndex => {
                     let Some((table, pos)) = catalog.index(schema, name, &path).map(|(t, p)| (t.clone(), p)) else {
@@ -973,7 +1049,10 @@ fn drop_objects(sess: &mut Session, stmt: &pb::DropStmt) -> Result<QueryResult> 
                         missing("view")?;
                         continue;
                     };
-                    catalog.views.remove(&(view.schema.clone(), view.name.clone()));
+                    let key = (view.schema.clone(), view.name.clone());
+                    remove_with_dependent_views(catalog, &path, "view", &view.name, cascade, |c| {
+                        c.views.remove(&key);
+                    })?;
                 }
                 O::ObjectType => {
                     let Some(ty) = catalog.enum_type(schema, name, &path).cloned() else {
@@ -1012,6 +1091,7 @@ fn drop_objects(sess: &mut Session, stmt: &pb::DropStmt) -> Result<QueryResult> 
                     for t in tables {
                         Session::lock_table_exclusive(txn, t.id, wait)?;
                         clear_table(&t, txn)?;
+                        crate::columnar::clear(&t, txn, &mut dropped_objects)?;
                         resets.push(t.id);
                     }
                     resets.extend(catalog.sequences.values().filter(|s| s.schema == *name).map(|s| s.id));
@@ -1028,6 +1108,7 @@ fn drop_objects(sess: &mut Session, stmt: &pb::DropStmt) -> Result<QueryResult> 
     })?;
     if let Some(t) = &mut sess.txn {
         t.reset_counters.extend(resets);
+        t.dropped_objects.extend(dropped_objects);
     }
     done(tag)
 }
@@ -1098,6 +1179,9 @@ fn alter_table_cmd(sess: &mut Session, rv: &pb::RangeVar, cmd: &pb::AlterTableCm
         Session::lock_table_exclusive(txn, table.id, wait)?;
         Ok(table)
     })?;
+    if table.columnar.is_some() {
+        return Err(feature("ALTER TABLE on columnar tables"));
+    }
     let column = |name: &str| {
         table.columns.iter().position(|c| c.name == name && !c.hidden).ok_or_else(|| undefined_column(&table, name))
     };
@@ -1307,17 +1391,23 @@ fn alter_table_cmd(sess: &mut Session, rv: &pb::RangeVar, cmd: &pb::AlterTableCm
             target.decl = decl.decl.clone();
             target.decl_oid = decl.oid;
             target.typmod = decl.typmod;
-                        let using = match &def.raw_default {
+            let using = match &def.raw_default {
                 Some(u) => deparse_expr(u)?,
                 None => {
                     // Without USING the conversion must be an assignment cast.
                     let from = &table.columns[idx].ty;
-                    if *from != decl.ty && !crate::value::can_cast(from, &decl.ty, crate::value::CastContext::Assignment) {
+                    if *from != decl.ty
+                        && !crate::value::can_cast(from, &decl.ty, crate::value::CastContext::Assignment)
+                    {
                         return Err(Error::type_mismatch(format!(
                             "column \"{}\" cannot be cast automatically to type {}",
                             cmd.name, decl.ty
                         ))
-                        .with_hint(format!("You might need to specify \"USING {}::{}\".", quote_ident(&cmd.name), decl.decl)));
+                        .with_hint(format!(
+                            "You might need to specify \"USING {}::{}\".",
+                            quote_ident(&cmd.name),
+                            decl.decl
+                        )));
                     }
                     format!("{}::{}", quote_ident(&cmd.name), decl.decl)
                 }
@@ -2021,6 +2111,7 @@ fn truncate(sess: &mut Session, stmt: &pb::TruncateStmt) -> Result<QueryResult> 
     for table in &tables {
         Session::lock_table_exclusive(&mut t.txn, table.id, wait)?;
         clear_table(table, &mut t.txn)?;
+        crate::columnar::clear(table, &mut t.txn, &mut t.dropped_objects)?;
         if stmt.restart_seqs {
             for seq in catalog.sequences.values() {
                 if matches!(&seq.owned_by, Some((id, _)) if *id == table.id) {
@@ -2078,6 +2169,7 @@ fn create_table_as(sess: &mut Session, stmt: &pb::CreateTableAsStmt) -> Result<Q
             indexes: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
+            columnar: None,
         };
         let qualified = quote_qualified(&schema, name);
         put_table(catalog, table);
@@ -2117,7 +2209,7 @@ fn transaction(sess: &mut Session, stmt: &pb::TransactionStmt) -> Result<QueryRe
             }
             match &mut sess.txn {
                 // Already inside a block: Postgres only warns.
-                                Some(t) if t.explicit && !t.batch => {}
+                Some(t) if t.explicit && !t.batch => {}
                 // BEGIN inside a multi-statement string turns the string's
                 // implicit transaction into a real block.
                 Some(t) => {
@@ -2255,7 +2347,7 @@ fn explain(sess: &mut Session, stmt: &pb::ExplainStmt) -> Result<QueryResult> {
         let on = arg.and_then(const_text).is_none_or(|v| !matches!(v.as_str(), "false" | "off" | "0"));
         match name {
             "analyze" => analyze = on,
-                        "format" if arg.and_then(const_text).is_some_and(|v| !v.eq_ignore_ascii_case("text")) => {
+            "format" if arg.and_then(const_text).is_some_and(|v| !v.eq_ignore_ascii_case("text")) => {
                 return Err(feature("EXPLAIN formats other than TEXT"));
             }
             _ => {}
@@ -2406,6 +2498,27 @@ pub(crate) fn run_utility(sess: &mut Session, stmt: &N, _params: &[Value]) -> Re
             }
             if s.is_vacuumcmd {
                 sess.shared.store.gc()?;
+                // For columnar tables VACUUM moves the delta into segments
+                // and merges small segments.
+                let catalog = sess.catalog();
+                let path = sess.state.search_path.clone();
+                let mut wanted = Vec::new();
+                for r in &s.rels {
+                    if let Some(N::VacuumRelation(v)) = r.node.as_ref() {
+                        if let Some(rv) = &v.relation {
+                            wanted.push(find_table(&catalog, rv, &path)?.id);
+                        }
+                    }
+                }
+                let ids: Vec<u32> = catalog
+                    .tables
+                    .values()
+                    .filter(|t| t.columnar.is_some() && (wanted.is_empty() || wanted.contains(&t.id)))
+                    .map(|t| t.id)
+                    .collect();
+                for id in ids {
+                    sess.compact_table(id)?;
+                }
             }
             done(if s.is_vacuumcmd { "VACUUM" } else { "ANALYZE" })
         }

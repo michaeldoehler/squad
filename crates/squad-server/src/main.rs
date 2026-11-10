@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use squad::{Config, Database, SyncMode};
+use squad::{Config, Database, RemoteConfig, RemoteSync, SyncMode};
 use squad_server::{Auth, Server, ServerConfig};
 
 const USAGE: &str = "\
@@ -17,6 +17,7 @@ USAGE:
     squad shell [<dir>]             interactive SQL prompt (in-memory without <dir>)
     squad backup <dir> <dest>       write a consistent copy of the database to <dest>
     squad verify <dir>              check the integrity of the stored data
+    squad restore <url> <dir>       download a database from an object store
     squad --version
 
 OPTIONS for serve:
@@ -27,6 +28,16 @@ OPTIONS for serve:
                               may be repeated; without it every client is trusted
     --cleartext-password      ask for passwords in clear text instead of SCRAM
     --sync <sync|group|async> commit durability (default sync)
+    --remote <url>            keep a complete copy in an object store and
+                              restore from it if <dir> is empty, e.g.
+                              file:///mnt/backup or
+                              s3://bucket/prefix?region=eu-central-1
+    --remote-sync <async|sync>
+                              async (default): ship the log in the background;
+                              sync: acknowledge a commit only once it is in
+                              the object store
+    --remote-restore          replace <dir> with the remote state if they
+                              disagree
 ";
 
 struct Args {
@@ -36,8 +47,8 @@ struct Args {
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
-    const WITH_VALUE: &[&str] = &["--listen", "--unix-socket-dir", "--user", "--password", "--sync"];
-    const FLAGS: &[&str] = &["--memory", "--cleartext-password"];
+    const WITH_VALUE: &[&str] = &["--listen", "--unix-socket-dir", "--user", "--password", "--sync", "--remote", "--remote-sync"];
+    const FLAGS: &[&str] = &["--memory", "--cleartext-password", "--remote-restore"];
     let mut parsed = Args { positional: Vec::new(), options: HashMap::new(), flags: Vec::new() };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -66,6 +77,16 @@ fn open(args: &Args, dir: Option<&String>) -> Result<Database, String> {
             "async" => SyncMode::Async,
             other => return Err(format!("invalid --sync mode \"{other}\" (expected sync, group or async)")),
         };
+    }
+    if let Some(url) = args.options.get("--remote").and_then(|v| v.last()) {
+        let store = squad::object::open_url(url).map_err(|e| format!("cannot open remote \"{url}\": {e}"))?;
+        let mode = match args.options.get("--remote-sync").and_then(|v| v.last()).map_or("async", String::as_str) {
+            "async" => RemoteSync::Async { interval: std::time::Duration::from_secs(1) },
+            "sync" => RemoteSync::Sync,
+            other => return Err(format!("invalid --remote-sync mode \"{other}\" (expected async or sync)")),
+        };
+        let restore = args.flags.iter().any(|f| f == "--remote-restore");
+        config.remote = Some(RemoteConfig { restore, ..RemoteConfig::new(store, mode) });
     }
     match (dir, args.flags.iter().any(|f| f == "--memory")) {
         (None, true) => Database::open_in_memory().map_err(|e| e.to_string()),
@@ -127,6 +148,13 @@ fn run(args: &[String]) -> Result<(), String> {
             let db = open(&rest, Some(dir))?;
             db.backup(dest).map_err(|e| format!("backup failed: {e}"))?;
             println!("backup written to {dest}");
+            Ok(())
+        }
+        "restore" => {
+            let [url, dir] = rest.positional.as_slice() else { return Err("usage: squad restore <url> <dir>".into()) };
+            let store = squad::object::open_url(url).map_err(|e| format!("cannot open \"{url}\": {e}"))?;
+            Database::restore_from(&*store, dir).map_err(|e| format!("restore failed: {e}"))?;
+            println!("database restored to {dir}");
             Ok(())
         }
         "verify" => {

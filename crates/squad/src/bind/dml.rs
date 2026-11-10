@@ -406,6 +406,9 @@ impl<'a> Binder<'a> {
 
     fn bind_update(&mut self, upd: &pb::UpdateStmt) -> Result<(Plan, Vec<OutputColumn>)> {
         let (table, alias) = self.target_table(&upd.relation)?;
+        if table.columnar.is_some() {
+            return Err(Error::unsupported("UPDATE on columnar tables"));
+        }
         let (source, scope, recheck) = self.bind_modify_source(&table, &alias, &upd.from_clause, &upd.where_clause)?;
         self.clause = "UPDATE";
         let set = self.bind_set_list(&upd.target_list, &table, &scope)?;
