@@ -293,7 +293,13 @@ fn queries(p: &Pair, rng: &mut Rng) {
 }
 
 fn run(shards: usize, seed: u64, steps: usize) {
-    let cluster = Cluster::open(ClusterConfig::new(vec![ShardSpec::Memory; shards])).unwrap();
+    run_on(vec![ShardSpec::Memory; shards], &[], seed, steps)
+}
+
+/// `remote` holds the databases behind the remote shards, by shard index.
+fn run_on(specs: Vec<ShardSpec>, remote: &[(usize, Database)], seed: u64, steps: usize) {
+    let shards = specs.len();
+    let cluster = Cluster::open(ClusterConfig::new(specs)).unwrap();
     let db = cluster.connect();
     db.batch_execute(SCHEMA).unwrap();
     db.batch_execute(DECLARE).unwrap();
@@ -317,7 +323,10 @@ fn run(shards: usize, seed: u64, steps: usize) {
     // are the same everywhere.
     let plans = pair.model.query("SELECT * FROM plans ORDER BY id", &[]).unwrap();
     for shard in cluster.shards() {
-        let conn = shard.database().unwrap().connect();
+        let conn = match shard.database() {
+            Some(db) => db.connect(),
+            None => remote.iter().find(|(i, _)| *i == shard.index()).unwrap().1.connect(),
+        };
         for table in ["users", "events"] {
             for row in conn.query(&format!("SELECT DISTINCT project_id FROM {table}"), &[]).unwrap() {
                 assert_eq!(cluster.shard_for(&row.values()[0]), shard.index(), "{table} row on the wrong shard");
@@ -363,4 +372,29 @@ fn four_shards_match_a_single_database() {
 #[test]
 fn seven_shards_match_a_single_database() {
     seeds().for_each(|seed| run(7, seed, steps()));
+}
+
+/// Shards 1 and 3 are squad servers reached over the wire protocol, the
+/// others are databases in this process.
+#[test]
+fn local_and_remote_shards_match_a_single_database() {
+    use squad_server::Serve;
+    for seed in seeds().take(3) {
+        let mut specs = Vec::new();
+        let mut remote = Vec::new();
+        let mut servers = Vec::new();
+        for i in 0..4 {
+            if i % 2 == 1 {
+                let db = Database::open_in_memory().unwrap();
+                let server = db.serve("127.0.0.1:0").unwrap();
+                specs.push(ShardSpec::remote(server.url().unwrap()));
+                remote.push((i, db));
+                servers.push(server);
+            } else {
+                specs.push(ShardSpec::Memory);
+            }
+        }
+        run_on(specs, &remote, seed, steps());
+        servers.into_iter().for_each(|s| s.shutdown());
+    }
 }
