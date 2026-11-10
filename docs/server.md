@@ -25,6 +25,14 @@ psql -h 127.0.0.1 -U squad squad
 | `--cleartext-password` | ask for the password in clear text, for clients without SCRAM |
 | `--sync sync\|group\|async` | commit durability, see [durability](durability.md) |
 | `--memory` | serve an in-memory database |
+| `--remote <url>`, `--remote-sync async\|sync`, `--remote-restore` | keep the durable copy in an object store, see [cloud storage](cloud-storage.md) |
+| `--replica-of <url>` | serve a **read replica** of the database whose writer runs with `--remote <url>`; `<dir>` holds the replica's local copy |
+| `--poll-interval <ms>` | how often a replica looks for new commits (default 1000) |
+
+A replica answers queries and refuses writes with SQLSTATE `25006`;
+`SELECT squad_promote()` from any client turns it into the writer. See
+[replication](replication.md) for guarantees, monitoring and the
+failover procedure.
 
 The database name and, without `--user`, the user name a client sends
 are accepted as given; there is one database per directory.
@@ -124,7 +132,9 @@ Not implemented:
 - **TLS.** Connections are unencrypted. Bind to localhost or a Unix
   socket, or put a TLS-terminating proxy in front.
 - **Query cancellation.** Cancel requests are accepted and ignored.
-- **`LISTEN`/`NOTIFY`**, logical replication, and notices.
+- **`LISTEN`/`NOTIFY`**, PostgreSQL's replication protocols (streaming
+  and logical; squad's own [replication](replication.md) goes through
+  an object store), and notices.
 - **`COPY` binary format**, `COPY` from or to server-side files.
 - In the extended protocol each `Execute` outside a transaction block
   commits on its own, whereas Postgres commits at `Sync`. This only

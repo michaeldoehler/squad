@@ -164,6 +164,16 @@ The result: starting a second writer on the same remote — deliberately,
 to fail over, or by mistake — never mixes two histories, and never loses
 a commit that was acknowledged in `Sync` mode.
 
+A directory that cannot continue the remote history (it is behind, or
+was left by a writer that has been replaced) is recognised *before*
+step 1 and refused without claiming anything, so starting a stale copy
+by mistake does not stop the writer that is running.
+
+The same mechanism is what makes promoting a
+[read replica](replication.md#promotion-and-failover) safe: the replica
+claims the next epoch, applies everything the previous writer uploaded,
+and continues from there.
+
 Residual risks, stated plainly:
 
 - The claim relies on the store's conditional put (`If-None-Match: *`).
@@ -197,8 +207,10 @@ Residual risks, stated plainly:
 
 - **Not multi-writer.** One process writes; a second one takes over
   rather than joining.
-- **Not read replicas.** Other processes can restore a copy and serve
-  reads from it, but nothing keeps such a copy up to date continuously.
+- **Not synchronous replication.** Read replicas that follow the
+  writer through the object store, and promotion of a replica when the
+  writer is lost, are described in [replication](replication.md). A
+  commit never waits for a replica.
 - **Not storage separated from compute.** The whole database is on the
   local disk and its hot part in memory; the object store is not read
   during normal operation. A database larger than the local disk does
