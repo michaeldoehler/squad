@@ -430,6 +430,10 @@ pub(crate) struct SegmentRows<'p> {
     plan: &'p ScanPlan,
     segments: Vec<Arc<cs::Segment>>,
     prune: Option<cs::Predicate>,
+    /// The whole filter as a predicate of the column engine, if it has an
+    /// exact equivalent: the engine then filters vectorized, using bloom
+    /// filters, and only matching rows are converted.
+    exact: Option<cs::Predicate>,
     projection: Vec<usize>,
     /// (segment, row group) to read next.
     next: (usize, usize),
@@ -441,9 +445,9 @@ impl<'p> SegmentRows<'p> {
         let table = &plan.table;
         let manifest = load_manifest(table, cx)?;
         let pos = segment_positions(table);
-        let prune = match &plan.filter {
-            Some(f) => pruning_predicate(f, table, &pos, cx)?,
-            None => None,
+        let (prune, exact) = match &plan.filter {
+            Some(f) => (pruning_predicate(f, table, &pos, cx)?, predicate(f, table, &pos, cx)?),
+            None => (None, None),
         };
         // Whole segments that cannot match are not even opened.
         let mut kept = cs::Manifest::new(manifest.schema.clone(), manifest.sort_key.clone());
@@ -454,7 +458,7 @@ impl<'p> SegmentRows<'p> {
         }
         let segments = open_segments(table, &kept, cx)?;
         let projection = (0..stored(table).count()).collect();
-        Ok(SegmentRows { plan, segments, prune, projection, next: (0, 0), pending: Vec::new().into_iter() })
+        Ok(SegmentRows { plan, segments, prune, exact, projection, next: (0, 0), pending: Vec::new().into_iter() })
     }
 }
 
@@ -470,6 +474,20 @@ impl Node for SegmentRows<'_> {
             }
             let (s, g) = self.next;
             let Some(segment) = self.segments.get(s) else { return Ok(None) };
+            if let Some(exact) = &self.exact {
+                // One segment at a time through the column engine.
+                self.next = (s + 1, 0);
+                let mut source = cs::TableSource::new(schema(table));
+                source.segments.push(segment.clone());
+                let request =
+                    cs::ScanRequest { projection: self.projection.clone(), predicate: Some(exact.clone()), limit: None };
+                let mut rows = Vec::new();
+                for batch in cs::scan(&source, &request)? {
+                    batch_rows(table, &batch?, &mut rows, cx)?;
+                }
+                self.pending = rows.into_iter();
+                continue;
+            }
             if g >= segment.num_row_groups() {
                 self.next = (s + 1, 0);
                 continue;
@@ -481,21 +499,27 @@ impl Node for SegmentRows<'_> {
             }
             let batch = segment.read_row_group(g, &self.projection)?;
             let mut rows = Vec::with_capacity(batch.num_rows());
-            for i in 0..batch.num_rows() {
-                let mut data = batch.row(i).into_iter();
-                let mut row = Vec::with_capacity(table.columns.len());
-                for col in &table.columns {
-                    row.push(match col.hidden {
-                        // Rows in segments have no row id.
-                        true => Value::Null,
-                        false => from_datum(data.next().unwrap_or(cs::Datum::Null), col, cx)?,
-                    });
-                }
-                rows.push(row);
-            }
+            batch_rows(table, &batch, &mut rows, cx)?;
             self.pending = rows.into_iter();
         }
     }
+}
+
+/// Converts a batch of the stored columns into table rows.
+fn batch_rows(table: &Table, batch: &cs::Batch, out: &mut Vec<Row>, cx: &ExecCx) -> Result<()> {
+    for i in 0..batch.num_rows() {
+        let mut data = batch.row(i).into_iter();
+        let mut row = Vec::with_capacity(table.columns.len());
+        for col in &table.columns {
+            row.push(match col.hidden {
+                // Rows in segments have no row id.
+                true => Value::Null,
+                false => from_datum(data.next().unwrap_or(cs::Datum::Null), col, cx)?,
+            });
+        }
+        out.push(row);
+    }
+    Ok(())
 }
 
 /// Delta rows of a table that pass the scan's filter.
@@ -752,23 +776,48 @@ fn save_manifest(table: &Table, manifest: &cs::Manifest, cx: &mut ExecCx) -> Res
     Ok(())
 }
 
-/// Serializes changes to a table's segments. Callers take a fresh snapshot
-/// afterwards, so they see what the previous holder committed.
-fn lock_segments(table: &Table, cx: &mut ExecCx) -> Result<()> {
+/// Serializes changes to a table's segments and returns the manifest as
+/// the previous holder of the lock left it, whatever this transaction's
+/// snapshot is.
+fn lock_segments(table: &Table, cx: &mut ExecCx) -> Result<cs::Manifest> {
     let wait = WaitPolicy::Wait(cx.session.lock_timeout);
     cx.txn.lock(&manifest_key(table.id), LockMode::Exclusive, wait)?;
-    cx.txn.refresh_snapshot();
-    Ok(())
+    match cx.txn.get_current(&manifest_key(table.id))? {
+        Some(bytes) => Ok(cs::Manifest::from_bytes(&bytes)?),
+        None => {
+            let order_by = table.columnar.as_ref().map(|c| c.order_by.clone()).unwrap_or_default();
+            Ok(cs::Manifest::new((*schema(table)).clone(), order_by))
+        }
+    }
+}
+
+/// Rows of one `INSERT` from which they are written straight into
+/// segments instead of passing through the delta.
+pub(crate) const BULK_INSERT_ROWS: usize = 50_000;
+const BULK_SEGMENT_ROWS: usize = 1_000_000;
+
+/// Stores the rows of a large insert as new segments. The segments become
+/// visible when the inserting transaction commits its manifest change,
+/// so the insert is as atomic as any other.
+pub(crate) fn bulk_insert(table: &Table, rows: &[Row], cx: &mut ExecCx) -> Result<()> {
+    let mut manifest = lock_segments(table, cx)?;
+    for chunk in rows.chunks(BULK_SEGMENT_ROWS) {
+        let batch = rows_to_batch(table, chunk, cx)?;
+        add_segment(table, &mut manifest, &batch, cx)?;
+    }
+    save_manifest(table, &manifest, cx)
 }
 
 /// Moves all delta rows into a new segment and merges small segments.
 /// Returns the number of rows moved. Must run in a Read Committed
 /// transaction of its own.
 pub(crate) fn compact(table: &Arc<Table>, cx: &mut ExecCx) -> Result<u64> {
-    lock_segments(table, cx)?;
+    let mut manifest = lock_segments(table, cx)?;
+    // With the lock held, a fresh snapshot shows exactly the delta rows
+    // that no earlier compaction has moved.
+    cx.txn.refresh_snapshot();
     let plan = ScanPlan::full(table.clone());
     let rows = delta_rows(&plan, cx)?;
-    let mut manifest = load_manifest(table, cx)?;
     if !rows.is_empty() {
         let batch = rows_to_batch(table, &rows, cx)?;
         add_segment(table, &mut manifest, &batch, cx)?;
@@ -800,13 +849,12 @@ pub(crate) fn compact(table: &Arc<Table>, cx: &mut ExecCx) -> Result<u64> {
 /// every segment that holds matching rows is rewritten without them.
 pub(crate) fn delete(plan: &ScanPlan, cx: &mut ExecCx) -> Result<u64> {
     let table = &plan.table;
-    lock_segments(table, cx)?;
+    let mut manifest = lock_segments(table, cx)?;
     let mut count = 0u64;
     for row in delta_rows(plan, cx)? {
         cx.txn.delete_blind(&crate::exec::row_key(table, &row))?;
         count += 1;
     }
-    let mut manifest = load_manifest(table, cx)?;
     let pos = segment_positions(table);
     let prune = match &plan.filter {
         Some(f) => pruning_predicate(f, table, &pos, cx)?,
@@ -827,6 +875,7 @@ pub(crate) fn delete(plan: &ScanPlan, cx: &mut ExecCx) -> Result<u64> {
             plan: &unfiltered,
             segments: open_segments(table, &one, cx)?,
             prune: None,
+            exact: None,
             projection: (0..stored(table).count()).collect(),
             next: (0, 0),
             pending: Vec::new().into_iter(),

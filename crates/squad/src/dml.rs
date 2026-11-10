@@ -414,6 +414,40 @@ fn returning(exprs: &Option<Vec<Expr>>, row: &[Value], out: &mut Vec<Row>, cx: &
 pub(crate) fn insert(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
     let table = &plan.table;
     let affected_before = cx.rows_affected;
+    // A large insert into a columnar table is written straight into
+    // segments; small ones go through the delta like any row.
+    if table.columnar.is_some() && plan.returning.is_none() && !matches!(plan.source, crate::plan::Plan::Values(_)) {
+        let rows = collect(&plan.source, cx)?;
+        if rows.len() >= crate::columnar::BULK_INSERT_ROWS {
+            for row in &rows {
+                check_row(table, &plan.checks, row, cx)?;
+            }
+            crate::columnar::bulk_insert(table, &rows, cx)?;
+            cx.rows_affected += rows.len() as u64;
+            return Ok(Vec::new());
+        }
+        return insert_rows(plan, rows.into_iter(), cx);
+    }
+    let _ = affected_before;
+    insert_stream(plan, cx)
+}
+
+/// Inserts already computed rows through the ordinary path.
+fn insert_rows(plan: &InsertPlan, rows: std::vec::IntoIter<Row>, cx: &mut ExecCx) -> Result<Vec<Row>> {
+    let values = crate::plan::Plan::Values(rows.map(|r| r.into_iter().map(Expr::Const).collect()).collect());
+    let direct = InsertPlan {
+        table: plan.table.clone(),
+        source: values,
+        on_conflict: None,
+        checks: plan.checks.clone(),
+        returning: None,
+    };
+    insert_stream(&direct, cx)
+}
+
+fn insert_stream(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
+    let table = &plan.table;
+    let affected_before = cx.rows_affected;
     let mut out = Vec::new();
     // Rows this statement inserted or updated; ON CONFLICT DO UPDATE may
     // not touch any of them again.
