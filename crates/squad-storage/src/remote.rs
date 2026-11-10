@@ -209,8 +209,6 @@ pub(crate) struct WalObject {
 pub(crate) struct RemoteState {
     /// Epochs with an established base, ascending: `(epoch, base lsn)`.
     pub(crate) epochs: Vec<(u64, u64)>,
-    /// Highest claimed epoch, established or not.
-    pub(crate) max_claim: u64,
     /// Newest valid snapshot: `(epoch, lsn)`.
     pub(crate) snapshot: Option<(u64, u64)>,
     /// Log objects to replay, in order, starting after the snapshot (or
@@ -254,12 +252,8 @@ pub(crate) fn read_remote(store: &dyn ObjectStore) -> Result<RemoteState> {
 /// ones that continue a copy standing at that LSN instead of the ones
 /// that continue the newest snapshot.
 pub(crate) fn read_remote_from(store: &dyn ObjectStore, from: Option<u64>) -> Result<RemoteState> {
-    let mut max_claim = 0;
     let mut epochs = Vec::new();
-    for meta in store.list("writer/").map_err(remote_err)? {
-        if let Some(e) = meta.key.strip_prefix("writer/claim-").and_then(|s| s.parse::<u64>().ok()) {
-            max_claim = max_claim.max(e);
-        }
+    for meta in store.list("writer/base-").map_err(remote_err)? {
         if let Some(e) = meta.key.strip_prefix("writer/base-").and_then(|s| s.parse::<u64>().ok()) {
             let base = store.get(&meta.key).map_err(remote_err)?;
             let base = base.and_then(|b| String::from_utf8(b).ok()).and_then(|s| s.trim().parse::<u64>().ok());
@@ -303,7 +297,7 @@ pub(crate) fn read_remote_from(store: &dyn ObjectStore, from: Option<u64>) -> Re
             }
         }
     }
-    Ok(RemoteState { epochs, max_claim, snapshot, wal, lsn })
+    Ok(RemoteState { epochs, snapshot, wal, lsn })
 }
 
 fn data_file_lsn(first_page: &[u8]) -> Result<u64> {

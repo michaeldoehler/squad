@@ -573,7 +573,7 @@ fn plan_merge(sel: &pb::SelectStmt, text: &str, env: &Env) -> Result<Scatter> {
         });
     }
     let merged: Vec<pb::Node> = merged.iter().map(|m| parse_expr(m)).collect::<Result<_>>()?;
-    let mut place = |expr: &mut pb::Node| -> Result<()> {
+    let place = |expr: &mut pb::Node| -> Result<()> {
         tree::walk(expr, &mut |n| {
             if let Some(i) = bare_name(n).and_then(|name| name.strip_prefix("__agg")).and_then(|i| i.parse::<usize>().ok()) {
                 if let Some(m) = merged.get(i) {

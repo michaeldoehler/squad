@@ -81,6 +81,47 @@ impl Database {
         Ok(())
     }
 
+    /// Opens a read replica of the database a writer keeps in
+    /// `config.store` (the store of that writer's [`Config::remote`]).
+    ///
+    /// An empty or missing `path` is filled from the newest snapshot; a
+    /// directory holding the replica's own earlier copy is brought up to
+    /// date. The replica then applies what the writer ships, every
+    /// `config.poll_interval`, while it serves queries. All its sessions
+    /// are read-only: statements that would write fail with SQLSTATE
+    /// `25006`. See [`promote`](Database::promote) for turning it into
+    /// the writer.
+    pub fn open_replica(path: impl AsRef<Path>, config: crate::ReplicaConfig) -> Result<Database> {
+        Ok(Database { shared: crate::replica::open(path.as_ref(), config)? })
+    }
+
+    /// Where this replica stands relative to its writer. `None` for a
+    /// database that was not opened with
+    /// [`open_replica`](Database::open_replica).
+    pub fn replication_status(&self) -> Option<crate::ReplicationStatus> {
+        crate::replica::status(&self.shared)
+    }
+
+    /// Applies everything the writer has shipped so far instead of
+    /// waiting for the next poll, and returns the resulting position.
+    pub fn replication_catch_up(&self) -> Result<crate::ReplicationStatus> {
+        crate::replica::catch_up(&self.shared)
+    }
+
+    /// Makes this replica the writer: it claims the database in the
+    /// object store (the previous writer is refused from then on),
+    /// applies every commit that writer shipped, and starts shipping its
+    /// own. New transactions are read-write afterwards. Does nothing if
+    /// the replica was promoted before; on error it stays a replica.
+    pub fn promote(&self) -> Result<()> {
+        crate::replica::promote(&self.shared)
+    }
+
+    /// True while this database is a read replica.
+    pub fn is_replica(&self) -> bool {
+        self.shared.in_recovery()
+    }
+
     /// Opens a volatile database that lives in memory only.
     pub fn open_in_memory() -> Result<Database> {
         Database::with_engine(Arc::new(MemEngine::new()))
@@ -122,6 +163,7 @@ impl Database {
     /// Removes row versions no transaction can see any more. This also
     /// happens incrementally during normal operation.
     pub fn vacuum(&self) -> Result<u64> {
+        self.shared.check_writable("VACUUM")?;
         Ok(self.shared.store.gc()?)
     }
 

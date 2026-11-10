@@ -258,12 +258,14 @@ fn a_superseded_writer_is_fenced() {
 }
 
 #[test]
-fn garbage_collection_keeps_exactly_what_restore_needs() {
+fn garbage_collection_keeps_what_restore_and_replicas_need() {
     let store = MemoryStore::new();
     let vfs = SimVfs::new(10);
     let mut rng = Rng(10);
     let mut model = Model::new();
     let engine = TieredEngine::open(Path::new("/db"), options(&vfs), config(&store, RemoteSync::Sync)).unwrap();
+    // LSN of the snapshot taken at the end of the previous round.
+    let mut previous = 0;
     for round in 0..8 {
         for _ in 0..80 {
             let lsn = engine.write(random_batch(&mut rng, &mut model)).unwrap();
@@ -272,7 +274,16 @@ fn garbage_collection_keeps_exactly_what_restore_needs() {
         engine.checkpoint().unwrap();
         let keys: Vec<String> = store.list("").unwrap().into_iter().map(|m| m.key).collect();
         assert_eq!(keys.iter().filter(|k| k.starts_with("snapshot/")).count(), 1, "round {round}: {keys:?}");
-        assert_eq!(keys.iter().filter(|k| k.starts_with("wal/")).count(), 0, "round {round}: {keys:?}");
+        // The log is kept back to the snapshot before the newest one, for
+        // replicas that were reading it, and no further.
+        let logs: Vec<u64> = keys
+            .iter()
+            .filter(|k| k.starts_with("wal/"))
+            .map(|k| k.rsplit('-').next().unwrap().parse::<u64>().unwrap())
+            .collect();
+        assert!(logs.iter().all(|last| *last > previous), "round {round}: {keys:?}");
+        assert!(logs.len() <= 80, "round {round}: {keys:?}");
+        previous = engine.remote_stats().snapshot_lsn;
         // No chunk is stored that the manifest does not reference.
         let manifest = store.get(keys.iter().find(|k| k.starts_with("snapshot/")).unwrap()).unwrap().unwrap();
         let referenced = String::from_utf8(manifest).unwrap().lines().filter(|l| l.starts_with("chunk ")).count();

@@ -20,6 +20,7 @@ mod mem;
 mod page;
 mod pool;
 mod remote;
+mod replica;
 mod sim;
 mod vfs;
 mod wal;
@@ -29,5 +30,6 @@ pub use engine::{Engine, EngineStats, SyncMode, VerifyReport, WriteBatch, MAX_KE
 pub use error::{Result, StorageError};
 pub use mem::MemEngine;
 pub use remote::{restore_from, RemoteConfig, RemoteStats, RemoteSync, TieredEngine};
+pub use replica::{ReplayHooks, ReplicaEngine, ReplicaStatus};
 pub use sim::SimVfs;
 pub use vfs::{RealVfs, Vfs, VfsFile, VfsLock};

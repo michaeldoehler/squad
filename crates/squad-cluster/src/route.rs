@@ -405,8 +405,9 @@ fn undeclared_error(table: &str) -> Error {
 }
 
 fn missing_key_error(what: &str) -> Error {
-    unsupported(format!("{what} that reads distributed tables on several shards"))
-        .with_hint("Add a condition on the distribution column (for example project_id = …) for every distributed table, or join them on it.")
+    unsupported(what).with_hint(
+        "Add a condition on the distribution column (for example project_id = …) for every distributed table, or join them on it.",
+    )
 }
 
 /// A call `name('a', 'b')` without FROM, as used for the cluster's own
@@ -462,20 +463,24 @@ pub(crate) fn analyze(stmt: &pb::Node, text: &str, env: &Env) -> Result<Plan> {
             let write = !sel.locking_clause.is_empty();
             if keys.open_groups == 0 && !keys.nested_open {
                 // Several key values may still name several shards.
-                let scatter = (keys.groups.len() == 1 && !write).then(|| scatter::plan(sel, text, env));
+                let scatter = if write {
+                    Some(Err(missing_key_error("SELECT … FOR UPDATE on several shards")))
+                } else {
+                    (keys.groups.len() == 1).then(|| scatter::plan(sel, text, env))
+                };
                 return Ok(Plan::Keyed { groups: keys.groups, write, scatter });
             }
             if single {
                 return Ok(Plan::Keyed { groups: Vec::new(), write, scatter: None });
             }
             if write {
-                return Err(missing_key_error("SELECT … FOR UPDATE"));
+                return Err(missing_key_error("SELECT … FOR UPDATE on several shards"));
             }
             if keys.nested_open || keys.open_groups > 1 || !keys.groups.is_empty() {
                 return Ok(Plan::Scatter(Err(missing_key_error(if keys.open_groups > 1 {
                     "a join of distributed tables that is not on their distribution columns"
                 } else {
-                    "a subquery"
+                    "a subquery or join that reads distributed tables without a condition on their distribution column"
                 }))));
             }
             Ok(Plan::Scatter(scatter::plan(sel, text, env)))
@@ -577,7 +582,7 @@ pub(crate) fn analyze(stmt: &pb::Node, text: &str, env: &Env) -> Result<Plan> {
                         return Ok(Plan::Keyed { groups: keys.groups, write: true, scatter: None });
                     }
                     if keys.nested_open || keys.open_groups > 1 || !keys.groups.is_empty() {
-                        return Err(missing_key_error(what));
+                        return Err(missing_key_error(&format!("{what} that reads other distributed tables without a condition on their distribution column")));
                     }
                     Ok(Plan::WriteAll)
                 }

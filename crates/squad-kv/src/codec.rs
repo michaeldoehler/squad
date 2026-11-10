@@ -10,6 +10,9 @@
 //! encoded keys equals the order of `(user key asc, commit_ts desc)`.
 
 pub(crate) const META_LAST_TS: &[u8] = b"\x00last_ts";
+/// Never stored. A read replica deletes it to keep a batch that became
+/// empty from being skipped by the engine.
+pub(crate) const META_REPLAY_PAD: &[u8] = b"\x00replay_pad";
 pub(crate) const DATA_LO: &[u8] = b"\x01";
 pub(crate) const DATA_HI: &[u8] = b"\x02";
 

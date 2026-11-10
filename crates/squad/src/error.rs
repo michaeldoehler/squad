@@ -206,6 +206,10 @@ impl From<KvError> for Error {
             KvError::SerializationFailure => {
                 Error::new(sqlstate::SERIALIZATION_FAILURE, "could not serialize access due to concurrent update")
             }
+            KvError::SnapshotTooOld => Error::new(
+                sqlstate::SERIALIZATION_FAILURE,
+                "canceling statement due to conflict with recovery: the replica replaced the state this snapshot reads",
+            ),
             KvError::ReadOnly => {
                 Error::new(sqlstate::READ_ONLY_SQL_TRANSACTION, "cannot execute statement in a read-only transaction")
             }

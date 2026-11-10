@@ -260,7 +260,18 @@ fn load_manifest(table: &Table, cx: &ExecCx) -> Result<cs::Manifest> {
 
 fn open_segments(table: &Table, manifest: &cs::Manifest, cx: &ExecCx) -> Result<Vec<Arc<cs::Segment>>> {
     let store = cx.shared.objects();
-    manifest.segments.iter().map(|s| cx.shared.segments.get(&object_key(table.id, &s.id), &*store)).collect()
+    let segments: Result<Vec<_>> =
+        manifest.segments.iter().map(|s| cx.shared.segments.get(&object_key(table.id, &s.id), &*store)).collect();
+    match segments {
+        // A replica reads a manifest the writer has moved past: the
+        // writer deletes a segment as soon as its own state stops naming
+        // it. The statement can be repeated once the replica caught up.
+        Err(e) if e.code() == sqlstate::DATA_CORRUPTED && cx.shared.in_recovery() => Err(Error::new(
+            sqlstate::SERIALIZATION_FAILURE,
+            format!("canceling statement due to conflict with recovery: {}", e.message()),
+        )),
+        other => other,
+    }
 }
 
 /// Positions of the stored columns: table column index → segment column.

@@ -168,6 +168,17 @@ impl Txn {
         }
     }
 
+    /// Passes on the result of an engine read made for this snapshot,
+    /// unless the snapshot was invalidated meanwhile. That only happens
+    /// on a read replica; the check comes after the read because the
+    /// versions disappear after the snapshot is declared too old.
+    fn checked<T>(&self, read: squad_storage::Result<T>) -> Result<T> {
+        if self.snapshot < self.inner.min_snapshot.load(Ordering::Acquire) {
+            return Err(KvError::SnapshotTooOld);
+        }
+        Ok(read?)
+    }
+
     fn track_key(&self, key: &[u8]) {
         if self.isolation == Isolation::Serializable {
             self.reads.lock().keys.insert(key.to_vec());
@@ -188,7 +199,8 @@ impl Txn {
         self.track_key(key);
         let lo = codec::encode(key, self.snapshot);
         let hi = codec::key_end(key);
-        let mut hit = self.inner.engine.scan(Bound::Included(&lo), Bound::Excluded(&hi), false, 1)?;
+        let hit = self.inner.engine.scan(Bound::Included(&lo), Bound::Excluded(&hi), false, 1);
+        let mut hit = self.checked(hit)?;
         Ok(hit.pop().and_then(|(_, v)| codec::decode_value(v)))
     }
 
@@ -343,7 +355,7 @@ impl Txn {
         };
         loop {
             let n = (limit.saturating_sub(out.len())).saturating_mul(2).clamp(2, 4096);
-            let chunk = engine.scan(as_ref(&elo), as_ref(&ehi), reverse, n)?;
+            let chunk = self.checked(engine.scan(as_ref(&elo), as_ref(&ehi), reverse, n))?;
             let short = chunk.len() < n;
             let mut last = None;
             for (ek, ev) in chunk {

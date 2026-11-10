@@ -2,7 +2,7 @@
 //! state shared by all sessions of one database.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,6 +51,15 @@ pub struct Shared {
     /// keep their own reference to the catalog and only go back to the
     /// shared one when this number changes.
     catalog_version: std::sync::atomic::AtomicU64,
+    /// True while this database follows a writer as a read replica.
+    recovery: AtomicBool,
+    /// On a replica, a session holds this shared while it takes a catalog
+    /// and a snapshot, and the apply loop holds it exclusively while it
+    /// makes a schema change visible, so the two always belong together.
+    replay_gate: RwLock<()>,
+    /// The replication machinery, if the database was opened as a
+    /// replica. It stays after promotion.
+    pub(crate) replica: std::sync::OnceLock<crate::replica::Replica>,
 }
 
 fn table_lock_key(id: u32) -> Vec<u8> {
@@ -82,7 +91,74 @@ impl Shared {
                         next_pid: AtomicI32::new(1),
             database_name: database_name.to_string(),
             catalog_version: std::sync::atomic::AtomicU64::new(version),
+            recovery: AtomicBool::new(false),
+            replay_gate: RwLock::new(()),
+            replica: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// True while this database is a read replica that follows a writer.
+    pub fn in_recovery(&self) -> bool {
+        self.recovery.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_recovery(&self, on: bool) -> bool {
+        self.recovery.swap(on, Ordering::AcqRel)
+    }
+
+    /// Fails on a read replica, where nothing may be written.
+    pub(crate) fn check_writable(&self, what: &str) -> Result<()> {
+        if self.in_recovery() {
+            return Err(Error::new(
+                sqlstate::READ_ONLY_SQL_TRANSACTION,
+                format!("cannot execute {what} on a read replica"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Replica: held by a session while it picks a catalog and a snapshot.
+    fn replay_shared(&self) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+        self.in_recovery().then(|| self.replay_gate.read())
+    }
+
+    /// Replica: runs `publish`, which makes a commit visible, together
+    /// with the change of catalog that commit made.
+    pub(crate) fn replay_catalog(&self, catalog: Arc<Catalog>, publish: impl FnOnce()) {
+        let _gate = self.replay_gate.write();
+        publish();
+        let mut current = self.catalog.write();
+        self.catalog_version.store(catalog.version, Ordering::Release);
+        *current = catalog;
+        self.plan_cache.lock().clear();
+    }
+
+    /// Replica: adopts the state of a replaced local copy.
+    pub(crate) fn replay_reload(&self) -> Result<()> {
+        let _gate = self.replay_gate.write();
+        self.store.replay_reset()?;
+        let txn = self.store.begin(Isolation::ReadCommitted);
+        let catalog = match txn.get(CATALOG_KEY)? {
+            Some(bytes) => Catalog::from_bytes(&bytes)?,
+            None => Catalog::bootstrap(),
+        };
+        drop(txn);
+        let mut current = self.catalog.write();
+        self.catalog_version.store(catalog.version, Ordering::Release);
+        *current = Arc::new(catalog);
+        self.plan_cache.lock().clear();
+        Ok(())
+    }
+
+    /// The node stopped being a replica: forget what was derived from a
+    /// state that only the writer changed.
+    pub(crate) fn replay_finished(&self) {
+        if self.set_recovery(false) {
+            self.store.replay_finish();
+            self.sequences.lock().clear();
+            self.delta_rows.lock().clear();
+            self.plan_cache.lock().clear();
+        }
     }
 
         /// The object store holding the segments of columnar tables.
@@ -118,6 +194,7 @@ impl Shared {
         cache: i64,
         name: &str,
     ) -> Result<i64> {
+        self.check_writable("nextval()")?;
         let mut seqs = self.sequences.lock();
         let state = match seqs.entry(id) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -179,6 +256,7 @@ impl Shared {
                 ),
             ));
         }
+        self.check_writable("setval()")?;
         let mut seqs = self.sequences.lock();
         let hwm = if is_called { value } else { value.saturating_sub(seq.increment) };
         let mut txn = self.store.begin(Isolation::ReadCommitted);
@@ -190,6 +268,7 @@ impl Shared {
 
     /// Forgets a counter's state (new or dropped sequence, truncated table).
     pub fn reset_counter(&self, id: u32) -> Result<()> {
+        self.check_writable("a sequence change")?;
         let mut seqs = self.sequences.lock();
         seqs.remove(&id);
         let mut txn = self.store.begin(Isolation::ReadCommitted);
@@ -748,6 +827,8 @@ impl Session {
             self.begin(None, false)?;
             return Ok(self.txn.as_mut().unwrap());
         }
+        let shared = self.shared.clone();
+        let _gate = shared.replay_shared();
         let latest = self.latest_catalog();
         let t = self.txn.as_mut().unwrap();
         t.txn.refresh_snapshot();
@@ -807,15 +888,21 @@ impl Session {
 
     pub(crate) fn begin(&mut self, isolation: Option<Isolation>, explicit: bool) -> Result<()> {
                 let isolation = isolation.unwrap_or(self.state.default_isolation);
+        let shared = self.shared.clone();
+        let recovery = shared.in_recovery();
+        let gate = shared.replay_shared();
                 let catalog = self.latest_catalog();
         // Reuse the previous transaction object where there is one.
-        let txn = match self.spare_txn.take() {
+        let mut txn = match self.spare_txn.take() {
             Some(mut txn) => {
                 txn.restart(isolation);
                 txn
             }
             None => self.shared.store.begin(isolation),
         };
+        drop(gate);
+        // A replica only reads.
+        txn.set_read_only(recovery);
         self.txn = Some(TxnState {
             txn,
             catalog,
@@ -878,6 +965,7 @@ impl Session {
     /// Moves the delta of a columnar table into a segment and merges
     /// small segments. Returns the number of rows moved.
     pub fn compact_table(&mut self, table_id: u32) -> Result<u64> {
+        self.shared.check_writable("compaction")?;
         if self.txn.is_some() {
             return Err(Error::new(sqlstate::ACTIVE_SQL_TRANSACTION, "compaction cannot run inside a transaction block"));
         }

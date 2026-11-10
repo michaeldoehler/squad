@@ -2223,7 +2223,7 @@ fn transaction(sess: &mut Session, stmt: &pb::TransactionStmt) -> Result<QueryRe
                 None => sess.begin(isolation, true)?,
             }
             if let Some(t) = &mut sess.txn {
-                t.txn.set_read_only(read_only);
+                t.txn.set_read_only(read_only || sess.shared.in_recovery());
             }
             done("BEGIN")
         }
@@ -2327,8 +2327,15 @@ fn set_variable(sess: &mut Session, stmt: &pb::VariableSetStmt) -> Result<QueryR
                         }
                     }
                     "transaction_read_only" => {
+                        let read_only = matches!(value.as_str(), "1" | "on" | "true");
+                        if !read_only && sess.shared.in_recovery() {
+                            return Err(Error::new(
+                                sqlstate::READ_ONLY_SQL_TRANSACTION,
+                                "cannot set transaction read-write mode on a read replica",
+                            ));
+                        }
                         if let Some(t) = &mut sess.txn {
-                            t.txn.set_read_only(matches!(value.as_str(), "1" | "on" | "true"));
+                            t.txn.set_read_only(read_only);
                         }
                     }
                     _ => {}
@@ -2497,6 +2504,7 @@ pub(crate) fn run_utility(sess: &mut Session, stmt: &N, _params: &[Value]) -> Re
                 ));
             }
             if s.is_vacuumcmd {
+                sess.shared.check_writable("VACUUM")?;
                 sess.shared.store.gc()?;
                 // For columnar tables VACUUM moves the delta into segments
                 // and merges small segments.

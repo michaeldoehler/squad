@@ -71,7 +71,25 @@ pub(crate) struct Inner {
     pub(crate) serializable_live: AtomicUsize,
     /// Write sets of recent commits, for serializable validation.
     pub(crate) recent: Mutex<VecDeque<CommitRecord>>,
+    /// Snapshots below this timestamp can no longer be read. Stays zero
+    /// except on a read replica.
+    pub(crate) min_snapshot: AtomicU64,
+    /// Read replica only: version removals shipped by the writer that
+    /// wait until no local snapshot needs the versions.
+    pub(crate) deferred: Mutex<Deferred>,
 }
+
+/// Removals a replica has not applied yet, oldest first: the timestamp
+/// from which on no snapshot reads the versions, and their engine keys.
+#[derive(Default)]
+pub(crate) struct Deferred {
+    queue: VecDeque<(u64, Vec<Vec<u8>>)>,
+    keys: usize,
+}
+
+/// A replica keeps at most this many removals waiting for its readers.
+/// Beyond it the oldest snapshots are invalidated instead.
+const MAX_DEFERRED_KEYS: usize = 1 << 20;
 
 impl Inner {
         /// Takes a snapshot at the latest commit and registers it so that the
@@ -181,7 +199,119 @@ impl Store {
                 next_txn_id: AtomicU64::new(1),
                 serializable_live: AtomicUsize::new(0),
                 recent: Mutex::new(VecDeque::new()),
+                min_snapshot: AtomicU64::new(0),
+                deferred: Mutex::new(Deferred::default()),
             }),
+        })
+    }
+
+    // -----------------------------------------------------------------
+    // Read replicas
+    //
+    // A replica does not commit. It receives the engine batches of the
+    // writer's commits, in order, writes each to its own engine and then
+    // moves the timestamp new snapshots read at. The batch of a commit
+    // carries that commit's timestamp, so the versions it adds stay
+    // invisible until then: a batch becomes visible as a whole.
+    // -----------------------------------------------------------------
+
+    /// Prepares a batch shipped by the writer for the local engine and
+    /// returns it with the commit timestamp it carries, if it is a commit.
+    ///
+    /// The writer removes versions that none of *its* snapshots read. A
+    /// snapshot here may be older, so removals are taken out of the batch
+    /// and added to a later one, once every local snapshot is at least as
+    /// new as the state the removals were shipped in. If more than about
+    /// a million removals pile up behind a long-running reader, snapshots
+    /// older than the oldest removals are invalidated instead and their
+    /// reads fail with [`KvError::SnapshotTooOld`](crate::KvError).
+    pub fn replay_prepare(&self, mut batch: WriteBatch) -> (WriteBatch, Option<u64>) {
+        let inner = &self.inner;
+        let mut commit_ts = None;
+        let mut removed = Vec::new();
+        batch.ops.retain_mut(|(key, value)| match value {
+            None if key.first() == Some(&codec::DATA_LO[0]) => {
+                removed.push(std::mem::take(key));
+                false
+            }
+            Some(v) if key.as_slice() == codec::META_LAST_TS && v.len() == 8 => {
+                commit_ts = Some(u64::from_be_bytes(v.as_slice().try_into().unwrap()));
+                true
+            }
+            _ => true,
+        });
+        let mut deferred = inner.deferred.lock();
+        if !removed.is_empty() {
+            // Everything the writer removed was shadowed for snapshots at
+            // or after the state before this batch.
+            deferred.keys += removed.len();
+            deferred.queue.push_back((inner.last_committed.load(Ordering::SeqCst), removed));
+        }
+        let mut horizon = inner.oldest_snapshot();
+        loop {
+            match deferred.queue.front() {
+                Some((needed, _)) if *needed <= horizon => {}
+                Some((needed, _)) if deferred.keys > MAX_DEFERRED_KEYS => {
+                    inner.min_snapshot.fetch_max(*needed, Ordering::AcqRel);
+                    horizon = horizon.max(*needed);
+                }
+                _ => break,
+            }
+            let (_, keys) = deferred.queue.pop_front().unwrap();
+            deferred.keys -= keys.len();
+            for key in keys {
+                batch.delete(key);
+            }
+        }
+        if batch.is_empty() {
+            // The local engine must give this batch the log position the
+            // writer gave it, which an empty batch would not take up.
+            batch.delete(codec::META_REPLAY_PAD.to_vec());
+        }
+        (batch, commit_ts)
+    }
+
+    /// Makes the commit with timestamp `ts`, whose batch is in the
+    /// engine, visible to new snapshots.
+    pub fn replay_publish(&self, ts: u64) {
+        self.inner.last_committed.fetch_max(ts, Ordering::SeqCst);
+    }
+
+    /// Invalidates every snapshot: the engine's contents are about to be
+    /// replaced by a newer state. Reads fail with
+    /// [`KvError::SnapshotTooOld`](crate::KvError) until
+    /// [`replay_reset`](Store::replay_reset).
+    pub fn replay_invalidate(&self) {
+        self.inner.min_snapshot.store(u64::MAX, Ordering::Release);
+    }
+
+    /// Adopts the state now in the engine: new snapshots read at its last
+    /// commit, older ones stay invalid.
+    pub fn replay_reset(&self) -> Result<()> {
+        let inner = &self.inner;
+        let last = match inner.engine.get(codec::META_LAST_TS)? {
+            Some(v) if v.len() == 8 => u64::from_be_bytes(v.try_into().unwrap()),
+            _ => 0,
+        };
+        *inner.deferred.lock() = Deferred::default();
+        inner.last_committed.fetch_max(last, Ordering::SeqCst);
+        inner.min_snapshot.store(inner.last_committed.load(Ordering::SeqCst), Ordering::Release);
+        Ok(())
+    }
+
+    /// Forgets the removals a replica was holding back. After promotion
+    /// the versions are found again by [`gc`](Store::gc).
+    pub fn replay_finish(&self) {
+        *self.inner.deferred.lock() = Deferred::default();
+    }
+
+    /// The value `batch` stores for user key `key`: `Some(None)` if the
+    /// batch deletes the key, `None` if it does not touch it.
+    pub fn replayed_value(batch: &WriteBatch, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        let start = codec::key_start(key);
+        batch.ops.iter().find_map(|(k, v)| match v {
+            Some(v) if codec::same_key(k, &start) => Some(codec::decode_value(v.clone())),
+            _ => None,
         })
     }
 

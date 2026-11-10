@@ -82,6 +82,8 @@ pub(crate) fn catalog_fn_type(name: &str, args: usize) -> Option<Type> {
         ("pg_relation_filenode" | "pg_sequence_last_value", 1) => Type::Int8,
         ("pg_size_pretty", 1) => Type::Text,
         ("pg_is_in_recovery", 0) => Type::Bool,
+        ("squad_promote", 0) | ("pg_promote", 0..=2) => Type::Bool,
+        ("squad_replication_status", 0) => Type::Jsonb,
         ("pg_postmaster_start_time" | "pg_conf_load_time", 0) => Type::TimestampTz,
         ("pg_my_temp_schema", 0) => Type::Int8,
         ("pg_current_xact_id", 0) => Type::Int8,
@@ -403,7 +405,16 @@ pub(crate) fn catalog_fn(name: &str, args: Vec<Value>, cx: &mut ExecCx) -> Resul
                 },
             }),
         },
-        "pg_is_other_temp_schema" | "pg_relation_is_publishable" | "pg_is_in_recovery" => Value::Bool(false),
+        "pg_is_other_temp_schema" | "pg_relation_is_publishable" => Value::Bool(false),
+        "pg_is_in_recovery" => Value::Bool(cx.shared.in_recovery()),
+        "squad_promote" | "pg_promote" => {
+            crate::replica::promote(cx.shared)?;
+            Value::Bool(true)
+        }
+        "squad_replication_status" => match crate::replica::status(cx.shared) {
+            Some(status) => Value::Jsonb(Box::new(status.to_json())),
+            None => Value::Null,
+        },
         n if n.ends_with("_is_visible") || n.starts_with("has_") || n == "pg_has_role" => Value::Bool(true),
 
         // ---- sizes and server facts ---------------------------------------

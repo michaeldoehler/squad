@@ -40,6 +40,7 @@ pub mod exec;
 mod explain;
 pub mod expr;
 pub mod plan;
+mod replica;
 pub mod session;
 mod system;
 pub mod types;
@@ -49,6 +50,7 @@ pub use api::{Config, Connection, Database, Row, RowIndex, Statement, Transactio
 pub use bind::OutputColumn;
 pub use convert::{FromSql, ToSql};
 pub use error::{sqlstate, Error, Result};
+pub use replica::{ReplicaConfig, ReplicationRole, ReplicationStatus};
 pub use session::{QueryResult, Session, TxnStatus};
 pub use squad_storage::{RemoteConfig, RemoteSync, SyncMode, VerifyReport};
 
