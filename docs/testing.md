@@ -9,7 +9,7 @@ version 0.1; "run on demand" suites are not part of `cargo test`.
 | --- | --- | --- |
 | Does SQL behave like PostgreSQL? | SQL regression suite | 12 scripts, ~580 statements, output identical to PostgreSQL 16 |
 | | sqllogictest, own suite | 468 records with results from PostgreSQL 16 |
-| | sqllogictest, public corpus (on demand) | 5.66 M records: 99.80 % pass; differs from PostgreSQL 16 on 6 |
+| | sqllogictest, public corpus (on demand) | 5,663,445 of 5,675,004 records pass (99.80 %); differs from PostgreSQL 16 on 6 |
 | | Differential fuzzer (on demand) | ~1.3 M random statements against PostgreSQL 16 |
 | | Value semantics | several hundred expected values taken from PostgreSQL 16 |
 | Do real tools and drivers work? | Server integration tests | psql, pgbench, pg_dump output, tokio-postgres, sqlx |

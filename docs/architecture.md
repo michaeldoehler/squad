@@ -109,7 +109,10 @@ databases.
 - **Parser.** squad embeds the PostgreSQL parser itself (libpg_query via
   the `pg_query` crate). Whatever Postgres parses, squad parses, with the
   same precedence and the same error positions. The price is a C
-  dependency in the build.
+  dependency in the build. The bundled parser is PostgreSQL 18's, while
+  behaviour is verified against PostgreSQL 16: syntax that only newer
+  versions accept is parsed, and then either supported or rejected with
+  `0A000` like any other unsupported feature.
 - **Catalog.** Schemas, tables, indexes, sequences, views and enum types
   form one immutable snapshot that is stored as a single record. DDL
   writes a modified copy inside the surrounding transaction, so DDL is

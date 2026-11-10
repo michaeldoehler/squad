@@ -175,7 +175,7 @@ squad's reference is PostgreSQL 16 itself. → [testing](docs/testing.md)
 
 - **SQL regression suite**: scripts whose expected output was produced
   by PostgreSQL; squad must print the same, byte for byte.
-- **sqllogictest**: 99.80 % of the public corpus (5.66 million records);
+- **sqllogictest**: 99.80 % of the public corpus (5.68 million records);
   squad and PostgreSQL disagree on 6 records.
 - **Differential fuzzing**: about 1.3 million random statements run
   against squad and PostgreSQL and compared.
