@@ -436,6 +436,46 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// `oid_column = $1`: an untyped parameter compared with a column of
+    /// an alias type (`oid`, `"char"`) is described to the client with
+    /// that type, as PostgreSQL does. Drivers that look up types in
+    /// `pg_type` send the OID in the binary format of `oid`.
+    fn adopt_alias_type(&mut self, column: Option<&pb::Node>, param: Option<&pb::Node>, scope: &Scope) {
+        let (Some(N::ColumnRef(c)), Some(N::ParamRef(p))) =
+            (column.and_then(|n| n.node.as_ref()), param.and_then(|n| n.node.as_ref()))
+        else {
+            return;
+        };
+        if p.number < 1 {
+            return;
+        }
+        let parts: Vec<&str> = c
+            .fields
+            .iter()
+            .filter_map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        let (table, name) = match parts.as_slice() {
+            [name] if c.fields.len() == 1 => (None, *name),
+            [.., table, name] if parts.len() == c.fields.len() => (Some(*table), *name),
+            _ => return,
+        };
+        let Ok(Some(Found::Col(i))) = lookup(scope, table, name) else { return };
+        let ty = &scope.cols[i].ty;
+        if *ty == ty.base() {
+            return;
+        }
+        let at = p.number as usize - 1;
+        if self.param_types.len() <= at {
+            self.param_types.resize(at + 1, None);
+        }
+        if self.param_types[at].is_none() {
+            self.param_types[at] = Some(ty.clone());
+        }
+    }
+
     fn bind_column(&mut self, c: &pb::ColumnRef, scope: &Scope) -> Result<Typed> {
         let mut parts = Vec::with_capacity(c.fields.len());
         for f in &c.fields {
@@ -545,6 +585,10 @@ impl<'a> Binder<'a> {
         let rexpr = e.rexpr.as_ref().ok_or_else(|| Error::internal("operator without right operand"))?;
         match kind {
             K::AexprOp | K::AexprLike | K::AexprIlike | K::AexprSimilar => {
+                if op == "=" {
+                    self.adopt_alias_type(e.lexpr.as_deref(), Some(rexpr), scope);
+                    self.adopt_alias_type(Some(rexpr), e.lexpr.as_deref(), scope);
+                }
                 let l = left(self)?;
                 let r = self.bind_expr(rexpr, scope)?;
                 self.bind_op(&op, l, r)
