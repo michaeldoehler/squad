@@ -459,10 +459,56 @@ struct Pending {
 }
 
 #[derive(Default)]
-struct SnapshotState {
+pub(crate) struct SnapshotState {
     lsn: u64,
     /// Chunks referenced by the newest manifest.
     chunks: HashSet<String>,
+}
+
+impl SnapshotState {
+    /// What the newest snapshot named by `state` consists of.
+    pub(crate) fn load(store: &dyn ObjectStore, state: &RemoteState) -> Result<SnapshotState> {
+        let mut snapshot = SnapshotState::default();
+        if let Some((e, lsn)) = state.snapshot {
+            if let Some(m) = store.get(&snapshot_key(e, lsn)).map_err(remote_err)?.and_then(|b| Manifest::decode(&b)) {
+                snapshot.lsn = m.lsn;
+                snapshot.chunks = m.chunks.into_iter().map(|c| c.0).collect();
+            }
+        }
+        Ok(snapshot)
+    }
+}
+
+/// Claims the next free writer epoch.
+pub(crate) fn claim_epoch(store: &dyn ObjectStore) -> Result<u64> {
+    let mut epoch = max_claim(store)? + 1;
+    while !store.put_if_absent(&claim_key(epoch), b"squad writer\n").map_err(remote_err)? {
+        epoch += 1;
+    }
+    Ok(epoch)
+}
+
+/// Epoch in which the history of the database in `dir` ends, if the
+/// directory was ever tied to an object store.
+pub(crate) fn read_marker(opts: &DiskOptions, dir: &Path) -> Result<Option<u64>> {
+    let vfs = &opts.vfs;
+    let marker = dir.join(MARKER_FILE);
+    if !vfs.exists(&marker)? {
+        return Ok(None);
+    }
+    let f = vfs.open(&marker)?;
+    let mut buf = vec![0u8; f.size()? as usize];
+    let n = f.read_at(&mut buf, 0)?;
+    Ok(String::from_utf8_lossy(&buf[..n]).trim().parse::<u64>().ok())
+}
+
+pub(crate) fn write_marker(opts: &DiskOptions, dir: &Path, epoch: u64) -> Result<()> {
+    let vfs = &opts.vfs;
+    let f = vfs.create(&dir.join(MARKER_FILE))?;
+    f.write_at(epoch.to_string().as_bytes(), 0)?;
+    f.sync()?;
+    vfs.sync_dir(dir)?;
+    Ok(())
 }
 
 struct Shared {
@@ -605,19 +651,25 @@ impl Shared {
         })();
         let _ = cleanup();
         let manifest = result?;
+        let previous = snap.lsn;
         snap.lsn = manifest.lsn;
         snap.chunks = manifest.chunks.iter().map(|c| c.0.clone()).collect();
         self.wal_bytes_since_snapshot.store(0, Ordering::Relaxed);
         self.pending.lock().overflowed = false;
         self.shipped_lsn.fetch_max(manifest.lsn, Ordering::AcqRel);
         // Failing to clean up only leaves garbage behind.
-        let _ = self.collect_garbage(&manifest);
+        let _ = self.collect_garbage(&manifest, previous);
         Ok(())
     }
 
-    /// Deletes everything the newest snapshot makes unnecessary: older
-    /// manifests first, then unreferenced chunks and covered log objects.
-    fn collect_garbage(&self, newest: &Manifest) -> Result<()> {
+    /// Deletes what the newest snapshot makes unnecessary: older manifests
+    /// first, then unreferenced chunks and old log objects.
+    ///
+    /// Log objects are kept one snapshot longer than a restore needs them
+    /// (up to `retain_from`, the LSN of the snapshot before the newest):
+    /// a read replica that was following the log when the snapshot was
+    /// taken can then finish reading it instead of downloading the image.
+    fn collect_garbage(&self, newest: &Manifest, retain_from: u64) -> Result<()> {
         self.check_fence()?;
         let keep = snapshot_key(self.epoch, newest.lsn);
         for meta in self.store.list("snapshot/").map_err(remote_err)? {
@@ -632,7 +684,8 @@ impl Shared {
             }
         }
         for meta in self.store.list("wal/").map_err(remote_err)? {
-            let covered = meta.key.rsplit('/').next().and_then(pair).is_some_and(|(_, last)| last <= newest.lsn);
+            let horizon = retain_from.min(newest.lsn);
+            let covered = meta.key.rsplit('/').next().and_then(pair).is_some_and(|(_, last)| last <= horizon);
             if covered {
                 self.store.delete(&meta.key).map_err(remote_err)?;
             }
@@ -686,23 +739,10 @@ impl TieredEngine {
         // Claim the next epoch first: everything a previous writer uploads
         // from now on either is visible to the listing below or fails that
         // writer's fence check.
-        let mut epoch = read_remote(&*store)?.max_claim + 1;
-        while !store.put_if_absent(&claim_key(epoch), b"squad writer\n").map_err(remote_err)? {
-            epoch += 1;
-        }
+        let epoch = claim_epoch(&*store)?;
         let mut state = read_remote(&*store)?;
         let remote_epoch = state.epochs.last().map(|e| e.0);
-
-        let marker = dir.join(MARKER_FILE);
-        let local_epoch = match vfs.exists(&marker)? {
-            true => {
-                let f = vfs.open(&marker)?;
-                let mut buf = vec![0u8; f.size()? as usize];
-                let n = f.read_at(&mut buf, 0)?;
-                String::from_utf8_lossy(&buf[..n]).trim().parse::<u64>().ok()
-            }
-            false => None,
-        };
+        let local_epoch = read_marker(&opts, dir)?;
 
         let mut needs_snapshot = false;
         let disk = if dir_is_empty(&opts, dir)? {
@@ -742,29 +782,42 @@ impl TieredEngine {
 
         // From here on this writer's uploads count.
         store.put(&base_key(epoch), disk.last_lsn().to_string().as_bytes()).map_err(remote_err)?;
-        let f = vfs.create(&marker)?;
-        f.write_at(epoch.to_string().as_bytes(), 0)?;
-        f.sync()?;
-        vfs.sync_dir(dir)?;
-
-        let mut snapshot = SnapshotState::default();
-        if let Some((e, lsn)) = state.snapshot {
-            if let Some(m) = store.get(&snapshot_key(e, lsn)).map_err(remote_err)?.and_then(|b| Manifest::decode(&b)) {
-                snapshot.lsn = m.lsn;
-                snapshot.chunks = m.chunks.into_iter().map(|c| c.0).collect();
-            }
+        write_marker(&opts, dir, epoch)?;
+        if vfs.exists(&dir.join(REPLICA_FILE))? {
+            // The directory was a replica's working copy until now.
+            vfs.remove(&dir.join(REPLICA_FILE))?;
+            vfs.sync_dir(dir)?;
         }
-        let shipped = disk.last_lsn();
+        let snapshot = SnapshotState::load(&*store, &state)?;
+        let shipped = if needs_snapshot { state.lsn.min(disk.last_lsn()) } else { disk.last_lsn() };
+        let engine = TieredEngine::start(disk, dir, opts, config, epoch, snapshot, shipped)?;
+        if needs_snapshot {
+            engine.shared.snapshot()?;
+        }
+        Ok(engine)
+    }
+
+    /// Starts shipping for a local engine whose epoch is established in
+    /// the object store.
+    pub(crate) fn start(
+        disk: DiskEngine,
+        dir: &Path,
+        opts: DiskOptions,
+        config: RemoteConfig,
+        epoch: u64,
+        snapshot: SnapshotState,
+        shipped: u64,
+    ) -> Result<TieredEngine> {
         let shared = Arc::new(Shared {
             disk,
-            store,
+            store: config.store.clone(),
             dir: dir.to_path_buf(),
             opts,
             epoch,
             write_lock: Mutex::new(()),
             pending: Mutex::new(Pending::default()),
             ship_lock: Mutex::new(()),
-            shipped_lsn: AtomicU64::new(if needs_snapshot { state.lsn.min(shipped) } else { shipped }),
+            shipped_lsn: AtomicU64::new(shipped),
             wal_bytes_since_snapshot: AtomicU64::new(0),
             snapshot: Mutex::new(snapshot),
             fenced: AtomicBool::new(false),
@@ -772,9 +825,6 @@ impl TieredEngine {
             stats: Mutex::new(RemoteStats { epoch, ..RemoteStats::default() }),
             config,
         });
-        if needs_snapshot {
-            shared.snapshot()?;
-        }
         let interval = match shared.config.mode {
             RemoteSync::Async { interval } => interval.max(Duration::from_millis(1)),
             // Only snapshots happen in the background.
