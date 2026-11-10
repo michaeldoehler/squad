@@ -1,7 +1,7 @@
 //! Behaviour of a cluster: metadata, routing, bulk inserts, transactions,
 //! what is rejected, and how errors of a shard surface.
 
-use squad::{Value, ToSql};
+use squad::{ToSql, Value};
 use squad_cluster::{Cluster, ClusterConfig, ClusterConnection, ShardSpec, TableClass};
 
 const SCHEMA: &str = "
@@ -26,7 +26,9 @@ fn rows_per_shard(cluster: &Cluster, table: &str) -> Vec<i64> {
     cluster
         .shards()
         .iter()
-        .map(|s| s.database().unwrap().connect().query_one(&format!("SELECT count(*) FROM {table}"), &[]).unwrap().get(0))
+        .map(|s| {
+            s.database().unwrap().connect().query_one(&format!("SELECT count(*) FROM {table}"), &[]).unwrap().get(0)
+        })
         .collect()
 }
 
@@ -36,7 +38,11 @@ fn assert_placement(cluster: &Cluster) {
         let conn = shard.database().unwrap().connect();
         for table in ["users", "events"] {
             for row in conn.query(&format!("SELECT DISTINCT project_id FROM {table}"), &[]).unwrap() {
-                assert_eq!(cluster.shard_for_table(table, &row.values()[0]).unwrap(), shard.index(), "{table}: row on the wrong shard");
+                assert_eq!(
+                    cluster.shard_for_table(table, &row.values()[0]).unwrap(),
+                    shard.index(),
+                    "{table}: row on the wrong shard"
+                );
             }
         }
     }
@@ -97,7 +103,8 @@ fn cluster_is_recorded_on_its_shards_and_checked_on_open() {
     }
     // Fewer shards, more shards, another order: refused.
     for order in [&[0usize, 1][..], &[0, 1, 2, 3], &[1, 0, 2], &[0, 2, 1]] {
-        let err = Cluster::open(ClusterConfig::new(specs(order))).err().unwrap_or_else(|| panic!("{order:?} was accepted"));
+        let err =
+            Cluster::open(ClusterConfig::new(specs(order))).err().unwrap_or_else(|| panic!("{order:?} was accepted"));
         assert_eq!(err.code(), squad::sqlstate::INVALID_PARAMETER_VALUE, "{order:?}: {err}");
     }
     // A refused open leaves the shards as they were. (Shard 3 was created
@@ -168,11 +175,13 @@ fn schema_changes_reach_every_shard() {
     for shard in cluster.shards() {
         let c = shard.database().unwrap().connect();
         c.query("SELECT country FROM users", &[]).unwrap();
-        let n: i64 = c.query_one("SELECT count(*) FROM pg_indexes WHERE indexname = 'users_email'", &[]).unwrap().get(0);
+        let n: i64 =
+            c.query_one("SELECT count(*) FROM pg_indexes WHERE indexname = 'users_email'", &[]).unwrap().get(0);
         assert_eq!(n, 1);
     }
     // A cached plan does not survive a schema change.
-    conn.execute("INSERT INTO users (project_id, id, country) VALUES (1, 1, 'fr'), (2, 1, 'fr'), (3, 1, 'it')", &[]).unwrap();
+    conn.execute("INSERT INTO users (project_id, id, country) VALUES (1, 1, 'fr'), (2, 1, 'fr'), (3, 1, 'it')", &[])
+        .unwrap();
     let q = "SELECT country, count(*) FROM users GROUP BY country ORDER BY 1";
     assert_eq!(conn.query(q, &[]).unwrap().len(), 2);
     conn.batch_execute("ALTER TABLE users DROP COLUMN country").unwrap();
@@ -209,21 +218,34 @@ fn schema_changes_reach_every_shard() {
 fn statements_with_a_key_run_on_one_shard() {
     let (cluster, conn) = memory(4);
     let (a, b) = two_tenants(&cluster);
-    conn.execute("INSERT INTO users VALUES ($1, 1, 'a1', 1, 10), ($1, 2, 'a2', 2, 20), ($2, 1, 'b1', 1, 30)", &[&a, &b]).unwrap();
-    conn.execute("INSERT INTO events VALUES ($1, 1, 'click', 1.5, now()), ($2, 1, 'click', 2.5, now())", &[&a, &b]).unwrap();
+    conn.execute(
+        "INSERT INTO users VALUES ($1, 1, 'a1', 1, 10), ($1, 2, 'a2', 2, 20), ($2, 1, 'b1', 1, 30)",
+        &[&a, &b],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO events VALUES ($1, 1, 'click', 1.5, now()), ($2, 1, 'click', 2.5, now())", &[&a, &b])
+        .unwrap();
     conn.execute("INSERT INTO plans VALUES (1, 'free'), (2, 'team')", &[]).unwrap();
     assert_placement(&cluster);
 
     // Remove tenant b's shard from the picture: statements for tenant a
     // must not notice, statements that need b's shard must see the hole.
     let shard_b = cluster.shard_for(&Value::Int8(b));
-    cluster.shards()[shard_b].database().unwrap().connect().batch_execute("DELETE FROM users; DELETE FROM events").unwrap();
+    cluster.shards()[shard_b]
+        .database()
+        .unwrap()
+        .connect()
+        .batch_execute("DELETE FROM users; DELETE FROM events")
+        .unwrap();
 
     let n: i64 = conn.query_one("SELECT count(*) FROM users WHERE project_id = $1", &[&a]).unwrap().get(0);
     assert_eq!(n, 2);
     let n: i64 = conn.query_one(&format!("SELECT count(*) FROM users WHERE project_id = {a}"), &[]).unwrap().get(0);
     assert_eq!(n, 2);
-    let n: i64 = conn.query_one(&format!("SELECT count(*) FROM users WHERE {a}::bigint = users.project_id AND score > 5"), &[]).unwrap().get(0);
+    let n: i64 = conn
+        .query_one(&format!("SELECT count(*) FROM users WHERE {a}::bigint = users.project_id AND score > 5"), &[])
+        .unwrap()
+        .get(0);
     assert_eq!(n, 2);
     let n: i64 = conn.query_one("SELECT count(*) FROM users WHERE project_id = $1", &[&b]).unwrap().get(0);
     assert_eq!(n, 0);
@@ -279,7 +301,9 @@ fn inserts_are_split_by_shard() {
     assert_eq!(rows_per_shard(&cluster, "users").iter().sum::<i64>(), 6);
     assert_placement(&cluster);
     // RETURNING comes back from every shard.
-    let rows = conn.query("INSERT INTO users (project_id, id) VALUES (10, 1), (11, 1), (12, 1), (13, 1) RETURNING project_id", &[]).unwrap();
+    let rows = conn
+        .query("INSERT INTO users (project_id, id) VALUES (10, 1), (11, 1), (12, 1), (13, 1) RETURNING project_id", &[])
+        .unwrap();
     let mut keys: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
     keys.sort();
     assert_eq!(keys, vec![10, 11, 12, 13]);
@@ -321,35 +345,68 @@ fn bulk_insert() {
     let per_shard = rows_per_shard(&cluster, "events");
     assert_eq!(per_shard.iter().sum::<i64>(), 20_000);
     assert!(per_shard.iter().all(|n| *n > 1000), "{per_shard:?}");
-    let row = conn.query_one("SELECT count(*), count(user_id), sum(value), count(DISTINCT project_id), min(at)::text FROM events", &[]).unwrap();
+    let row = conn
+        .query_one(
+            "SELECT count(*), count(user_id), sum(value), count(DISTINCT project_id), min(at)::text FROM events",
+            &[],
+        )
+        .unwrap();
     assert_eq!(row.get::<i64>(0), 20_000);
     assert_eq!(row.get::<i64>(1), 18_000);
     assert_eq!(row.get::<f64>(2), (0..20_000).map(|i| i as f64 * 0.5).sum::<f64>());
     assert_eq!(row.get::<i64>(3), 97);
     assert_eq!(row.get::<String>(4), "2026-03-01 12:00:00+00");
-    let n: i64 = conn.query_one("SELECT count(*) FROM events WHERE project_id = 5 AND name = 'click'", &[]).unwrap().get(0);
+    let n: i64 =
+        conn.query_one("SELECT count(*) FROM events WHERE project_id = 5 AND name = 'click'", &[]).unwrap().get(0);
     assert_eq!(n, (0..20_000).filter(|i| i % 97 == 5 && i % 3 == 1).count() as i64);
 
     // A subset of the columns, in another order.
-    conn.insert_rows("users", &["id", "project_id"], (0..300).map(|i| vec![Value::Int4(i), Value::Int8((i % 7) as i64)]).collect()).unwrap();
+    conn.insert_rows(
+        "users",
+        &["id", "project_id"],
+        (0..300).map(|i| vec![Value::Int4(i), Value::Int8((i % 7) as i64)]).collect(),
+    )
+    .unwrap();
     assert_eq!(rows_per_shard(&cluster, "users").iter().sum::<i64>(), 300);
     assert_placement(&cluster);
 
     // Reference tables receive every row on every shard.
-    let n = conn.insert_rows("plans", &["id", "label"], (0..50).map(|i| vec![Value::Int4(i), Value::Text(format!("p{i}"))]).collect()).unwrap();
+    let n = conn
+        .insert_rows(
+            "plans",
+            &["id", "label"],
+            (0..50).map(|i| vec![Value::Int4(i), Value::Text(format!("p{i}"))]).collect(),
+        )
+        .unwrap();
     assert_eq!(n, 50);
     assert_eq!(rows_per_shard(&cluster, "plans"), vec![50; 4]);
 
     // Errors.
     assert_eq!(conn.insert_rows("events", &["project_id"], Vec::new()).unwrap(), 0);
-    assert_eq!(code(conn.insert_rows("events", &["name"], vec![vec![Value::Text("x".into())]])), squad::sqlstate::FEATURE_NOT_SUPPORTED);
-    assert_eq!(code(conn.insert_rows("events", &["project_id", "name"], vec![vec![Value::Int8(1)]])), squad::sqlstate::SYNTAX_ERROR);
-    assert_eq!(code(conn.insert_rows("events", &["project_id", "nope"], vec![vec![Value::Int8(1), Value::Null]])), squad::sqlstate::UNDEFINED_COLUMN);
-    assert_eq!(code(conn.insert_rows("events", &["project_id"], vec![vec![Value::Null]])), squad::sqlstate::NOT_NULL_VIOLATION);
+    assert_eq!(
+        code(conn.insert_rows("events", &["name"], vec![vec![Value::Text("x".into())]])),
+        squad::sqlstate::FEATURE_NOT_SUPPORTED
+    );
+    assert_eq!(
+        code(conn.insert_rows("events", &["project_id", "name"], vec![vec![Value::Int8(1)]])),
+        squad::sqlstate::SYNTAX_ERROR
+    );
+    assert_eq!(
+        code(conn.insert_rows("events", &["project_id", "nope"], vec![vec![Value::Int8(1), Value::Null]])),
+        squad::sqlstate::UNDEFINED_COLUMN
+    );
+    assert_eq!(
+        code(conn.insert_rows("events", &["project_id"], vec![vec![Value::Null]])),
+        squad::sqlstate::NOT_NULL_VIOLATION
+    );
     assert_eq!(code(conn.insert_rows("missing", &["a"], vec![vec![Value::Int8(1)]])), squad::sqlstate::UNDEFINED_TABLE);
     // A primary key violation on one shard; the other shards keep their rows.
     let err = conn
-        .insert_rows("users", &["project_id", "id"], (0..7).map(|t| vec![Value::Int8(t), Value::Int4(if t == 3 { 3 } else { 1000 })]).collect())
+        .insert_rows(
+            "users",
+            &["project_id", "id"],
+            (0..7).map(|t| vec![Value::Int8(t), Value::Int4(if t == 3 { 3 } else { 1000 })]).collect(),
+        )
         .unwrap_err();
     assert_eq!(err.code(), squad::sqlstate::UNIQUE_VIOLATION);
     assert!(err.detail().unwrap().contains("Shards do not share a transaction"), "{err:?}");
@@ -394,12 +451,22 @@ fn transactions_are_bound_to_one_shard() {
         let err = tx.execute(sql, &params).unwrap_err();
         assert_eq!(err.code(), squad::sqlstate::FEATURE_NOT_SUPPORTED, "{sql}: {err}");
     }
-    assert_eq!(code(tx.insert_rows("users", &["project_id", "id"], vec![vec![Value::Int8(a), Value::Int4(5)], vec![Value::Int8(b), Value::Int4(5)]])), squad::sqlstate::FEATURE_NOT_SUPPORTED);
+    assert_eq!(
+        code(tx.insert_rows(
+            "users",
+            &["project_id", "id"],
+            vec![vec![Value::Int8(a), Value::Int4(5)], vec![Value::Int8(b), Value::Int4(5)]]
+        )),
+        squad::sqlstate::FEATURE_NOT_SUPPORTED
+    );
     // … without ending the transaction.
     tx.insert_rows("users", &["project_id", "id"], vec![vec![Value::Int8(a), Value::Int4(2)]]).unwrap();
     tx.commit().unwrap();
     assert!(!conn.in_transaction());
-    let n: i64 = other.query_one("SELECT count(*) FROM users WHERE project_id = $1 AND (score = 2 OR id = 2)", &[&a]).unwrap().get(0);
+    let n: i64 = other
+        .query_one("SELECT count(*) FROM users WHERE project_id = $1 AND (score = 2 OR id = 2)", &[&a])
+        .unwrap()
+        .get(0);
     assert_eq!(n, 2);
 
     // Rollback, explicit and by dropping the transaction.
@@ -421,14 +488,25 @@ fn transactions_are_bound_to_one_shard() {
     conn.batch_execute("ROLLBACK TO s1").unwrap();
     conn.execute("INSERT INTO users VALUES ($1, 12, 'z', 1, 1)", &[&b]).unwrap();
     conn.batch_execute("COMMIT").unwrap();
-    let ids: Vec<i32> = conn.query("SELECT id FROM users WHERE project_id = $1 ORDER BY id", &[&b]).unwrap().iter().map(|r| r.get(0)).collect();
+    let ids: Vec<i32> = conn
+        .query("SELECT id FROM users WHERE project_id = $1 ORDER BY id", &[&b])
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
     assert_eq!(ids, vec![10, 12]);
 
     // An error inside the transaction aborts it on its shard, as in a
     // single database.
     conn.batch_execute("BEGIN").unwrap();
-    assert_eq!(code(conn.execute("INSERT INTO users VALUES ($1, 10, 'dup', 1, 1)", &[&b])), squad::sqlstate::UNIQUE_VIOLATION);
-    assert_eq!(code(conn.query("SELECT 1 FROM users WHERE project_id = $1", &[&b])), squad::sqlstate::IN_FAILED_SQL_TRANSACTION);
+    assert_eq!(
+        code(conn.execute("INSERT INTO users VALUES ($1, 10, 'dup', 1, 1)", &[&b])),
+        squad::sqlstate::UNIQUE_VIOLATION
+    );
+    assert_eq!(
+        code(conn.query("SELECT 1 FROM users WHERE project_id = $1", &[&b])),
+        squad::sqlstate::IN_FAILED_SQL_TRANSACTION
+    );
     conn.batch_execute("ROLLBACK").unwrap();
     assert_eq!(conn.query("SELECT 1 FROM users WHERE project_id = $1", &[&b]).unwrap().len(), 2);
 
@@ -452,13 +530,26 @@ fn queries_across_shards() {
     let (cluster, conn) = memory(5);
     conn.execute("INSERT INTO plans VALUES (1, 'free'), (2, 'team'), (3, 'business')", &[]).unwrap();
     let users: Vec<Vec<Value>> = (0..400)
-        .map(|i| vec![Value::Int8((i % 23) as i64), Value::Int4(i), Value::Text(format!("u{i}@x")), Value::Int4(1 + i % 3), Value::Int4(i % 50)])
+        .map(|i| {
+            vec![
+                Value::Int8((i % 23) as i64),
+                Value::Int4(i),
+                Value::Text(format!("u{i}@x")),
+                Value::Int4(1 + i % 3),
+                Value::Int4(i % 50),
+            ]
+        })
         .collect();
     conn.insert_rows("users", &["project_id", "id", "email", "plan_id", "score"], users).unwrap();
     assert!(rows_per_shard(&cluster, "users").iter().all(|n| *n > 0));
 
     // Merged aggregates.
-    let row = conn.query_one("SELECT count(*), sum(score), avg(score), min(score), max(id), count(DISTINCT plan_id) FROM users", &[]).unwrap();
+    let row = conn
+        .query_one(
+            "SELECT count(*), sum(score), avg(score), min(score), max(id), count(DISTINCT plan_id) FROM users",
+            &[],
+        )
+        .unwrap();
     assert_eq!(row.get::<i64>(0), 400);
     assert_eq!(row.get::<i64>(1), (0..400).map(|i| i % 50).sum::<i64>());
     assert_eq!(row.get::<i32>(3), 0);
@@ -480,16 +571,29 @@ fn queries_across_shards() {
     assert_eq!(rows[0].columns().iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["label", "n", "sum"]);
 
     // Plain rows: sorted, de-duplicated and limited on the coordinator.
-    let ids: Vec<i32> = conn.query("SELECT id FROM users ORDER BY id DESC LIMIT 3 OFFSET 2", &[]).unwrap().iter().map(|r| r.get(0)).collect();
+    let ids: Vec<i32> = conn
+        .query("SELECT id FROM users ORDER BY id DESC LIMIT 3 OFFSET 2", &[])
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
     assert_eq!(ids, vec![397, 396, 395]);
-    let plans: Vec<i32> = conn.query("SELECT DISTINCT plan_id FROM users ORDER BY plan_id", &[]).unwrap().iter().map(|r| r.get(0)).collect();
+    let plans: Vec<i32> = conn
+        .query("SELECT DISTINCT plan_id FROM users ORDER BY plan_id", &[])
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
     assert_eq!(plans, vec![1, 2, 3]);
     assert_eq!(conn.query("SELECT email FROM users WHERE score = 49 ORDER BY project_id", &[]).unwrap().len(), 8);
     assert_eq!(conn.query("SELECT * FROM users", &[]).unwrap().len(), 400);
 
     // Writes without a key change every shard's rows.
     assert_eq!(conn.execute("UPDATE users SET score = score + 1 WHERE plan_id = 2", &[]).unwrap(), 133);
-    assert_eq!(conn.execute("DELETE FROM users WHERE score = 0", &[]).unwrap(), (0..400).filter(|i| i % 50 == 0 && i % 3 != 1).count() as u64);
+    assert_eq!(
+        conn.execute("DELETE FROM users WHERE score = 0", &[]).unwrap(),
+        (0..400).filter(|i| i % 50 == 0 && i % 3 != 1).count() as u64
+    );
     let n = conn.query("DELETE FROM users WHERE project_id IN (1, 2, 3) RETURNING id", &[]).unwrap().len();
     assert!(n > 40, "{n}");
 
@@ -498,7 +602,8 @@ fn queries_across_shards() {
     assert_eq!(n, 3);
     assert_eq!(conn.execute("UPDATE plans SET label = upper(label)", &[]).unwrap(), 3);
     for shard in cluster.shards() {
-        let label: String = shard.database().unwrap().connect().query_one("SELECT label FROM plans WHERE id = 2", &[]).unwrap().get(0);
+        let label: String =
+            shard.database().unwrap().connect().query_one("SELECT label FROM plans WHERE id = 2", &[]).unwrap().get(0);
         assert_eq!(label, "TEAM");
     }
 }
@@ -547,8 +652,14 @@ fn what_cannot_be_answered_correctly_is_rejected() {
         assert!(err.hint().is_some() || err.message().contains("not supported"), "{sql}: {err:?}");
     }
     // Shapes that can never run are refused when they are prepared.
-    assert_eq!(code(conn.prepare("SELECT id, row_number() OVER (ORDER BY id) FROM users")), squad::sqlstate::FEATURE_NOT_SUPPORTED);
-    assert_eq!(code(conn.prepare("SELECT stddev(score) FROM users WHERE score > $1")), squad::sqlstate::FEATURE_NOT_SUPPORTED);
+    assert_eq!(
+        code(conn.prepare("SELECT id, row_number() OVER (ORDER BY id) FROM users")),
+        squad::sqlstate::FEATURE_NOT_SUPPORTED
+    );
+    assert_eq!(
+        code(conn.prepare("SELECT stddev(score) FROM users WHERE score > $1")),
+        squad::sqlstate::FEATURE_NOT_SUPPORTED
+    );
     // With the key (or grouped by it) the same shapes work.
     for sql in [
         "SELECT approx_count_distinct(user_id) FROM events WHERE project_id = 1",
@@ -598,17 +709,30 @@ fn errors_of_a_shard_surface_with_their_code() {
     let (a, b) = two_tenants(&cluster);
     conn.execute("INSERT INTO users VALUES ($1, 1, 'a', 1, 0), ($2, 1, 'b', 1, 5)", &[&a, &b]).unwrap();
     // One shard.
-    assert_eq!(code(conn.execute("INSERT INTO users VALUES ($1, 1, 'dup', 1, 0)", &[&a])), squad::sqlstate::UNIQUE_VIOLATION);
-    assert_eq!(code(conn.execute("INSERT INTO users VALUES ($1, NULL, 'x', 1, 0)", &[&a])), squad::sqlstate::NOT_NULL_VIOLATION);
-    assert_eq!(code(conn.query("SELECT nope FROM users WHERE project_id = $1", &[&a])), squad::sqlstate::UNDEFINED_COLUMN);
+    assert_eq!(
+        code(conn.execute("INSERT INTO users VALUES ($1, 1, 'dup', 1, 0)", &[&a])),
+        squad::sqlstate::UNIQUE_VIOLATION
+    );
+    assert_eq!(
+        code(conn.execute("INSERT INTO users VALUES ($1, NULL, 'x', 1, 0)", &[&a])),
+        squad::sqlstate::NOT_NULL_VIOLATION
+    );
+    assert_eq!(
+        code(conn.query("SELECT nope FROM users WHERE project_id = $1", &[&a])),
+        squad::sqlstate::UNDEFINED_COLUMN
+    );
     assert_eq!(code(conn.query("SELEC 1", &[])), squad::sqlstate::SYNTAX_ERROR);
     // A scatter query that fails on one shard only (division by the score
     // of tenant a) fails as a whole.
     assert_eq!(code(conn.query("SELECT 10 / score FROM users", &[])), squad::sqlstate::DIVISION_BY_ZERO);
     assert_eq!(code(conn.query("SELECT sum(10 / score) FROM users", &[])), squad::sqlstate::DIVISION_BY_ZERO);
-    assert_eq!(code(conn.query("SELECT count(*) FROM users WHERE project_id IN ($1, $2) AND 1 / score > 0", &[&a, &b])), squad::sqlstate::DIVISION_BY_ZERO);
+    assert_eq!(
+        code(conn.query("SELECT count(*) FROM users WHERE project_id IN ($1, $2) AND 1 / score > 0", &[&a, &b])),
+        squad::sqlstate::DIVISION_BY_ZERO
+    );
     // A write to several shards that fails on one of them says what stayed.
-    let err = conn.execute("INSERT INTO users VALUES ($1, 1, 'dup', 1, 0), ($2, 2, 'new', 1, 0)", &[&a, &b]).unwrap_err();
+    let err =
+        conn.execute("INSERT INTO users VALUES ($1, 1, 'dup', 1, 0), ($2, 2, 'new', 1, 0)", &[&a, &b]).unwrap_err();
     assert_eq!(err.code(), squad::sqlstate::UNIQUE_VIOLATION);
     assert!(err.detail().unwrap().contains("Shards do not share a transaction"), "{err:?}");
     let n: i64 = conn.query_one("SELECT count(*) FROM users WHERE project_id = $1", &[&b]).unwrap().get(0);
@@ -636,7 +760,8 @@ fn connections_share_the_cluster_across_threads() {
                 let conn = cluster.connect();
                 for i in 0..150i32 {
                     let tenant = (t * 31 + i as i64) % 40;
-                    conn.execute("INSERT INTO users VALUES ($1, $2, 'x', 1, 1)", &[&tenant, &(t as i32 * 1000 + i)]).unwrap();
+                    conn.execute("INSERT INTO users VALUES ($1, $2, 'x', 1, 1)", &[&tenant, &(t as i32 * 1000 + i)])
+                        .unwrap();
                     if i % 10 == 0 {
                         let n: i64 = conn.query_one("SELECT count(*) FROM users", &[]).unwrap().get(0);
                         assert!(n > 0);
@@ -660,7 +785,8 @@ fn settings_apply_to_every_shard_connection() {
     conn.execute("INSERT INTO events VALUES (1, 1, 'a', 1, '2026-01-01 00:00:00+00'), (2, 1, 'a', 1, '2026-01-01 00:00:00+00'), (3, 1, 'a', 1, '2026-01-01 00:00:00+00')", &[]).unwrap();
     // Shard connections opened after the SET see it too.
     for tenant in 1..=3i64 {
-        let at: String = conn.query_one("SELECT at::text FROM events WHERE project_id = $1", &[&tenant]).unwrap().get(0);
+        let at: String =
+            conn.query_one("SELECT at::text FROM events WHERE project_id = $1", &[&tenant]).unwrap().get(0);
         assert_eq!(at, "2026-01-01 01:00:00+01");
     }
     let shown: String = conn.query_one("SHOW timezone", &[]).unwrap().get(0);

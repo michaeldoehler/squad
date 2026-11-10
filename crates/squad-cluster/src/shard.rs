@@ -29,7 +29,11 @@ const STATEMENT_CACHE: usize = 512;
 struct Wire(Value);
 
 impl PgToSql for Wire {
-    fn to_sql(&self, ty: &PgType, out: &mut BytesMut) -> std::result::Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+    fn to_sql(
+        &self,
+        ty: &PgType,
+        out: &mut BytesMut,
+    ) -> std::result::Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
         if self.0.is_null() {
             return Ok(IsNull::Yes);
         }
@@ -104,6 +108,14 @@ impl ShardConn {
         Ok(ShardConn::Remote { client: Box::new(client), stmts: HashMap::new() })
     }
 
+    /// The connection to a remote shard was lost.
+    pub(crate) fn is_broken(&self) -> bool {
+        match self {
+            ShardConn::Local { .. } => false,
+            ShardConn::Remote { client, .. } => client.is_closed(),
+        }
+    }
+
     /// Forgets prepared statements, after the schema changed.
     pub(crate) fn reset(&mut self) {
         match self {
@@ -156,12 +168,18 @@ impl ShardConn {
                 let wire: Vec<Wire> = params.iter().take(stmt.params().len()).cloned().map(Wire).collect();
                 let refs: Vec<&(dyn PgToSql + Sync)> = wire.iter().map(|w| w as &(dyn PgToSql + Sync)).collect();
                 if stmt.columns().is_empty() {
-                    return Ok(Output { affected: client.execute(&stmt, &refs).map_err(remote_error)?, ..Default::default() });
+                    return Ok(Output {
+                        affected: client.execute(&stmt, &refs).map_err(remote_error)?,
+                        ..Default::default()
+                    });
                 }
                 let columns: Vec<OutputColumn> = stmt
                     .columns()
                     .iter()
-                    .map(|c| OutputColumn { name: c.name().to_string(), ty: Type::from_oid(c.type_().oid()).unwrap_or(Type::Text) })
+                    .map(|c| OutputColumn {
+                        name: c.name().to_string(),
+                        ty: Type::from_oid(c.type_().oid()).unwrap_or(Type::Text),
+                    })
                     .collect();
                 let mut rows = Vec::new();
                 for row in client.query(&stmt, &refs).map_err(remote_error)? {
@@ -185,7 +203,10 @@ impl ShardConn {
                 .map_err(remote_error)?
                 .columns()
                 .iter()
-                .map(|c| OutputColumn { name: c.name().to_string(), ty: Type::from_oid(c.type_().oid()).unwrap_or(Type::Text) })
+                .map(|c| OutputColumn {
+                    name: c.name().to_string(),
+                    ty: Type::from_oid(c.type_().oid()).unwrap_or(Type::Text),
+                })
                 .collect()),
         }
     }

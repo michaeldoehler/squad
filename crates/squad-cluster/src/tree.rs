@@ -74,7 +74,11 @@ pub(crate) fn parse_expr(sql: &str) -> Result<pb::Node> {
 
 pub(crate) fn res_target(name: &str, val: pb::Node) -> pb::Node {
     pb::Node {
-        node: Some(N::ResTarget(Box::new(pb::ResTarget { name: name.to_string(), val: Some(Box::new(val)), ..Default::default() }))),
+        node: Some(N::ResTarget(Box::new(pb::ResTarget {
+            name: name.to_string(),
+            val: Some(Box::new(val)),
+            ..Default::default()
+        }))),
     }
 }
 
@@ -135,7 +139,9 @@ pub(crate) fn operand(n: &pb::Node) -> Option<Operand> {
 /// Top-level AND conjuncts of a condition.
 pub(crate) fn conjuncts(n: &pb::Node, out: &mut Vec<pb::Node>) {
     match n.node.as_ref() {
-        Some(N::BoolExpr(b)) if b.boolop == pb::BoolExprType::AndExpr as i32 => b.args.iter().for_each(|a| conjuncts(a, out)),
+        Some(N::BoolExpr(b)) if b.boolop == pb::BoolExprType::AndExpr as i32 => {
+            b.args.iter().for_each(|a| conjuncts(a, out))
+        }
         _ => out.push(n.clone()),
     }
 }

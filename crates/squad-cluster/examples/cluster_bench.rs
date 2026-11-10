@@ -56,9 +56,7 @@ fn single_inserts(cluster: &Cluster, threads: i64, per_thread: i64) -> f64 {
             let cluster = cluster.clone();
             scope.spawn(move || {
                 let conn = cluster.connect();
-                let insert = conn
-                    .prepare("INSERT INTO hits (project_id, id, path) VALUES ($1, $2, $3)")
-                    .unwrap();
+                let insert = conn.prepare("INSERT INTO hits (project_id, id, path) VALUES ($1, $2, $3)").unwrap();
                 for i in 0..per_thread {
                     let g = t * per_thread + i;
                     insert.execute(&[&((g * 7919) % PROJECTS), &g, &"/pricing"]).unwrap();
@@ -146,7 +144,10 @@ fn main() {
 
         println!("single-row inserts, durable commit each:");
         for threads in [1, 4, 8] {
-            println!("  {threads} connection(s):                {:9.0} rows/s", single_inserts(&cluster, threads, 4000 / threads));
+            println!(
+                "  {threads} connection(s):                {:9.0} rows/s",
+                single_inserts(&cluster, threads, 4000 / threads)
+            );
             conn.batch_execute("TRUNCATE hits").unwrap();
         }
 

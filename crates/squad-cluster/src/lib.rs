@@ -437,7 +437,12 @@ impl Cluster {
             shards,
             meta: RwLock::new(Arc::new(Meta { tables: HashMap::new(), slots: Vec::new() })),
             generation: AtomicU64::new(0),
-            caches: Mutex::new(Caches { generation: 0, parsed: HashMap::new(), plans: HashMap::new(), columns: HashMap::new() }),
+            caches: Mutex::new(Caches {
+                generation: 0,
+                parsed: HashMap::new(),
+                plans: HashMap::new(),
+                columns: HashMap::new(),
+            }),
         };
         let meta = inner.load(config.virtual_slots)?;
         *inner.meta.write() = Arc::new(meta);
@@ -632,6 +637,12 @@ fn combine(what: &str, results: Vec<(usize, Result<Output>)>) -> Result<Output> 
 
 impl State {
     fn conn(&mut self, inner: &Inner, shard: usize) -> Result<&mut ShardConn> {
+        // A lost connection to a remote shard is replaced, unless a
+        // transaction was open on it: that one must fail.
+        let in_txn = self.txn.as_ref().is_some_and(|t| t.shard == Some(shard));
+        if !in_txn && self.conns[shard].as_ref().is_some_and(ShardConn::is_broken) {
+            self.conns[shard] = None;
+        }
         if self.conns[shard].is_none() {
             let mut conn = inner.shards[shard].connect()?;
             for s in &self.settings {
@@ -648,7 +659,9 @@ impl State {
         let Some(txn) = self.txn.as_mut() else { return Ok(()) };
         match txn.shard {
             Some(s) if s == shard => Ok(()),
-            Some(s) => Err(cross_shard(format!("The transaction runs on shard {s}; this statement needs shard {shard}."))),
+            Some(s) => {
+                Err(cross_shard(format!("The transaction runs on shard {s}; this statement needs shard {shard}.")))
+            }
             None => {
                 let pending = std::mem::take(&mut txn.pending);
                 txn.shard = Some(shard);
@@ -674,13 +687,22 @@ impl State {
     }
 
     /// Runs statements on several shards at once, one thread per shard.
-    fn fan_out(&mut self, inner: &Inner, jobs: &[(usize, &str)], params: &[Value]) -> Result<Vec<(usize, Result<Output>)>> {
+    fn fan_out(
+        &mut self,
+        inner: &Inner,
+        jobs: &[(usize, &str)],
+        params: &[Value],
+    ) -> Result<Vec<(usize, Result<Output>)>> {
         let jobs: Vec<(usize, &str, &[Value])> = jobs.iter().map(|(s, q)| (*s, *q, params)).collect();
         self.fan_out_each(inner, &jobs)
     }
 
     /// Like [`fan_out`](Self::fan_out), with parameters per shard.
-    fn fan_out_each(&mut self, inner: &Inner, jobs: &[(usize, &str, &[Value])]) -> Result<Vec<(usize, Result<Output>)>> {
+    fn fan_out_each(
+        &mut self,
+        inner: &Inner,
+        jobs: &[(usize, &str, &[Value])],
+    ) -> Result<Vec<(usize, Result<Output>)>> {
         for (shard, _, _) in jobs {
             self.conn(inner, *shard)?;
         }
@@ -783,7 +805,10 @@ impl State {
                     if *ends {
                         return Ok(Output::default());
                     }
-                    return Err(Error::new(sqlstate::NO_ACTIVE_SQL_TRANSACTION, "savepoints can only be used in transaction blocks"));
+                    return Err(Error::new(
+                        sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                        "savepoints can only be used in transaction blocks",
+                    ));
                 };
                 match txn.shard {
                     Some(shard) => {
@@ -839,7 +864,10 @@ impl State {
                     for shard in Self::all_shards(inner) {
                         let conn = self.conn(inner, shard)?;
                         for t in dropped {
-                            conn.run(&format!("DELETE FROM {META_TABLE} WHERE key = $1"), &[Value::Text(format!("table:{t}"))])?;
+                            conn.run(
+                                &format!("DELETE FROM {META_TABLE} WHERE key = $1"),
+                                &[Value::Text(format!("table:{t}"))],
+                            )?;
                         }
                     }
                     inner.reload()?;
@@ -852,8 +880,9 @@ impl State {
             }
             Plan::ReferenceWrite => {
                 if self.txn.is_some() {
-                    return Err(unsupported("writing to a reference table inside a transaction")
-                        .with_hint("A reference table is written on every shard, and shards do not share a transaction."));
+                    return Err(unsupported("writing to a reference table inside a transaction").with_hint(
+                        "A reference table is written on every shard, and shards do not share a transaction.",
+                    ));
                 }
                 // One shard after the other, so that a statement that
                 // fails (a constraint, a type error) fails on the first
@@ -1146,7 +1175,9 @@ impl State {
                     if kind.is_some_and(|prev| prev != k) {
                         return Err(Error::new(
                             sqlstate::DATATYPE_MISMATCH,
-                            format!("column \"{column}\" of table \"{table}\" does not have the same type on all shards"),
+                            format!(
+                                "column \"{column}\" of table \"{table}\" does not have the same type on all shards"
+                            ),
                         ));
                     }
                     kind = Some(k);
@@ -1162,12 +1193,16 @@ impl State {
         match meta.tables.get(table) {
             Some(existing) if *existing == class => {}
             Some(existing) => {
-                return Err(Error::new(sqlstate::DUPLICATE_OBJECT, format!("table \"{table}\" is already {}", describe(existing))))
+                return Err(Error::new(
+                    sqlstate::DUPLICATE_OBJECT,
+                    format!("table \"{table}\" is already {}", describe(existing)),
+                ))
             }
             None => {
                 // Rows that are already there would be on the wrong shard.
                 for shard in &shards {
-                    let out = self.conn(inner, *shard)?.run(&format!("SELECT count(*) FROM {}", quote_ident(table)), &[])?;
+                    let out =
+                        self.conn(inner, *shard)?.run(&format!("SELECT count(*) FROM {}", quote_ident(table)), &[])?;
                     let rows = matches!(out.rows.first().and_then(|r| r.first()), Some(Value::Int8(n)) if *n > 0);
                     if rows && shards.len() > 1 {
                         return Err(Error::new(
@@ -1190,8 +1225,9 @@ impl State {
                 break;
             }
         }
-        combine("Recording the table class", results)
-            .map_err(|e| e.with_hint(format!("Repeat {function}; the table counts as declared once every shard has recorded it.")))?;
+        combine("Recording the table class", results).map_err(|e| {
+            e.with_hint(format!("Repeat {function}; the table counts as declared once every shard has recorded it."))
+        })?;
         inner.reload()?;
         Ok(Output {
             columns: vec![OutputColumn { name: function.to_string(), ty: Type::Text }],

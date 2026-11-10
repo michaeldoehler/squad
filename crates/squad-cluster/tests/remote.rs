@@ -105,7 +105,12 @@ fn remote_shards() {
     assert_eq!(row.get::<String>(1), "442.50");
     assert_eq!(row.get::<i64>(4), 3);
     assert_eq!(row.get::<i64>(5), 24);
-    let rows = conn.query("SELECT lvl::text AS l, count(*), sum(hits) FROM issues WHERE open GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 2", &[]).unwrap();
+    let rows = conn
+        .query(
+            "SELECT lvl::text AS l, count(*), sum(hits) FROM issues WHERE open GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 2",
+            &[],
+        )
+        .unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows.iter().map(|r| r.get::<i64>(1)).sum::<i64>(), 10);
     let ids: Vec<i64> = conn
@@ -130,9 +135,17 @@ fn remote_shards() {
         .collect();
     assert_eq!(conn.insert_rows("events", &["project_id", "user_id", "name", "value", "at"], rows).unwrap(), 5000);
     assert_eq!((0..3).map(|s| servers.count(s, "events")).sum::<i64>(), 5000);
-    let row = conn.query_one("SELECT count(*), count(user_id), sum(value), count(DISTINCT project_id) FROM events", &[]).unwrap();
-    assert_eq!((row.get::<i64>(0), row.get::<i64>(1), row.get::<f64>(2), row.get::<i64>(3)), (5000, 4444, 12_497_500.0, 41));
-    let n: i64 = conn.query_one("SELECT count(*) FROM events WHERE project_id = $1 AND name = 'click'", &[&4i64]).unwrap().get(0);
+    let row = conn
+        .query_one("SELECT count(*), count(user_id), sum(value), count(DISTINCT project_id) FROM events", &[])
+        .unwrap();
+    assert_eq!(
+        (row.get::<i64>(0), row.get::<i64>(1), row.get::<f64>(2), row.get::<i64>(3)),
+        (5000, 4444, 12_497_500.0, 41)
+    );
+    let n: i64 = conn
+        .query_one("SELECT count(*) FROM events WHERE project_id = $1 AND name = 'click'", &[&4i64])
+        .unwrap()
+        .get(0);
     assert_eq!(n, (0..5000).filter(|i| i % 41 == 4 && i % 2 == 1).count() as i64);
 
     // Reference tables and transactions.
@@ -140,7 +153,8 @@ fn remote_shards() {
     assert!((0..3).all(|s| servers.count(s, "plans") == 2));
     let tx = conn.transaction().unwrap();
     tx.execute("UPDATE issues SET hits = 0 WHERE project_id = $1", &[&3i64]).unwrap();
-    let elsewhere = (4..30i64).find(|t| cluster.shard_for(&Value::Int8(*t)) != cluster.shard_for(&Value::Int8(3))).unwrap();
+    let elsewhere =
+        (4..30i64).find(|t| cluster.shard_for(&Value::Int8(*t)) != cluster.shard_for(&Value::Int8(3))).unwrap();
     assert_eq!(
         tx.execute("UPDATE issues SET hits = 0 WHERE project_id = $1", &[&elsewhere]).unwrap_err().code(),
         squad::sqlstate::FEATURE_NOT_SUPPORTED
@@ -155,10 +169,15 @@ fn remote_shards() {
     assert_eq!(n, 29);
 
     // Errors keep their SQLSTATE, message and detail.
-    let err = conn.execute("INSERT INTO issues (project_id, id) VALUES (7, '00000000-0000-4000-8000-000000000007')", &[]).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO issues (project_id, id) VALUES (7, '00000000-0000-4000-8000-000000000007')", &[])
+        .unwrap_err();
     assert_eq!(err.code(), squad::sqlstate::UNIQUE_VIOLATION);
     assert!(err.message().contains("duplicate key"), "{err:?}");
-    assert_eq!(conn.query("SELECT 1 / (hits - 21) FROM issues", &[]).unwrap_err().code(), squad::sqlstate::DIVISION_BY_ZERO);
+    assert_eq!(
+        conn.query("SELECT 1 / (hits - 21) FROM issues", &[]).unwrap_err().code(),
+        squad::sqlstate::DIVISION_BY_ZERO
+    );
     assert_eq!(conn.query("SELECT nope FROM issues", &[]).unwrap_err().code(), squad::sqlstate::UNDEFINED_COLUMN);
 
     // A second coordinator on the same servers sees the same cluster.
@@ -169,9 +188,15 @@ fn remote_shards() {
     // Wrong order is refused for remote shards as well.
     let mut specs = servers.specs();
     specs.swap(0, 2);
-    assert_eq!(Cluster::open(ClusterConfig::new(specs)).err().unwrap().code(), squad::sqlstate::INVALID_PARAMETER_VALUE);
+    assert_eq!(
+        Cluster::open(ClusterConfig::new(specs)).err().unwrap().code(),
+        squad::sqlstate::INVALID_PARAMETER_VALUE
+    );
     // A table declared through one coordinator is known to another after reload().
-    conn.batch_execute("CREATE TABLE notes (project_id bigint, body text); SELECT squad_distribute('notes', 'project_id')").unwrap();
+    conn.batch_execute(
+        "CREATE TABLE notes (project_id bigint, body text); SELECT squad_distribute('notes', 'project_id')",
+    )
+    .unwrap();
     again.reload().unwrap();
     again.connect().execute("INSERT INTO notes VALUES (1, 'a'), (2, 'b'), (3, 'c')", &[]).unwrap();
     let n: i64 = conn.query_one("SELECT count(*) FROM notes", &[]).unwrap().get(0);
@@ -186,4 +211,49 @@ fn a_shard_that_is_down() {
     let err = Cluster::open(ClusterConfig::new(specs)).err().unwrap();
     assert_eq!(err.code(), squad::sqlstate::IO_ERROR, "{err}");
     assert!(err.message().contains("cannot connect to shard"), "{err}");
+}
+
+#[test]
+fn a_shard_that_goes_away_and_comes_back() {
+    let mut servers = Servers::start(3);
+    let cluster = Cluster::open(ClusterConfig::new(servers.specs())).unwrap();
+    let conn = cluster.connect();
+    conn.batch_execute("CREATE TABLE t (k bigint PRIMARY KEY, v int); SELECT squad_distribute('t', 'k')").unwrap();
+    for k in 0..60i64 {
+        conn.execute("INSERT INTO t VALUES ($1, 1)", &[&k]).unwrap();
+    }
+    let lost = 1;
+    let on_lost = (0..60i64).find(|k| cluster.shard_for(&Value::Int8(*k)) == lost).unwrap();
+    let elsewhere = (0..60i64).find(|k| cluster.shard_for(&Value::Int8(*k)) != lost).unwrap();
+    let addr = servers.handles[lost].local_addr().unwrap();
+    servers.handles.remove(lost).shutdown();
+
+    // Keys on other shards are not affected; the lost shard's keys and
+    // queries over all shards fail with an I/O error.
+    let v: i32 = conn.query_one("SELECT v FROM t WHERE k = $1", &[&elsewhere]).unwrap().get(0);
+    assert_eq!(v, 1);
+    assert_eq!(conn.execute("UPDATE t SET v = 2 WHERE k = $1", &[&elsewhere]).unwrap(), 1);
+    assert_eq!(conn.query("SELECT v FROM t WHERE k = $1", &[&on_lost]).unwrap_err().code(), squad::sqlstate::IO_ERROR);
+    assert_eq!(conn.query("SELECT count(*) FROM t", &[]).unwrap_err().code(), squad::sqlstate::IO_ERROR);
+    assert_eq!(
+        cluster.connect().query("SELECT v FROM t WHERE k = $1", &[&on_lost]).unwrap_err().code(),
+        squad::sqlstate::IO_ERROR
+    );
+
+    // The shard comes back on the same address: connections recover.
+    let mut back = None;
+    for _ in 0..50 {
+        match servers.dbs[lost].serve(addr) {
+            Ok(h) => {
+                back = Some(h);
+                break;
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    servers.handles.insert(lost, back.expect("could not serve the shard again"));
+    let v: i32 = conn.query_one("SELECT v FROM t WHERE k = $1", &[&on_lost]).unwrap().get(0);
+    assert_eq!(v, 1);
+    let n: i64 = conn.query_one("SELECT count(*) FROM t", &[]).unwrap().get(0);
+    assert_eq!(n, 60);
 }

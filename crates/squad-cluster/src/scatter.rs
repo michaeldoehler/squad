@@ -16,7 +16,9 @@ use squad::{sqlstate, Error, OutputColumn, Result, Type, Value};
 
 use crate::route::{self, Env};
 use crate::shard::Output;
-use crate::tree::{self, deparse, deparse_expr, func_name, operand, parse_expr, res_target, select_node, unsupported, Operand};
+use crate::tree::{
+    self, deparse, deparse_expr, func_name, operand, parse_expr, res_target, select_node, unsupported, Operand,
+};
 
 /// Distinct values the coordinator holds at most for `count(DISTINCT …)`.
 pub(crate) const DISTINCT_LIMIT: usize = 1_000_000;
@@ -245,8 +247,16 @@ fn count_of(op: &Option<Operand>, params: &[Value], what: &str) -> Result<Option
         Value::Int2(i) => *i as i64,
         Value::Int4(i) => *i as i64,
         Value::Int8(i) => *i,
-        Value::Text(s) => s.trim().parse().map_err(|_| Error::new(sqlstate::INVALID_TEXT_REPRESENTATION, format!("invalid {what}: \"{s}\"")))?,
-        other => return Err(Error::new(sqlstate::DATATYPE_MISMATCH, format!("{what} must be an integer, not {}", other.type_of().name()))),
+        Value::Text(s) => s
+            .trim()
+            .parse()
+            .map_err(|_| Error::new(sqlstate::INVALID_TEXT_REPRESENTATION, format!("invalid {what}: \"{s}\"")))?,
+        other => {
+            return Err(Error::new(
+                sqlstate::DATATYPE_MISMATCH,
+                format!("{what} must be an integer, not {}", other.type_of().name()),
+            ))
+        }
     };
     if n < 0 {
         return Err(Error::new(sqlstate::INVALID_PARAMETER_VALUE, format!("{what} must not be negative")));
@@ -443,11 +453,12 @@ fn plan_merge(sel: &pb::SelectStmt, text: &str, env: &Env) -> Result<Scatter> {
         }
         let mut expr = g;
         if let Some(i) = ordinal(g) {
-            expr = sel
-                .target_list
-                .get(i)
-                .and_then(target_value)
-                .ok_or_else(|| Error::new(sqlstate::INVALID_COLUMN_REFERENCE, format!("GROUP BY position {} is not in select list", i + 1)))?;
+            expr = sel.target_list.get(i).and_then(target_value).ok_or_else(|| {
+                Error::new(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    format!("GROUP BY position {} is not in select list", i + 1),
+                )
+            })?;
         } else if let Some(name) = bare_name(g) {
             let alias = sel.target_list.iter().find_map(|t| match t.node.as_ref() {
                 Some(N::ResTarget(rt)) if rt.name == name => rt.val.as_deref(),
@@ -463,7 +474,8 @@ fn plan_merge(sel: &pb::SelectStmt, text: &str, env: &Env) -> Result<Scatter> {
     }
     let group_texts: Vec<String> = groups.iter().map(deparse_expr).collect::<Result<_>>()?;
 
-    let mut rw = Rewriter { group_texts: &group_texts, aggs: Vec::new(), by_text: HashMap::new(), partials: Vec::new() };
+    let mut rw =
+        Rewriter { group_texts: &group_texts, aggs: Vec::new(), by_text: HashMap::new(), partials: Vec::new() };
     let mut targets = Vec::with_capacity(sel.target_list.len());
     for t in &sel.target_list {
         let mut val = target_value(t).ok_or_else(|| Error::internal("malformed select list"))?.clone();
@@ -539,7 +551,9 @@ fn plan_merge(sel: &pb::SelectStmt, text: &str, env: &Env) -> Result<Scatter> {
     let scratch_type = |ty: &Type| -> Result<String> {
         match ty {
             Type::Unknown => Ok("text".into()),
-            Type::Enum(_) | Type::Record | Type::Void => Err(across(&format!("grouping or aggregating values of type {}", ty.name()))),
+            Type::Enum(_) | Type::Record | Type::Void => {
+                Err(across(&format!("grouping or aggregating values of type {}", ty.name())))
+            }
             Type::Array(e) if matches!(**e, Type::Enum(_) | Type::Record) => {
                 Err(across(&format!("grouping or aggregating values of type {}", ty.name())))
             }
@@ -548,7 +562,10 @@ fn plan_merge(sel: &pb::SelectStmt, text: &str, env: &Env) -> Result<Scatter> {
     };
     let mut defs = Vec::with_capacity(types.len());
     for (i, c) in types.iter().enumerate() {
-        defs.push((if i < groups.len() { format!("__g{i}") } else { format!("__a{}", i - groups.len()) }, scratch_type(&c.ty)?));
+        defs.push((
+            if i < groups.len() { format!("__g{i}") } else { format!("__a{}", i - groups.len()) },
+            scratch_type(&c.ty)?,
+        ));
     }
     for agg in &aggs {
         let col = |k: usize| format!("__a{}", agg.partials[k]);
@@ -558,7 +575,9 @@ fn plan_merge(sel: &pb::SelectStmt, text: &str, env: &Env) -> Result<Scatter> {
             AggKind::Sum => format!("sum({})::{}", col(0), scratch_type(ty(0))?),
             AggKind::Same(f) => format!("{f}({})", col(0)),
             AggKind::Avg => match ty(0) {
-                Type::Float4 | Type::Float8 => format!("(sum({})::float8 / nullif(sum({}), 0)::float8)", col(0), col(1)),
+                Type::Float4 | Type::Float8 => {
+                    format!("(sum({})::float8 / nullif(sum({}), 0)::float8)", col(0), col(1))
+                }
                 Type::Int2 | Type::Int4 | Type::Int8 | Type::Numeric => {
                     format!("(sum({})::numeric / nullif(sum({}), 0)::numeric)", col(0), col(1))
                 }
@@ -575,7 +594,9 @@ fn plan_merge(sel: &pb::SelectStmt, text: &str, env: &Env) -> Result<Scatter> {
     let merged: Vec<pb::Node> = merged.iter().map(|m| parse_expr(m)).collect::<Result<_>>()?;
     let place = |expr: &mut pb::Node| -> Result<()> {
         tree::walk(expr, &mut |n| {
-            if let Some(i) = bare_name(n).and_then(|name| name.strip_prefix("__agg")).and_then(|i| i.parse::<usize>().ok()) {
+            if let Some(i) =
+                bare_name(n).and_then(|name| name.strip_prefix("__agg")).and_then(|i| i.parse::<usize>().ok())
+            {
                 if let Some(m) = merged.get(i) {
                     *n = m.clone();
                     return Ok(true);
@@ -589,8 +610,9 @@ fn plan_merge(sel: &pb::SelectStmt, text: &str, env: &Env) -> Result<Scatter> {
     m.target_list.clear();
     for (mut val, column) in targets.into_iter().zip(&out) {
         place(&mut val)?;
-        let castable = !matches!(column.ty, Type::Unknown | Type::Enum(_) | Type::Record | Type::Void | Type::Oid | Type::Char)
-            && !matches!(&column.ty, Type::Array(e) if matches!(**e, Type::Enum(_) | Type::Record));
+        let castable =
+            !matches!(column.ty, Type::Unknown | Type::Enum(_) | Type::Record | Type::Void | Type::Oid | Type::Char)
+                && !matches!(&column.ty, Type::Array(e) if matches!(**e, Type::Enum(_) | Type::Record));
         if castable {
             val = parse_expr(&format!("({})::{}", deparse_expr(&val)?, column.ty.name()))?;
         }
@@ -638,7 +660,8 @@ impl Merge {
         if self.distinct_cols.is_empty() {
             return Ok(rows);
         }
-        let keys: Vec<Vec<u8>> = rows.iter().map(|r| squad::encoding::encode_key_tuple(r.iter().take(self.group_cols))).collect();
+        let keys: Vec<Vec<u8>> =
+            rows.iter().map(|r| squad::encoding::encode_key_tuple(r.iter().take(self.group_cols))).collect();
         let mut held = 0usize;
         for &col in &self.distinct_cols {
             let mut sets: HashMap<&[u8], HashSet<Vec<u8>>> = HashMap::new();

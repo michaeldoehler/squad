@@ -37,14 +37,24 @@ pub(crate) type KeyGroups = Vec<(String, Vec<Operand>)>;
 
 pub(crate) enum Plan {
     /// `SELECT squad_distribute('table', 'column')`
-    Distribute { table: String, column: String },
+    Distribute {
+        table: String,
+        column: String,
+    },
     /// `SELECT squad_reference('table')`
-    Reference { table: String },
+    Reference {
+        table: String,
+    },
     Begin,
     /// COMMIT, ROLLBACK and savepoint commands, forwarded to the pinned shard.
-    TxnControl { ends: bool },
+    TxnControl {
+        ends: bool,
+    },
     /// Schema changes and session settings: every shard.
-    Everywhere { ddl: bool, dropped: Vec<String> },
+    Everywhere {
+        ddl: bool,
+        dropped: Vec<String>,
+    },
     /// Reads that touch no distributed table: any one shard.
     Anywhere,
     /// Writes to a reference table: every shard.
@@ -52,7 +62,11 @@ pub(crate) enum Plan {
     Insert(InsertRouting),
     /// Restricted by distribution keys. `scatter` is how to run a SELECT
     /// when the keys name several shards.
-    Keyed { groups: KeyGroups, write: bool, scatter: Option<std::result::Result<Scatter, Error>> },
+    Keyed {
+        groups: KeyGroups,
+        write: bool,
+        scatter: Option<std::result::Result<Scatter, Error>>,
+    },
     /// UPDATE or DELETE of a distributed table without a key: each shard
     /// changes its own rows.
     WriteAll,
@@ -209,7 +223,8 @@ impl Level {
                 // of this level, and be that table's distribution column.
                 let mut owner = None;
                 for (idx, inst) in self.instances.iter().enumerate() {
-                    let has = inst.dist.as_deref() == Some(name) || (env.columns)(&inst.table)?.iter().any(|c| c == name);
+                    let has =
+                        inst.dist.as_deref() == Some(name) || (env.columns)(&inst.table)?.iter().any(|c| c == name);
                     if has {
                         if owner.is_some() {
                             return Ok(None);
@@ -329,7 +344,8 @@ fn level_keys(level: &Level, env: &Env, top: bool) -> Result<Keys> {
         }
     }
     for root in roots {
-        let members: Vec<usize> = (0..n).filter(|i| level.instances[*i].dist.is_some() && find(&mut parent, *i) == root).collect();
+        let members: Vec<usize> =
+            (0..n).filter(|i| level.instances[*i].dist.is_some() && find(&mut parent, *i) == root).collect();
         match members.iter().find_map(|m| filters.get(m).map(|f| (*m, f))) {
             Some((m, ops)) => out.groups.push((level.instances[m].table.clone(), ops.clone())),
             None => out.open_groups += 1,
@@ -500,7 +516,9 @@ pub(crate) fn analyze(stmt: &pb::Node, text: &str, env: &Env) -> Result<Plan> {
                     let pos = if ins.cols.is_empty() {
                         (env.columns)(&table)?.iter().position(|c| c == column)
                     } else {
-                        ins.cols.iter().position(|c| matches!(c.node.as_ref(), Some(N::ResTarget(t)) if t.name == *column))
+                        ins.cols
+                            .iter()
+                            .position(|c| matches!(c.node.as_ref(), Some(N::ResTarget(t)) if t.name == *column))
                     };
                     let Some(pos) = pos else {
                         return Err(unsupported(format!(
@@ -508,7 +526,9 @@ pub(crate) fn analyze(stmt: &pb::Node, text: &str, env: &Env) -> Result<Plan> {
                         )));
                     };
                     let values = match ins.select_stmt.as_ref().and_then(|s| s.node.as_ref()) {
-                        Some(N::SelectStmt(s)) if !s.values_lists.is_empty() && s.with_clause.is_none() => &s.values_lists,
+                        Some(N::SelectStmt(s)) if !s.values_lists.is_empty() && s.with_clause.is_none() => {
+                            &s.values_lists
+                        }
                         _ => {
                             return Err(unsupported(format!(
                                 "INSERT … SELECT and DEFAULT VALUES into distributed table \"{table}\""
@@ -518,9 +538,14 @@ pub(crate) fn analyze(stmt: &pb::Node, text: &str, env: &Env) -> Result<Plan> {
                     };
                     let mut keys = Vec::with_capacity(values.len());
                     for row in values {
-                        let Some(N::List(list)) = row.node.as_ref() else { return Err(Error::internal("malformed VALUES")) };
+                        let Some(N::List(list)) = row.node.as_ref() else {
+                            return Err(Error::internal("malformed VALUES"));
+                        };
                         if matches!(list.items.get(pos).and_then(|n| n.node.as_ref()), Some(N::AConst(c)) if c.isnull) {
-                            return Err(Error::new(sqlstate::NOT_NULL_VIOLATION, "the distribution column cannot be null"));
+                            return Err(Error::new(
+                                sqlstate::NOT_NULL_VIOLATION,
+                                "the distribution column cannot be null",
+                            ));
                         }
                         let key = list.items.get(pos).and_then(operand).ok_or_else(|| {
                             unsupported(format!(
@@ -597,7 +622,9 @@ pub(crate) fn analyze(stmt: &pb::Node, text: &str, env: &Env) -> Result<Plan> {
             match K::try_from(t.kind).unwrap_or(K::Undefined) {
                 K::TransStmtBegin | K::TransStmtStart => Ok(Plan::Begin),
                 K::TransStmtCommit | K::TransStmtRollback => Ok(Plan::TxnControl { ends: true }),
-                K::TransStmtSavepoint | K::TransStmtRelease | K::TransStmtRollbackTo => Ok(Plan::TxnControl { ends: false }),
+                K::TransStmtSavepoint | K::TransStmtRelease | K::TransStmtRollbackTo => {
+                    Ok(Plan::TxnControl { ends: false })
+                }
                 _ => Err(unsupported("two-phase commit")),
             }
         }
@@ -619,10 +646,12 @@ pub(crate) fn analyze(stmt: &pb::Node, text: &str, env: &Env) -> Result<Plan> {
         N::RenameStmt(r) => {
             let table = r.relation.as_ref().map(relname).unwrap_or_default();
             match env.meta.tables.get(&table) {
-                Some(_) if r.rename_type == pb::ObjectType::ObjectTable as i32 => {
-                    Err(unsupported(format!("renaming \"{table}\", a distributed or reference table"))
-                        .with_hint("The cluster records table classes by name. Create the table under the new name and move the rows."))
-                }
+                Some(_) if r.rename_type == pb::ObjectType::ObjectTable as i32 => Err(unsupported(format!(
+                    "renaming \"{table}\", a distributed or reference table"
+                ))
+                .with_hint(
+                    "The cluster records table classes by name. Create the table under the new name and move the rows.",
+                )),
                 Some(Class::Distributed { column, .. })
                     if r.rename_type == pb::ObjectType::ObjectColumn as i32 && r.subname == *column =>
                 {
@@ -639,7 +668,9 @@ pub(crate) fn analyze(stmt: &pb::Node, text: &str, env: &Env) -> Result<Plan> {
                     let changes = c.subtype == pb::AlterTableType::AtDropColumn as i32
                         || c.subtype == pb::AlterTableType::AtAlterColumnType as i32;
                     if changes && c.name == *column {
-                        return Err(unsupported(format!("dropping or retyping distribution column \"{column}\" of \"{table}\"")));
+                        return Err(unsupported(format!(
+                            "dropping or retyping distribution column \"{column}\" of \"{table}\""
+                        )));
                     }
                 }
             }

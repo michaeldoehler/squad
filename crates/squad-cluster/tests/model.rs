@@ -62,7 +62,9 @@ impl Pair {
     fn check(&self, sql: &str, params: &[&dyn ToSql], ordered: bool) {
         let cluster: Outcome = match self.cluster.query(sql, params) {
             Ok(rows) => Ok((
-                rows.first().map(|r| r.columns().iter().map(|c| format!("{}:{}", c.name, c.ty.name())).collect()).unwrap_or_default(),
+                rows.first()
+                    .map(|r| r.columns().iter().map(|c| format!("{}:{}", c.name, c.ty.name())).collect())
+                    .unwrap_or_default(),
                 rows.iter().map(|r| r.values().to_vec()).collect(),
                 0,
             )),
@@ -70,7 +72,9 @@ impl Pair {
         };
         let model: Outcome = match self.model.query(sql, params) {
             Ok(rows) => Ok((
-                rows.first().map(|r| r.columns().iter().map(|c| format!("{}:{}", c.name, c.ty.name())).collect()).unwrap_or_default(),
+                rows.first()
+                    .map(|r| r.columns().iter().map(|c| format!("{}:{}", c.name, c.ty.name())).collect())
+                    .unwrap_or_default(),
                 rows.iter().map(|r| r.values().to_vec()).collect(),
                 0,
             )),
@@ -84,8 +88,16 @@ impl Pair {
                     c.sort();
                     m.sort();
                 }
-                assert!(c == m, "{}\nstatement: {sql}\nparams: {params:?}\ncluster: {c:#?}\nmodel:   {m:#?}", self.context);
-                assert!(ccols == mcols, "{}\nstatement: {sql}\ncluster columns: {ccols:?}\nmodel columns:   {mcols:?}", self.context);
+                assert!(
+                    c == m,
+                    "{}\nstatement: {sql}\nparams: {params:?}\ncluster: {c:#?}\nmodel:   {m:#?}",
+                    self.context
+                );
+                assert!(
+                    ccols == mcols,
+                    "{}\nstatement: {sql}\ncluster columns: {ccols:?}\nmodel columns:   {mcols:?}",
+                    self.context
+                );
             }
             (c, m) => panic!(
                 "{}\nstatement: {sql}\nparams: {params:?}\ncluster: {:?}\nmodel:   {:?}",
@@ -110,7 +122,8 @@ impl Pair {
 fn event_row(rng: &mut Rng) -> String {
     let user = if rng.below(10) == 0 { "NULL".to_string() } else { rng.below(40).to_string() };
     let value = if rng.below(12) == 0 { "NULL".to_string() } else { format!("{}", rng.below(400) as f64 * 0.25) };
-    let amount = if rng.below(12) == 0 { "NULL".to_string() } else { format!("{}.{:02}", rng.below(500), rng.below(4) * 25) };
+    let amount =
+        if rng.below(12) == 0 { "NULL".to_string() } else { format!("{}.{:02}", rng.below(500), rng.below(4) * 25) };
     let n = if rng.below(15) == 0 { "NULL".to_string() } else { rng.below(60).to_string() };
     format!(
         "({}, {user}, '{}', {value}, {amount}, {n}, '2026-03-{:02} {:02}:{:02}:00+00')",
@@ -139,7 +152,13 @@ fn mutate(p: &Pair, rng: &mut Rng, next_user: &mut i32) {
             for _ in 0..1 + rng.below(6) {
                 *next_user += 1;
                 let plan = if rng.below(6) == 0 { "NULL".to_string() } else { (1 + rng.below(4)).to_string() };
-                rows.push(format!("({}, {}, 'm{}@example', {plan}, {})", rng.below(TENANTS), *next_user, *next_user, rng.below(100)));
+                rows.push(format!(
+                    "({}, {}, 'm{}@example', {plan}, {})",
+                    rng.below(TENANTS),
+                    *next_user,
+                    *next_user,
+                    rng.below(100)
+                ));
             }
             p.write(&format!("INSERT INTO users VALUES {}", rows.join(", ")), &[]);
         }
@@ -157,7 +176,10 @@ fn mutate(p: &Pair, rng: &mut Rng, next_user: &mut i32) {
             "UPDATE users SET score = score + $1 WHERE project_id = $2 AND id % 3 = $3",
             &[&(rng.below(5) as i32), &tenant, &(rng.below(3) as i32)],
         ),
-        9 => p.write("UPDATE users SET score = score + 1, email = upper(email) WHERE score < $1", &[&(rng.below(30) as i32)]),
+        9 => p.write(
+            "UPDATE users SET score = score + 1, email = upper(email) WHERE score < $1",
+            &[&(rng.below(30) as i32)],
+        ),
         10 => p.write(
             "UPDATE users SET plan_id = $1 WHERE project_id IN ($2, $3) AND score > 50",
             &[&(1 + rng.below(4) as i32), &tenant, &(rng.below(TENANTS) as i64)],
@@ -188,7 +210,11 @@ fn queries(p: &Pair, rng: &mut Rng) {
 
     // One tenant: routed to its shard.
     p.check("SELECT id, email, score FROM users WHERE project_id = $1 ORDER BY id", &[&tenant], true);
-    p.check("SELECT count(*), sum(score), avg(score), min(email), max(score) FROM users WHERE project_id = $1", &[&tenant], true);
+    p.check(
+        "SELECT count(*), sum(score), avg(score), min(email), max(score) FROM users WHERE project_id = $1",
+        &[&tenant],
+        true,
+    );
     p.check(
         "SELECT name, approx_percentile(value, 0.5), approx_count_distinct(user_id), count(*) FROM events \
          WHERE project_id = $1 GROUP BY name ORDER BY name",
@@ -206,12 +232,24 @@ fn queries(p: &Pair, rng: &mut Rng) {
         &[&tenant, &small],
         true,
     );
-    p.check("SELECT project_id, count(*) FROM users WHERE project_id IN ($1, $2, 3) GROUP BY project_id ORDER BY 1", &[&tenant, &other], true);
-    p.check("SELECT id, score FROM users WHERE project_id IN ($1, $2) ORDER BY score DESC, id LIMIT $3", &[&tenant, &other, &limit], true);
+    p.check(
+        "SELECT project_id, count(*) FROM users WHERE project_id IN ($1, $2, 3) GROUP BY project_id ORDER BY 1",
+        &[&tenant, &other],
+        true,
+    );
+    p.check(
+        "SELECT id, score FROM users WHERE project_id IN ($1, $2) ORDER BY score DESC, id LIMIT $3",
+        &[&tenant, &other, &limit],
+        true,
+    );
     p.check("SELECT count(*), avg(score) FROM users WHERE project_id IN ($1, $2)", &[&tenant, &other], true);
 
     // All tenants, grouped by tenant: complete groups on each shard.
-    p.check("SELECT project_id, count(*), sum(score), avg(score) FROM users GROUP BY project_id ORDER BY project_id", &[], true);
+    p.check(
+        "SELECT project_id, count(*), sum(score), avg(score) FROM users GROUP BY project_id ORDER BY project_id",
+        &[],
+        true,
+    );
     p.check(
         "SELECT project_id, name, count(*), approx_count_distinct(user_id), approx_percentile(value, 0.9) FROM events \
          GROUP BY project_id, name ORDER BY project_id, name",
@@ -254,9 +292,21 @@ fn queries(p: &Pair, rng: &mut Rng) {
         &[],
         true,
     );
-    p.check("SELECT count(*), count(DISTINCT name), sum(n), avg(n), max(at) FROM events WHERE name <> $1", &[&rng.pick(NAMES)], true);
-    p.check("SELECT count(*) + count(DISTINCT name) AS x, sum(n)::float8 / nullif(count(*), 0) AS y FROM events", &[], true);
-    p.check("SELECT bool_and(score > 0), bool_or(score > 90), bit_or(score), bit_and(score), every(id > 0) FROM users", &[], true);
+    p.check(
+        "SELECT count(*), count(DISTINCT name), sum(n), avg(n), max(at) FROM events WHERE name <> $1",
+        &[&rng.pick(NAMES)],
+        true,
+    );
+    p.check(
+        "SELECT count(*) + count(DISTINCT name) AS x, sum(n)::float8 / nullif(count(*), 0) AS y FROM events",
+        &[],
+        true,
+    );
+    p.check(
+        "SELECT bool_and(score > 0), bool_or(score > 90), bit_or(score), bit_and(score), every(id > 0) FROM users",
+        &[],
+        true,
+    );
     p.check("SELECT 1 + count(*) AS total FROM users WHERE score > $1 HAVING count(*) > 2", &[&small], true);
     p.check(
         "SELECT p.label, count(*), sum(u.score) FROM users u JOIN plans p ON p.id = u.plan_id GROUP BY p.label ORDER BY p.label",
@@ -284,7 +334,11 @@ fn queries(p: &Pair, rng: &mut Rng) {
     p.check("SELECT project_id, id, score FROM users ORDER BY 3 DESC, 1, 2 LIMIT 4", &[], true);
     p.check("SELECT DISTINCT name FROM events ORDER BY name", &[], true);
     p.check("SELECT DISTINCT plan_id, score % 3 AS m FROM users ORDER BY 1 NULLS FIRST, m LIMIT 9", &[], true);
-    p.check("SELECT u.project_id, u.id, p.price FROM users u JOIN plans p ON p.id = u.plan_id ORDER BY 1, 2 LIMIT 20", &[], true);
+    p.check(
+        "SELECT u.project_id, u.id, p.price FROM users u JOIN plans p ON p.id = u.plan_id ORDER BY 1, 2 LIMIT 20",
+        &[],
+        true,
+    );
     p.check("SELECT id, email FROM users WHERE email LIKE $1 ORDER BY project_id, id", &[&"m%"], true);
 
     // Reference table.
@@ -309,7 +363,10 @@ fn run_on(specs: Vec<ShardSpec>, remote: &[(usize, Database)], seed: u64, steps:
 
     let mut pair = Pair { cluster: db, model, context: String::new() };
     let mut rng = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) ^ shards as u64);
-    pair.write("INSERT INTO plans VALUES (1, 'free', 0), (2, 'team', 19.00), (3, 'business', 99.50), (4, 'enterprise', NULL)", &[]);
+    pair.write(
+        "INSERT INTO plans VALUES (1, 'free', 0), (2, 'team', 19.00), (3, 'business', 99.50), (4, 'enterprise', NULL)",
+        &[],
+    );
     let mut next_user = 0;
     for step in 0..steps {
         pair.context = format!("shards={shards} seed={seed} step={step}");
