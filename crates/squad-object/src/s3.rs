@@ -207,6 +207,50 @@ fn xml_unescape(s: &str) -> String {
     s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
 }
 
+impl S3Store {
+    /// ListObjectsV2, all pages, optionally starting after a key.
+    fn list_from(&self, prefix: &str, after: Option<&str>) -> Result<Vec<ObjectMeta>> {
+        let strip = if self.config.prefix.is_empty() { 0 } else { self.config.prefix.len() + 1 };
+        let full_prefix = if strip == 0 { prefix.to_string() } else { format!("{}/{prefix}", self.config.prefix) };
+        let path = if self.root.is_empty() { "/".to_string() } else { self.root.clone() };
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut query =
+                vec![("list-type".to_string(), "2".to_string()), ("prefix".to_string(), full_prefix.clone())];
+            if let Some(t) = &token {
+                query.push(("continuation-token".to_string(), t.clone()));
+            } else if let Some(after) = after {
+                let full = if strip == 0 { after.to_string() } else { format!("{}/{after}", self.config.prefix) };
+                query.push(("start-after".to_string(), full));
+            }
+            let (r, _) = self.request("GET", &path, &query, &[], None)?;
+            if r.status != 200 {
+                return Err(Self::failed(&r));
+            }
+            let xml = String::from_utf8_lossy(&r.body);
+            let mut rest: &str = &xml;
+            while let Some(start) = rest.find("<Contents>") {
+                let end = rest[start..].find("</Contents>").map_or(rest.len(), |e| start + e);
+                let item = &rest[start..end];
+                let key = xml_unescape(element(item, "Key").unwrap_or_default());
+                let size = element(item, "Size").and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+                if key.len() >= strip {
+                    out.push(ObjectMeta { key: key[strip..].to_string(), size });
+                }
+                rest = &rest[end..];
+            }
+            let truncated = element(&xml, "IsTruncated").is_some_and(|v| v.trim() == "true");
+            token = element(&xml, "NextContinuationToken").map(xml_unescape);
+            if !truncated || token.is_none() {
+                break;
+            }
+        }
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(out)
+    }
+}
+
 impl ObjectStore for S3Store {
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         let (r, _) = self.request("PUT", &self.object_path(key)?, &[], &[], Some(data))?;
@@ -272,41 +316,11 @@ impl ObjectStore for S3Store {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
-        let strip = if self.config.prefix.is_empty() { 0 } else { self.config.prefix.len() + 1 };
-        let full_prefix = if strip == 0 { prefix.to_string() } else { format!("{}/{prefix}", self.config.prefix) };
-        let path = if self.root.is_empty() { "/".to_string() } else { self.root.clone() };
-        let mut out = Vec::new();
-        let mut token: Option<String> = None;
-        loop {
-            let mut query =
-                vec![("list-type".to_string(), "2".to_string()), ("prefix".to_string(), full_prefix.clone())];
-            if let Some(t) = &token {
-                query.push(("continuation-token".to_string(), t.clone()));
-            }
-            let (r, _) = self.request("GET", &path, &query, &[], None)?;
-            if r.status != 200 {
-                return Err(Self::failed(&r));
-            }
-            let xml = String::from_utf8_lossy(&r.body);
-            let mut rest: &str = &xml;
-            while let Some(start) = rest.find("<Contents>") {
-                let end = rest[start..].find("</Contents>").map_or(rest.len(), |e| start + e);
-                let item = &rest[start..end];
-                let key = xml_unescape(element(item, "Key").unwrap_or_default());
-                let size = element(item, "Size").and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-                if key.len() >= strip {
-                    out.push(ObjectMeta { key: key[strip..].to_string(), size });
-                }
-                rest = &rest[end..];
-            }
-            let truncated = element(&xml, "IsTruncated").is_some_and(|v| v.trim() == "true");
-            token = element(&xml, "NextContinuationToken").map(xml_unescape);
-            if !truncated || token.is_none() {
-                break;
-            }
-        }
-        out.sort_by(|a, b| a.key.cmp(&b.key));
-        Ok(out)
+        self.list_from(prefix, None)
+    }
+
+    fn list_after(&self, prefix: &str, after: &str) -> Result<Vec<ObjectMeta>> {
+        self.list_from(prefix, Some(after))
     }
 
     fn delete(&self, key: &str) -> Result<()> {

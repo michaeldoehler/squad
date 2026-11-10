@@ -245,13 +245,22 @@ pub(crate) fn max_claim(store: &dyn ObjectStore) -> Result<u64> {
 }
 
 pub(crate) fn read_remote(store: &dyn ObjectStore) -> Result<RemoteState> {
-    read_remote_from(store, None)
+    read_remote_from(store, None, None)
 }
 
 /// Reads the remote state. With `from`, the log objects returned are the
 /// ones that continue a copy standing at that LSN instead of the ones
 /// that continue the newest snapshot.
-pub(crate) fn read_remote_from(store: &dyn ObjectStore, from: Option<u64>) -> Result<RemoteState> {
+///
+/// `applied` names a log object (epoch and key) whose records, and those
+/// of every object before it, are all at or below `from`: the listing
+/// then starts after it, so that following a writer costs in proportion
+/// to what is new and not to how much log the store retains.
+pub(crate) fn read_remote_from(
+    store: &dyn ObjectStore,
+    from: Option<u64>,
+    applied: Option<(u64, &str)>,
+) -> Result<RemoteState> {
     let mut epochs = Vec::new();
     for meta in store.list("writer/base-").map_err(remote_err)? {
         if let Some(e) = meta.key.strip_prefix("writer/base-").and_then(|s| s.parse::<u64>().ok()) {
@@ -282,8 +291,14 @@ pub(crate) fn read_remote_from(store: &dyn ObjectStore, from: Option<u64>) -> Re
     for (epoch, _) in &epochs {
         let lim = limit(*epoch).unwrap_or(u64::MAX);
         let prefix = wal_prefix(*epoch);
-        let mut objects: Vec<(String, u64, u64)> = store
-            .list(&prefix)
+        let listed = match applied {
+            // Records of earlier writers count up to where a later one
+            // took over, which lies at or below what was applied.
+            Some((done, _)) if *epoch < done => continue,
+            Some((done, key)) if *epoch == done => store.list_after(&prefix, key),
+            _ => store.list(&prefix),
+        };
+        let mut objects: Vec<(String, u64, u64)> = listed
             .map_err(remote_err)?
             .into_iter()
             .filter_map(|m| pair(&m.key[prefix.len()..]).map(|(a, b)| (m.key, a, b)))

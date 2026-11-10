@@ -140,6 +140,20 @@ impl ObjectStore for MemoryStore {
             .collect())
     }
 
+    fn list_after(&self, prefix: &str, after: &str) -> Result<Vec<ObjectMeta>> {
+        if self.fault("list", prefix) != Fault::None {
+            return Err(Self::injected("list", prefix));
+        }
+        let objects = self.objects.lock();
+        let start = if after > prefix { after } else { prefix };
+        Ok(objects
+            .range::<str, _>((std::ops::Bound::Included(start), std::ops::Bound::Unbounded))
+            .filter(|(k, _)| k.as_str() > after)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| ObjectMeta { key: k.clone(), size: v.len() as u64 })
+            .collect())
+    }
+
     fn delete(&self, key: &str) -> Result<()> {
         check_key(key)?;
         let fault = self.fault("delete", key);

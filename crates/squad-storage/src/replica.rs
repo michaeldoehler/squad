@@ -112,6 +112,10 @@ enum Mode {
 struct Apply {
     /// Epoch recorded in the directory's marker file.
     epoch: u64,
+    /// The last log object applied in full, by epoch and key, if it was
+    /// applied to the copy that is open now. Later polls list the log
+    /// from there.
+    cursor: Option<(u64, String)>,
 }
 
 /// A local engine that follows a remote writer. See the module
@@ -210,7 +214,7 @@ impl ReplicaEngine {
             opts,
             config,
             mode: RwLock::new(Mode::Follower(disk)),
-            apply: Mutex::new(Apply { epoch }),
+            apply: Mutex::new(Apply { epoch, cursor: None }),
             promoted: AtomicBool::new(false),
             epoch: AtomicU64::new(epoch),
             applied_lsn: AtomicU64::new(lsn),
@@ -261,7 +265,7 @@ impl ReplicaEngine {
             return Ok(1);
         };
         let store = &*self.store;
-        let state = read_remote_from(store, Some(local))?;
+        let state = read_remote_from(store, Some(local), apply.cursor.as_ref().map(|(e, k)| (*e, k.as_str())))?;
         if state.epochs.is_empty() {
             return Err(StorageError::Invalid("the object store holds no database to follow".into()));
         }
@@ -284,6 +288,7 @@ impl ReplicaEngine {
         };
         let mut waiting = false;
         let mut applied = 0u64;
+        let mut cursor = None;
         {
             let mode = self.mode.read();
             let Mode::Follower(disk) = &*mode else { return Ok(0) };
@@ -331,11 +336,18 @@ impl ReplicaEngine {
                 if off != bytes.len() {
                     return Err(StorageError::Corruption(format!("log object {} is damaged", object.key)));
                 }
+                // Complete, and not cut short by a takeover.
+                if disk.last_lsn() < object.limit {
+                    cursor = Some((object.epoch, object.key.clone()));
+                }
             }
             if applied > 0 {
                 disk.sync(disk.last_lsn())?;
                 *self.last_apply.lock() = Some(Instant::now());
             }
+        }
+        if cursor.is_some() {
+            apply.cursor = cursor;
         }
         self.waiting.store(waiting, Ordering::Release);
         Ok(applied)
@@ -378,6 +390,7 @@ impl ReplicaEngine {
             *mode = Mode::Follower(disk);
         }
         let _ = wipe(&self.opts, &staging);
+        apply.cursor = None;
         apply.epoch = epoch;
         self.epoch.store(epoch, Ordering::Release);
         self.applied_lsn.store(lsn, Ordering::Release);

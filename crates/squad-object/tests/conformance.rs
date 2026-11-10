@@ -42,6 +42,17 @@ fn conformance(store: &dyn ObjectStore) {
     assert_eq!(keys("b/deep/"), ["b/deep/er/three"]);
     assert!(keys("c").is_empty());
     assert_eq!(store.list("a/one").unwrap()[0].size, 11);
+    let after = |prefix: &str, after: &str| {
+        store.list_after(prefix, after).unwrap().into_iter().map(|m| m.key).collect::<Vec<_>>()
+    };
+    assert_eq!(after("", ""), ["a/one", "a/two", "b/deep/er/three"]);
+    assert_eq!(after("a/", "a/one"), ["a/two"]);
+    assert_eq!(after("a/", "a/o"), ["a/one", "a/two"]);
+    assert_eq!(after("", "a/two"), ["b/deep/er/three"]);
+    assert_eq!(after("b/", "a/two"), ["b/deep/er/three"]);
+    assert!(after("a/", "a/two").is_empty());
+    assert!(after("a/", "b").is_empty());
+    assert_eq!(store.list_after("a/", "a/o").unwrap(), store.list("a/").unwrap());
 
     // Conditional creation.
     assert!(store.put_if_absent("lock/1", b"mine").unwrap());

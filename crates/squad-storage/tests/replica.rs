@@ -127,7 +127,12 @@ fn a_replica_starts_from_snapshot_and_log_and_follows() {
         assert_eq!(contents(&r), model, "round {round}");
         assert_eq!(r.status().applied_lsn, w.disk().last_lsn());
     }
+    // A poll that finds nothing new is a handful of requests, however
+    // much log the store holds.
+    let requests = store.requests();
     assert_eq!(r.poll(&mut ()).unwrap(), 0);
+    let idle = store.requests() - requests;
+    assert!(idle <= 6, "{idle} requests for an idle poll");
     let by_writer = w.remote_stats();
     assert!(by_writer.shipped_lsn >= r.status().applied_lsn);
     drop(r);

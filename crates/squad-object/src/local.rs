@@ -58,7 +58,7 @@ impl LocalStore {
         Ok(tmp)
     }
 
-    fn walk(&self, dir: &Path, prefix: &str, out: &mut Vec<ObjectMeta>) -> Result<()> {
+    fn walk(&self, dir: &Path, prefix: &str, after: &str, out: &mut Vec<ObjectMeta>) -> Result<()> {
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -78,9 +78,9 @@ impl LocalStore {
                 // Only descend where keys with the prefix can live.
                 let as_dir = format!("{key}/");
                 if as_dir.starts_with(prefix) || prefix.starts_with(&as_dir) {
-                    self.walk(&path, prefix, out)?;
+                    self.walk(&path, prefix, after, out)?;
                 }
-            } else if key.starts_with(prefix) {
+            } else if key.starts_with(prefix) && key.as_str() > after {
                 out.push(ObjectMeta { key, size: entry.metadata()?.len() });
             }
         }
@@ -162,7 +162,16 @@ impl ObjectStore for LocalStore {
 
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
         let mut out = Vec::new();
-        self.walk(&self.dir, prefix, &mut out)?;
+        self.walk(&self.dir, prefix, "", &mut out)?;
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(out)
+    }
+
+    fn list_after(&self, prefix: &str, after: &str) -> Result<Vec<ObjectMeta>> {
+        // The directory is still read in full, but only new files are
+        // looked at.
+        let mut out = Vec::new();
+        self.walk(&self.dir, prefix, after, &mut out)?;
         out.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(out)
     }

@@ -98,6 +98,16 @@ pub trait ObjectStore: Send + Sync + 'static {
     /// All objects whose key starts with `prefix`, sorted by key.
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
 
+    /// The objects whose key starts with `prefix` and sorts after
+    /// `after`, sorted by key. For a reader that follows keys which only
+    /// ever grow, this costs in proportion to what is new, where the
+    /// store supports it.
+    fn list_after(&self, prefix: &str, after: &str) -> Result<Vec<ObjectMeta>> {
+        let mut all = self.list(prefix)?;
+        all.retain(|m| m.key.as_str() > after);
+        Ok(all)
+    }
+
     /// Deletes the object. Deleting a missing object succeeds.
     fn delete(&self, key: &str) -> Result<()>;
 }
@@ -146,6 +156,9 @@ impl<T: ObjectStore + ?Sized> ObjectStore for std::sync::Arc<T> {
     }
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
         (**self).list(prefix)
+    }
+    fn list_after(&self, prefix: &str, after: &str) -> Result<Vec<ObjectMeta>> {
+        (**self).list_after(prefix, after)
     }
     fn delete(&self, key: &str) -> Result<()> {
         (**self).delete(key)

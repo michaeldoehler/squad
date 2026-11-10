@@ -362,7 +362,7 @@ fn list(state: &State, req: &Request) -> (u16, Vec<(&'static str, String)>, Vec<
         return (404, vec![], error_xml("NotImplemented", "only ListObjectsV2 is supported"));
     }
     let prefix = param("prefix").unwrap_or_default();
-    let after = param("continuation-token").unwrap_or_default();
+    let after = param("continuation-token").or_else(|| param("start-after")).unwrap_or_default();
     let page = state.page_size.load(Ordering::SeqCst) as usize;
     let objects = state.objects.lock();
     let mut matching = objects.iter().filter(|(k, _)| k.starts_with(&prefix) && k.as_str() > after.as_str());

@@ -156,6 +156,10 @@ impl<S: ObjectStore> ObjectStore for CachedStore<S> {
         self.inner.list(prefix)
     }
 
+    fn list_after(&self, prefix: &str, after: &str) -> Result<Vec<ObjectMeta>> {
+        self.inner.list_after(prefix, after)
+    }
+
     fn delete(&self, key: &str) -> Result<()> {
         self.forget(key);
         self.inner.delete(key)
