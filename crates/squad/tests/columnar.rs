@@ -90,7 +90,10 @@ fn rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
         .unwrap_or_else(|e| panic!("{sql}: {e}"))
         .iter()
         .map(|r| {
-            r.values().iter().map(|v| if v.is_null() { "NULL".into() } else { squad::value::format_value(v, &ctx) }).collect()
+            r.values()
+                .iter()
+                .map(|v| if v.is_null() { "NULL".into() } else { squad::value::format_value(v, &ctx) })
+                .collect()
         })
         .collect()
 }
@@ -123,7 +126,12 @@ fn columnar_tables_answer_like_ordinary_tables() {
     compare_all(&conn, "several segments and delta");
 
     // Deletes rewrite the segments that hold matching rows.
-    for predicate in ["ts < '2024-01-01 06:00:00'", "name = 'signup' AND duration > 300", "user_id IS NULL", "props ->> 's' = 'v1' AND project = 4"] {
+    for predicate in [
+        "ts < '2024-01-01 06:00:00'",
+        "name = 'signup' AND duration > 300",
+        "user_id IS NULL",
+        "props ->> 's' = 'v1' AND project = 4",
+    ] {
         let expected = conn.execute(&format!("DELETE FROM plain WHERE {predicate}"), &[]).unwrap();
         let actual = conn.execute(&format!("DELETE FROM col WHERE {predicate}"), &[]).unwrap();
         assert_eq!(actual, expected, "DELETE WHERE {predicate}");
@@ -131,7 +139,10 @@ fn columnar_tables_answer_like_ordinary_tables() {
     }
 
     // A rolled-back transaction leaves both parts untouched.
-    conn.batch_execute("BEGIN; DELETE FROM col; INSERT INTO col (ts, project, name) VALUES ('2030-01-01', 1, 'x'); ROLLBACK").unwrap();
+    conn.batch_execute(
+        "BEGIN; DELETE FROM col; INSERT INTO col (ts, project, name) VALUES ('2030-01-01', 1, 'x'); ROLLBACK",
+    )
+    .unwrap();
     compare_all(&conn, "after rollback");
 
     // The fast path is taken where it applies.
@@ -150,7 +161,10 @@ fn approximate_aggregates_are_close() {
     conn.execute("INSERT INTO e SELECT g % 20000, g % 1000 FROM generate_series(1, 200000) g", &[]).unwrap();
     for stage in ["delta", "segments"] {
         let row = conn
-            .query_one("SELECT approx_count_distinct(u), approx_percentile(d, 0.5), approx_percentile(d, 0.99) FROM e", &[])
+            .query_one(
+                "SELECT approx_count_distinct(u), approx_percentile(d, 0.5), approx_percentile(d, 0.99) FROM e",
+                &[],
+            )
             .unwrap();
         let (distinct, p50, p99): (i64, f64, f64) = (row.get(0), row.get(1), row.get(2));
         assert!((distinct - 20000).abs() < 1000, "{stage}: distinct estimate {distinct}");
@@ -165,7 +179,8 @@ fn approximate_aggregates_are_close() {
 #[test]
 fn restrictions_are_reported() {
     let conn = Database::open_in_memory().unwrap().connect();
-    let unsupported = |sql: &str| assert_eq!(conn.batch_execute(sql).unwrap_err().code(), sqlstate::FEATURE_NOT_SUPPORTED, "{sql}");
+    let unsupported =
+        |sql: &str| assert_eq!(conn.batch_execute(sql).unwrap_err().code(), sqlstate::FEATURE_NOT_SUPPORTED, "{sql}");
     unsupported("CREATE TABLE c (id int PRIMARY KEY) USING columnar");
     unsupported("CREATE TABLE c (id int UNIQUE) USING columnar");
     unsupported("CREATE TABLE c (id int) USING nosuch");
@@ -176,7 +191,10 @@ fn restrictions_are_reported() {
     unsupported("DELETE FROM c RETURNING id");
     // Row constraints still apply on insert.
     assert_eq!(conn.batch_execute("INSERT INTO c (id) VALUES (0)").unwrap_err().code(), sqlstate::CHECK_VIOLATION);
-    assert_eq!(conn.batch_execute("INSERT INTO c (id) VALUES (NULL)").unwrap_err().code(), sqlstate::NOT_NULL_VIOLATION);
+    assert_eq!(
+        conn.batch_execute("INSERT INTO c (id) VALUES (NULL)").unwrap_err().code(),
+        sqlstate::NOT_NULL_VIOLATION
+    );
     conn.batch_execute("INSERT INTO c (id) VALUES (1)").unwrap();
     assert_eq!(rows(&conn, "SELECT id, v FROM c"), vec![vec!["1".to_string(), "d".to_string()]]);
 }
@@ -198,7 +216,10 @@ fn segments_survive_reopen_and_live_in_the_object_directory() {
     assert_eq!(segments, 1, "one table directory in the object store");
     let db = Database::open(dir.path(), Config::default()).unwrap();
     let conn = db.connect();
-    assert_eq!(rows(&conn, "SELECT name, count(*), sum(duration), min(ts) FROM col GROUP BY name ORDER BY name"), expected);
+    assert_eq!(
+        rows(&conn, "SELECT name, count(*), sum(duration), min(ts) FROM col GROUP BY name ORDER BY name"),
+        expected
+    );
     compare_all(&conn, "after reopen");
     conn.batch_execute("DROP TABLE col").unwrap();
     let left: usize = walk(&dir.path().join("objects"));
@@ -206,9 +227,8 @@ fn segments_survive_reopen_and_live_in_the_object_directory() {
 }
 
 fn walk(dir: &std::path::Path) -> usize {
-    std::fs::read_dir(dir).map_or(0, |entries| {
-        entries.flatten().map(|e| if e.path().is_dir() { walk(&e.path()) } else { 1 }).sum()
-    })
+    std::fs::read_dir(dir)
+        .map_or(0, |entries| entries.flatten().map(|e| if e.path().is_dir() { walk(&e.path()) } else { 1 }).sum())
 }
 
 #[test]
@@ -222,7 +242,8 @@ fn readers_see_consistent_totals_during_inserts_and_compaction() {
             let conn = db.connect();
             thread::spawn(move || {
                 for b in 0..40 {
-                    conn.execute("INSERT INTO e SELECT $1, g FROM generate_series(0, 99) g", &[&(w * 1000 + b)]).unwrap();
+                    conn.execute("INSERT INTO e SELECT $1, g FROM generate_series(0, 99) g", &[&(w * 1000 + b)])
+                        .unwrap();
                 }
             })
         })

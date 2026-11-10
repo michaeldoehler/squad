@@ -8,9 +8,9 @@
 //! evicted before a checkpoint has made it durable, so the data file always
 //! holds exactly the state of the last completed checkpoint.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -173,7 +173,10 @@ impl Pool {
         if let Some(&i) = s.map.get(&pid) {
             return Ok(s.slots[i].as_ref().unwrap().page.clone());
         }
-        s.insert(Entry { pid, page: page.clone(), dirty_epoch: 0, referenced: AtomicBool::new(true) }, self.cap_per_shard);
+        s.insert(
+            Entry { pid, page: page.clone(), dirty_epoch: 0, referenced: AtomicBool::new(true) },
+            self.cap_per_shard,
+        );
         Ok(page)
     }
 
@@ -214,7 +217,10 @@ impl Pool {
             e.page = Arc::new(page);
         } else {
             self.dirty.fetch_add(1, Ordering::Relaxed);
-            s.insert(Entry { pid, page: Arc::new(page), dirty_epoch: epoch, referenced: AtomicBool::new(true) }, self.cap_per_shard);
+            s.insert(
+                Entry { pid, page: Arc::new(page), dirty_epoch: epoch, referenced: AtomicBool::new(true) },
+                self.cap_per_shard,
+            );
         }
     }
 

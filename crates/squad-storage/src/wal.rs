@@ -51,7 +51,7 @@ pub fn create_segment(vfs: &dyn Vfs, dir: &Path, seq: u64) -> Result<Arc<dyn Vfs
     let mut hdr = [0u8; SEG_HEADER];
     hdr[..8].copy_from_slice(SEG_MAGIC);
     hdr[8..].copy_from_slice(&seq.to_le_bytes());
-        file.write_at(&hdr, 0)?;
+    file.write_at(&hdr, 0)?;
     file.write_at(&vec![0u8; PREALLOC as usize - SEG_HEADER], SEG_HEADER as u64)?;
     file.sync()?;
     Ok(file)
@@ -133,7 +133,7 @@ pub struct Wal {
     pub dir: PathBuf,
     cur: Arc<dyn VfsFile>,
     pub cur_seq: u64,
-        cur_off: u64,
+    cur_off: u64,
     /// Length of the current segment file; everything from `cur_off` up
     /// to here is zeros.
     allocated: u64,
@@ -154,7 +154,7 @@ impl Wal {
             dir,
             cur,
             cur_seq,
-                        cur_off: SEG_HEADER as u64,
+            cur_off: SEG_HEADER as u64,
             allocated: PREALLOC,
             buf: Vec::new(),
             last_lsn,
@@ -178,7 +178,7 @@ impl Wal {
 
     /// Hands buffered records to the operating system (no fsync).
     pub fn flush_buf(&mut self) -> Result<()> {
-                if !self.buf.is_empty() {
+        if !self.buf.is_empty() {
             let end = self.cur_off + self.buf.len() as u64;
             if end > self.allocated {
                 // Extend ahead of the write position.
@@ -206,7 +206,7 @@ impl Wal {
         self.flush_buf()?;
         let old = std::mem::replace(&mut self.cur, file);
         self.pending_sync.push(old);
-                self.cur_seq = seq;
+        self.cur_seq = seq;
         self.cur_off = SEG_HEADER as u64;
         self.allocated = PREALLOC;
         Ok(std::mem::take(&mut self.bytes))

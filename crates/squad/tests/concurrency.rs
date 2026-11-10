@@ -36,7 +36,8 @@ fn retrying<T>(conn: &Connection, mut f: impl FnMut(&Connection) -> squad::Resul
 
 #[test]
 fn read_committed_updates_are_not_lost() {
-    let db = database("CREATE TABLE counter (id int PRIMARY KEY, n bigint NOT NULL); INSERT INTO counter VALUES (1, 0)");
+    let db =
+        database("CREATE TABLE counter (id int PRIMARY KEY, n bigint NOT NULL); INSERT INTO counter VALUES (1, 0)");
     let threads: Vec<_> = (0..8)
         .map(|_| {
             let conn = db.connect();
@@ -57,7 +58,8 @@ fn read_committed_rechecks_the_predicate_after_waiting() {
     let (a, b) = (db.connect(), db.connect());
     a.batch_execute("BEGIN").unwrap();
     assert_eq!(a.execute("UPDATE t SET state = 'taken' WHERE id = 1 AND state = 'new'", &[]).unwrap(), 1);
-    let waiter = thread::spawn(move || b.execute("UPDATE t SET state = 'stolen' WHERE id = 1 AND state = 'new'", &[]).unwrap());
+    let waiter =
+        thread::spawn(move || b.execute("UPDATE t SET state = 'stolen' WHERE id = 1 AND state = 'new'", &[]).unwrap());
     thread::sleep(Duration::from_millis(100));
     a.batch_execute("COMMIT").unwrap();
     // The second update waited, saw the committed row no longer matches
@@ -72,7 +74,8 @@ fn repeatable_read_sees_one_snapshot_and_fails_on_concurrent_update() {
     let (a, b) = (db.connect(), db.connect());
     a.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
     assert_eq!(count(&a, "SELECT sum(v) FROM t"), 30);
-    b.batch_execute("UPDATE t SET v = 11 WHERE id = 1; INSERT INTO t VALUES (3, 30); DELETE FROM t WHERE id = 2").unwrap();
+    b.batch_execute("UPDATE t SET v = 11 WHERE id = 1; INSERT INTO t VALUES (3, 30); DELETE FROM t WHERE id = 2")
+        .unwrap();
     // Still the old snapshot: no changed, new or missing rows.
     assert_eq!(count(&a, "SELECT sum(v) FROM t"), 30);
     assert_eq!(count(&a, "SELECT count(*) FROM t"), 2);
@@ -224,7 +227,11 @@ fn upserts_from_many_connections_count_exactly() {
             thread::spawn(move || {
                 for i in 0..200 {
                     let page = format!("/p{}", i % 5);
-                    conn.execute("INSERT INTO hits VALUES ($1, 1) ON CONFLICT (page) DO UPDATE SET n = hits.n + 1", &[&page]).unwrap();
+                    conn.execute(
+                        "INSERT INTO hits VALUES ($1, 1) ON CONFLICT (page) DO UPDATE SET n = hits.n + 1",
+                        &[&page],
+                    )
+                    .unwrap();
                 }
             })
         })
@@ -246,12 +253,17 @@ fn skip_locked_hands_out_every_job_once() {
             thread::spawn(move || loop {
                 conn.batch_execute("BEGIN").unwrap();
                 let job = conn
-                    .query_opt("SELECT id FROM jobs WHERE state = 'pending' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED", &[])
+                    .query_opt(
+                        "SELECT id FROM jobs WHERE state = 'pending' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED",
+                        &[],
+                    )
                     .unwrap();
                 let Some(job) = job else {
                     conn.batch_execute("COMMIT").unwrap();
                     // Nothing claimable right now; done once nothing is pending.
-                    if conn.query_one("SELECT count(*) FROM jobs WHERE state = 'pending'", &[]).unwrap().get::<i64>(0) == 0 {
+                    if conn.query_one("SELECT count(*) FROM jobs WHERE state = 'pending'", &[]).unwrap().get::<i64>(0)
+                        == 0
+                    {
                         break;
                     }
                     continue;
@@ -326,7 +338,8 @@ fn foreign_keys_hold_against_concurrent_parent_deletes() {
     inserter.join().unwrap();
     deleter.join().unwrap();
     let conn = db.connect();
-    let orphans = count(&conn, "SELECT count(*) FROM child c WHERE NOT EXISTS (SELECT 1 FROM parent p WHERE p.id = c.parent_id)");
+    let orphans =
+        count(&conn, "SELECT count(*) FROM child c WHERE NOT EXISTS (SELECT 1 FROM parent p WHERE p.id = c.parent_id)");
     assert_eq!(orphans, 0, "no child may reference a deleted parent");
     // Both sides made progress: some parents went, some were kept alive
     // by a child.
@@ -356,7 +369,9 @@ fn writers_wait_for_each_other_but_not_for_readers() {
 
 #[test]
 fn concurrent_schema_changes_and_queries() {
-    let db = database("CREATE TABLE t (id int PRIMARY KEY, v int NOT NULL); INSERT INTO t SELECT g, g FROM generate_series(1, 200) g");
+    let db = database(
+        "CREATE TABLE t (id int PRIMARY KEY, v int NOT NULL); INSERT INTO t SELECT g, g FROM generate_series(1, 200) g",
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let mut workers = Vec::new();
     for w in 0..3 {

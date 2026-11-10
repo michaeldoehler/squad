@@ -75,7 +75,11 @@ fn main() {
     let t_compact = start.elapsed().as_secs_f64();
     println!("rows: {rows}");
     println!("load row table:            {:>8.1} s  {:>9.0} rows/s", t_row, rows as f64 / t_row);
-    println!("load columnar table:       {:>8.1} s  {:>9.0} rows/s (insert, including automatic compaction)", t_col, rows as f64 / t_col);
+    println!(
+        "load columnar table:       {:>8.1} s  {:>9.0} rows/s (insert, including automatic compaction)",
+        t_col,
+        rows as f64 / t_col
+    );
     println!("final VACUUM (compaction): {:>8.1} s\n", t_compact);
 
     let queries: &[(&str, &str)] = &[

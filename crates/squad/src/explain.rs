@@ -81,7 +81,7 @@ fn walk(plan: &Plan, depth: usize, out: &mut Vec<String>) {
             walk(left, depth + 1, out);
             walk(right, depth + 1, out);
         }
-                Plan::ColumnarAgg { scan, groups, .. } => {
+        Plan::ColumnarAgg { scan, groups, .. } => {
             line(format!(
                 "Columnar {} on {}",
                 if groups.is_empty() { "Aggregate" } else { "HashAggregate" },

@@ -556,7 +556,7 @@ impl<'a> Binder<'a> {
             if having.as_ref().is_some_and(super::opt::cannot_be_true) {
                 plan = self.push_filter(plan, Some(Expr::Const(crate::types::Value::Bool(false))), &scope.types())?;
             }
-                        plan = match plan {
+            plan = match plan {
                 // Aggregations over one columnar table go to the column
                 // engine, which decides at run time whether it can
                 // express the filter.

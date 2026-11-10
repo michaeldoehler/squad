@@ -35,7 +35,7 @@ pub enum Type {
     Enum(String),
     /// Row type of an anonymous record (`ROW(...)`, whole-row references).
     Record,
-        /// An untyped string literal or NULL whose type is decided by context.
+    /// An untyped string literal or NULL whose type is decided by context.
     Unknown,
     Void,
     /// Object identifier, as found in the system catalogs. Values are
@@ -70,7 +70,7 @@ impl Type {
             Type::Numeric => 1700,
             Type::Uuid => 2950,
             Type::Jsonb => 3802,
-                        Type::Record => 2249,
+            Type::Record => 2249,
             Type::Void => 2278,
             Type::Oid => 26,
             Type::Char => 18,
@@ -103,7 +103,7 @@ impl Type {
     pub fn from_oid(oid: u32) -> Option<Type> {
         let scalar = |oid| {
             Some(match oid {
-                                16 => Type::Bool,
+                16 => Type::Bool,
                 17 => Type::Bytea,
                 18 => Type::Char,
                 26 => Type::Oid,
@@ -127,7 +127,7 @@ impl Type {
             })
         };
         scalar(oid).or_else(|| {
-                        let elem = match oid {
+            let elem = match oid {
                 1000 => 16,
                 1002 => 18,
                 1028 => 26,
@@ -176,7 +176,7 @@ impl Type {
             Type::Array(e) => format!("{}[]", e.name()),
             Type::Enum(n) => n.clone(),
             Type::Record => "record".into(),
-                        Type::Unknown => "unknown".into(),
+            Type::Unknown => "unknown".into(),
             Type::Void => "void".into(),
             Type::Oid => "oid".into(),
             Type::Char => "\"char\"".into(),
@@ -201,7 +201,7 @@ impl Type {
             "bool" | "boolean" => Type::Bool,
             "int2" | "smallint" | "smallserial" | "serial2" => Type::Int2,
             "int4" | "int" | "integer" | "serial" | "serial4" => Type::Int4,
-                        "oid" => Type::Oid,
+            "oid" => Type::Oid,
             "int8" | "bigint" | "bigserial" | "serial8" | "regclass" | "regtype" | "regproc" | "xid" => Type::Int8,
             "float4" | "real" => Type::Float4,
             "float8" | "double precision" | "float" => Type::Float8,

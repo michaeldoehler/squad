@@ -55,7 +55,17 @@ struct Args {
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
-    const WITH_VALUE: &[&str] = &["--listen", "--unix-socket-dir", "--user", "--password", "--sync", "--remote", "--remote-sync", "--replica-of", "--poll-interval"];
+    const WITH_VALUE: &[&str] = &[
+        "--listen",
+        "--unix-socket-dir",
+        "--user",
+        "--password",
+        "--sync",
+        "--remote",
+        "--remote-sync",
+        "--replica-of",
+        "--poll-interval",
+    ];
     const FLAGS: &[&str] = &["--memory", "--cleartext-password", "--remote-restore"];
     let mut parsed = Args { positional: Vec::new(), options: HashMap::new(), flags: Vec::new() };
     let mut it = args.iter();
@@ -95,17 +105,18 @@ fn open(args: &Args, dir: Option<&String>) -> Result<Database, String> {
         let store = squad::object::open_url(url).map_err(|e| format!("cannot open \"{url}\": {e}"))?;
         let mut replica = ReplicaConfig::new(store);
         replica.sync_mode = config.sync_mode;
-        replica.promoted_sync = match args.options.get("--remote-sync").and_then(|v| v.last()).map_or("sync", String::as_str)
-        {
-            "async" => RemoteSync::Async { interval: std::time::Duration::from_secs(1) },
-            "sync" => RemoteSync::Sync,
-            other => return Err(format!("invalid --remote-sync mode \"{other}\" (expected async or sync)")),
-        };
+        replica.promoted_sync =
+            match args.options.get("--remote-sync").and_then(|v| v.last()).map_or("sync", String::as_str) {
+                "async" => RemoteSync::Async { interval: std::time::Duration::from_secs(1) },
+                "sync" => RemoteSync::Sync,
+                other => return Err(format!("invalid --remote-sync mode \"{other}\" (expected async or sync)")),
+            };
         if let Some(ms) = args.options.get("--poll-interval").and_then(|v| v.last()) {
             let ms: u64 = ms.parse().map_err(|_| format!("invalid --poll-interval \"{ms}\" (milliseconds)"))?;
             replica.poll_interval = std::time::Duration::from_millis(ms.max(1));
         }
-        return Database::open_replica(dir, replica).map_err(|e| format!("cannot open replica \"{dir}\" of \"{url}\": {e}"));
+        return Database::open_replica(dir, replica)
+            .map_err(|e| format!("cannot open replica \"{dir}\" of \"{url}\": {e}"));
     }
     if args.options.contains_key("--poll-interval") {
         return Err("--poll-interval needs --replica-of".into());

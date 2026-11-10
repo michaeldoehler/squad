@@ -72,7 +72,13 @@ fn main() -> squad::Result<()> {
     let insert = conn.prepare("INSERT INTO bench VALUES ($1, $2, $3, NULL)")?;
     report("insert one row", time(100_000, |i| insert.execute(&[&(ROWS + 1 + i as i64), &"new", &7i32]).unwrap()));
 
-    report("ad-hoc select (plan cache)", time(100_000, |i| conn.query(&format!("SELECT name FROM bench WHERE id = {}", key(i) % 64 + 1), &[]).unwrap()));
-    report("aggregate over 100k rows", time(20, |_| conn.query_one("SELECT count(*), sum(score) FROM bench", &[]).unwrap()));
+    report(
+        "ad-hoc select (plan cache)",
+        time(100_000, |i| conn.query(&format!("SELECT name FROM bench WHERE id = {}", key(i) % 64 + 1), &[]).unwrap()),
+    );
+    report(
+        "aggregate over 100k rows",
+        time(20, |_| conn.query_one("SELECT count(*), sum(score) FROM bench", &[]).unwrap()),
+    );
     Ok(())
 }

@@ -762,9 +762,14 @@ fn create_table(sess: &mut Session, stmt: &pb::CreateStmt) -> Result<QueryResult
                     }
                     for col in arg.and_then(const_text).unwrap_or_default().split(',') {
                         let col = col.trim();
-                        order_by.push(table.columns.iter().position(|c| c.name == col && !c.hidden).ok_or_else(|| {
-                            Error::new(sqlstate::UNDEFINED_COLUMN, format!("column \"{col}\" named in order_by does not exist"))
-                        })?);
+                        order_by.push(table.columns.iter().position(|c| c.name == col && !c.hidden).ok_or_else(
+                            || {
+                                Error::new(
+                                    sqlstate::UNDEFINED_COLUMN,
+                                    format!("column \"{col}\" named in order_by does not exist"),
+                                )
+                            },
+                        )?);
                     }
                 }
                 table.columnar = Some(crate::catalog::Columnar { order_by });

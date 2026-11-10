@@ -52,8 +52,12 @@ struct Squad {
 impl Squad {
     fn connect(db: &Database) -> Squad {
         let conn = db.connect();
-        conn.batch_execute(&format!("{};{}", SCHEMA.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS"), INDEX.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS")))
-            .unwrap();
+        conn.batch_execute(&format!(
+            "{};{}",
+            SCHEMA.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS"),
+            INDEX.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS")
+        ))
+        .unwrap();
         Squad {
             db: db.clone(),
             select: conn.prepare("SELECT name FROM bench WHERE id = $1").unwrap(),
@@ -214,7 +218,10 @@ impl Target for Postgres {
     }
     fn load(&mut self, rows: i64) {
         self.client
-            .execute("INSERT INTO bench SELECT g, 'user ' || g, g % 1000 FROM generate_series(1, $1::bigint) g", &[&rows])
+            .execute(
+                "INSERT INTO bench SELECT g, 'user ' || g, g % 1000 FROM generate_series(1, $1::bigint) g",
+                &[&rows],
+            )
             .unwrap();
         self.client.batch_execute("VACUUM ANALYZE bench").unwrap();
         self.client.batch_execute("CHECKPOINT").unwrap();

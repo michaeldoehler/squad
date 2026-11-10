@@ -9,7 +9,10 @@ fn memory() -> squad::Connection {
 #[test]
 fn typed_parameters_and_results() {
     let conn = memory();
-    conn.batch_execute("CREATE TABLE t (id bigint PRIMARY KEY, name text, score float8, ok boolean, data bytea, tags text[])").unwrap();
+    conn.batch_execute(
+        "CREATE TABLE t (id bigint PRIMARY KEY, name text, score float8, ok boolean, data bytea, tags text[])",
+    )
+    .unwrap();
     let n = conn
         .execute(
             "INSERT INTO t VALUES ($1, $2, $3, $4, $5, $6)",
@@ -104,7 +107,11 @@ fn data_survives_reopen() {
         )
         .unwrap();
         for i in 0..500 {
-            conn.execute("INSERT INTO t (name, c, n) VALUES ($1, 'green', $2)", &[&format!("row {i}"), &(i as f64 / 4.0)]).unwrap();
+            conn.execute(
+                "INSERT INTO t (name, c, n) VALUES ($1, 'green', $2)",
+                &[&format!("row {i}"), &(i as f64 / 4.0)],
+            )
+            .unwrap();
         }
         conn.execute("DELETE FROM t WHERE id % 2 = 0", &[]).unwrap();
         assert!(Database::open(dir.path(), Config::default()).is_err(), "second open must be refused");
@@ -117,7 +124,10 @@ fn data_survives_reopen() {
     // The sequence continues after the highest value handed out.
     let id: i32 = conn.query_one("INSERT INTO t (name) VALUES ('new') RETURNING id", &[]).unwrap().get(0);
     assert!(id > 500, "sequence restarted at {id}");
-    assert_eq!(conn.execute("INSERT INTO t (name) VALUES ('new')", &[]).unwrap_err().code(), sqlstate::UNIQUE_VIOLATION);
+    assert_eq!(
+        conn.execute("INSERT INTO t (name) VALUES ('new')", &[]).unwrap_err().code(),
+        sqlstate::UNIQUE_VIOLATION
+    );
     assert!(db.verify().unwrap().is_ok());
 
     let backup = dir.path().join("backup");

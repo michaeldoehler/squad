@@ -85,9 +85,14 @@ enum Kind {
 fn kind(col: &Column) -> Kind {
     match &col.ty {
         Type::Bool => Kind::Bool,
-        Type::Int2 | Type::Int4 | Type::Int8 | Type::Oid | Type::Date | Type::Time | Type::Timestamp | Type::TimestampTz => {
-            Kind::Int
-        }
+        Type::Int2
+        | Type::Int4
+        | Type::Int8
+        | Type::Oid
+        | Type::Date
+        | Type::Time
+        | Type::Timestamp
+        | Type::TimestampTz => Kind::Int,
         Type::Float4 | Type::Float8 => Kind::Float,
         Type::Numeric if col.typmod >= 4 => Kind::Decimal(((col.typmod - 4) & 0xffff).min(28) as u8),
         Type::Text | Type::Enum(_) | Type::Char => Kind::Text,
@@ -163,7 +168,9 @@ fn from_datum(d: cs::Datum, col: &Column, cx: &ExecCx) -> Result<Value> {
         (cs::Datum::Float(f), Type::Float4) => Value::Float4(f as f32),
         (cs::Datum::Float(f), _) => Value::Float8(f),
         (cs::Datum::Decimal(m), _) => match kind(col) {
-            Kind::Decimal(scale) => Value::Numeric(Decimal::try_from_i128_with_scale(m, scale as u32).map_err(|_| bad())?),
+            Kind::Decimal(scale) => {
+                Value::Numeric(Decimal::try_from_i128_with_scale(m, scale as u32).map_err(|_| bad())?)
+            }
             _ => return Err(bad()),
         },
         (cs::Datum::Bytes(b), ty) => match (kind(col), ty) {
@@ -204,6 +211,10 @@ fn rows_to_batch(table: &Table, rows: &[Row], cx: &ExecCx) -> Result<cs::Batch> 
 #[derive(Default)]
 pub(crate) struct SegmentCache {
     inner: Mutex<CacheInner>,
+    /// Replaced segment objects waiting for old snapshots to end, with
+    /// the timestamp of the commit that replaced them.
+    retired: Mutex<Vec<(u64, String)>>,
+    retired_count: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -237,6 +248,39 @@ impl SegmentCache {
         inner.order.push(key.to_string());
         inner.map.insert(key.to_string(), (segment.clone(), size));
         Ok(segment)
+    }
+
+    /// Queues segment objects that a commit at `ts` replaced. They are
+    /// deleted by [`sweep`](SegmentCache::sweep) once no snapshot can
+    /// still read a manifest that names them.
+    pub(crate) fn retire(&self, ts: u64, keys: Vec<String>) {
+        let mut retired = self.retired.lock();
+        retired.extend(keys.into_iter().map(|k| (ts, k)));
+        self.retired_count.store(retired.len(), std::sync::atomic::Ordering::Release);
+    }
+
+    /// True if segment objects wait to be deleted.
+    pub(crate) fn has_retired(&self) -> bool {
+        self.retired_count.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+
+    /// Deletes retired segment objects that no snapshot at or after
+    /// `horizon` can name.
+    pub(crate) fn sweep(&self, horizon: u64, store: &dyn squad_object::ObjectStore) {
+        let due: Vec<String> = {
+            let mut retired = self.retired.lock();
+            if retired.is_empty() {
+                return;
+            }
+            let (due, keep): (Vec<_>, Vec<_>) = retired.drain(..).partition(|(ts, _)| *ts <= horizon);
+            *retired = keep;
+            self.retired_count.store(retired.len(), std::sync::atomic::Ordering::Release);
+            due.into_iter().map(|(_, k)| k).collect()
+        };
+        for key in due {
+            self.forget(&key);
+            let _ = store.delete(&key);
+        }
     }
 
     pub(crate) fn forget(&self, key: &str) {
@@ -350,7 +394,9 @@ fn predicate(e: &Expr, table: &Table, pos: &[Option<usize>], cx: &mut ExecCx) ->
         Expr::And(items) => list(items, cx)?.map(cs::Predicate::And),
         Expr::Or(items) => list(items, cx)?.map(cs::Predicate::Or),
         Expr::Not(inner) => predicate(inner, table, pos, cx)?.map(|p| cs::Predicate::Not(Box::new(p))),
-        Expr::IsNull(inner, negated) => target(inner).map(|(column, _)| cs::Predicate::IsNull { column, negated: *negated }),
+        Expr::IsNull(inner, negated) => {
+            target(inner).map(|(column, _)| cs::Predicate::IsNull { column, negated: *negated })
+        }
         Expr::Column(i) if table.columns[*i].ty == Type::Bool => pos[*i].map(cs::Predicate::BoolColumn),
         Expr::InList(inner, items, negated) => {
             let Some((column, col)) = target(inner) else { return Ok(None) };
@@ -490,8 +536,11 @@ impl Node for SegmentRows<'_> {
                 self.next = (s + 1, 0);
                 let mut source = cs::TableSource::new(schema(table));
                 source.segments.push(segment.clone());
-                let request =
-                    cs::ScanRequest { projection: self.projection.clone(), predicate: Some(exact.clone()), limit: None };
+                let request = cs::ScanRequest {
+                    projection: self.projection.clone(),
+                    predicate: Some(exact.clone()),
+                    limit: None,
+                };
                 let mut rows = Vec::new();
                 for batch in cs::scan(&source, &request)? {
                     batch_rows(table, &batch?, &mut rows, cx)?;
@@ -554,7 +603,12 @@ enum Mapped {
 /// Runs `SELECT groups, aggs FROM table WHERE filter GROUP BY groups` in
 /// the column engine. Returns `None` if some part cannot be expressed
 /// there; the caller then runs the ordinary plan.
-pub(crate) fn aggregate(plan: &ScanPlan, groups: &[Expr], aggs: &[AggCall], cx: &mut ExecCx) -> Result<Option<Vec<Row>>> {
+pub(crate) fn aggregate(
+    plan: &ScanPlan,
+    groups: &[Expr],
+    aggs: &[AggCall],
+    cx: &mut ExecCx,
+) -> Result<Option<Vec<Row>>> {
     let table = &plan.table;
     let pos = segment_positions(table);
     let filter = match &plan.filter {
@@ -581,7 +635,9 @@ pub(crate) fn aggregate(plan: &ScanPlan, groups: &[Expr], aggs: &[AggCall], cx: 
                 key_info.push(Key::Column(col));
             }
             Expr::Call(f, args) if &*f.name == "date_trunc" && args.len() == 2 => {
-                let (Expr::Const(Value::Text(unit)), Some(i)) = (&args[0], column_of(&args[1])) else { return Ok(None) };
+                let (Expr::Const(Value::Text(unit)), Some(i)) = (&args[0], column_of(&args[1])) else {
+                    return Ok(None);
+                };
                 let col = &table.columns[i];
                 // Buckets of timestamptz follow the session time zone;
                 // only UTC has fixed boundaries.
@@ -651,8 +707,12 @@ pub(crate) fn aggregate(plan: &ScanPlan, groups: &[Expr], aggs: &[AggCall], cx: 
             (AggFunc::Avg, Some((p, col)), false) if numeric(col) => {
                 Mapped::Avg(push(cs::Aggregate::Sum(p)), push(cs::Aggregate::Count(p)))
             }
-            (AggFunc::Min, Some((p, col)), _) if kind(col) != Kind::AsText => Mapped::Direct(push(cs::Aggregate::Min(p))),
-            (AggFunc::Max, Some((p, col)), _) if kind(col) != Kind::AsText => Mapped::Direct(push(cs::Aggregate::Max(p))),
+            (AggFunc::Min, Some((p, col)), _) if kind(col) != Kind::AsText => {
+                Mapped::Direct(push(cs::Aggregate::Min(p)))
+            }
+            (AggFunc::Max, Some((p, col)), _) if kind(col) != Kind::AsText => {
+                Mapped::Direct(push(cs::Aggregate::Max(p)))
+            }
             _ => return Ok(None),
         };
         mapped.push((m, a, column.map(|c| c.1)));
@@ -702,9 +762,9 @@ pub(crate) fn aggregate(plan: &ScanPlan, groups: &[Expr], aggs: &[AggCall], cx: 
                 (cs::Datum::Null, _) => Value::Null,
                 (cs::Datum::Float(f), Type::Float4) => Value::Float4(*f as f32),
                 (cs::Datum::Float(f), _) => Value::Float8(*f),
-                (d, Type::Int8) => {
-                    Value::Int8(int_of(d).and_then(|i| i64::try_from(i).ok()).ok_or_else(|| Error::out_of_range("bigint"))?)
-                }
+                (d, Type::Int8) => Value::Int8(
+                    int_of(d).and_then(|i| i64::try_from(i).ok()).ok_or_else(|| Error::out_of_range("bigint"))?,
+                ),
                 (d, _) => Value::Numeric(
                     int_of(d)
                         .and_then(|m| Decimal::try_from_i128_with_scale(m, scale).ok())
@@ -760,7 +820,8 @@ fn new_segment_id() -> String {
 
 fn writer_options(table: &Table) -> cs::WriterOptions {
     let pos = segment_positions(table);
-    let sort_key = table.columnar.as_ref().map(|c| c.order_by.iter().filter_map(|i| pos[*i]).collect()).unwrap_or_default();
+    let sort_key =
+        table.columnar.as_ref().map(|c| c.order_by.iter().filter_map(|i| pos[*i]).collect()).unwrap_or_default();
     cs::WriterOptions { sort_key, ..Default::default() }
 }
 

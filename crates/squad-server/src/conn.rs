@@ -105,7 +105,7 @@ fn row_description(io: &mut Io, columns: &[OutputColumn], formats: &[i16], types
         io.cstr(&c.name);
         io.i32(0); // table OID
         io.i16(0); // column number
-                io.i32(types.oid(&c.ty) as i32);
+        io.i32(types.oid(&c.ty) as i32);
         io.i16(type_len(&c.ty));
         io.i32(-1); // type modifier
         io.i16(format_at(formats, i));
@@ -519,7 +519,7 @@ impl Conn {
 
     /// Runs SQL text through the session, streaming every result.
     fn run_sql(&mut self, sql: &str) -> Step {
-                let ctx = self.fn_ctx();
+        let ctx = self.fn_ctx();
         let types = self.session.types();
         let io = &mut self.io;
         self.session.execute_each(sql, &mut |r| {
@@ -616,8 +616,9 @@ impl Conn {
     fn copy_in(&mut self, req: &CopyRequest) -> Step {
         // Refused before the client is asked for data.
         if self.session.shared().in_recovery() {
-            return Err(Error::new(sqlstate::READ_ONLY_SQL_TRANSACTION, "cannot execute COPY FROM on a read replica")
-                .into());
+            return Err(
+                Error::new(sqlstate::READ_ONLY_SQL_TRANSACTION, "cannot execute COPY FROM on a read replica").into()
+            );
         }
         let columns: Vec<String> = if req.columns.is_empty() {
             self.session.prepare(&req.select_sql(), &[])?.columns.iter().map(|c| c.name.clone()).collect()
@@ -730,12 +731,12 @@ impl Conn {
         let mut r = Reader::new(body);
         let name = r.cstr()?.to_string();
         let sql = r.cstr()?;
-                let n = r.i16()?.max(0) as usize;
+        let n = r.i16()?.max(0) as usize;
         let resolver = self.session.types();
         let mut types = Vec::with_capacity(n);
         for _ in 0..n {
             let oid = r.i32()? as u32;
-                        types.push(if oid == 0 { None } else { resolver.from_oid(oid).filter(|t| *t != Type::Unknown) });
+            types.push(if oid == 0 { None } else { resolver.from_oid(oid).filter(|t| *t != Type::Unknown) });
         }
         if !name.is_empty() && self.stmts.contains_key(&name) {
             return Err(Error::new(
@@ -841,7 +842,7 @@ impl Conn {
                     StmtKind::Sql(p) => (&p.param_types, &p.columns),
                     StmtKind::Copy(_) => (&[], &[]),
                 };
-                                let types = self.session.types();
+                let types = self.session.types();
                 let m = self.io.begin(b't');
                 self.io.i16(params.len() as i16);
                 for t in params {
@@ -859,7 +860,7 @@ impl Conn {
                     Error::new(sqlstate::INVALID_CURSOR_NAME, format!("portal \"{name}\" does not exist"))
                 })?;
                 match &portal.kind {
-                                        StmtKind::Sql(p) if !p.columns.is_empty() => {
+                    StmtKind::Sql(p) if !p.columns.is_empty() => {
                         row_description(&mut self.io, &p.columns, &portal.formats, &self.session.types())
                     }
                     _ => self.io.message(b'n', &[]),

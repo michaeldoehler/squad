@@ -200,7 +200,10 @@ fn check(db: &Database, model: &Model, ctx: &str) {
     // Acknowledged schema changes are in place.
     for column in &model.extra_columns {
         let n: i64 = conn
-            .query_one("SELECT count(*) FROM information_schema.columns WHERE table_name = 'ledger' AND column_name = $1", &[column])
+            .query_one(
+                "SELECT count(*) FROM information_schema.columns WHERE table_name = 'ledger' AND column_name = $1",
+                &[column],
+            )
             .unwrap()
             .get(0);
         assert_eq!(n, 1, "{ctx}: acknowledged column {column} is missing");
@@ -263,8 +266,11 @@ fn run_seed(seed: u64) {
         let db = open(&vfs, &mut rng).unwrap_or_else(|e| panic!("{ctx}: recovery failed: {e}"));
         check(&db, &model, &ctx);
         // What survived is now known for good.
-        let present: BTreeSet<i64> =
-            db.connect().query("SELECT txid FROM ledger", &[]).map(|r| r.iter().map(|x| x.get(0)).collect()).unwrap_or_default();
+        let present: BTreeSet<i64> = db
+            .connect()
+            .query("SELECT txid FROM ledger", &[])
+            .map(|r| r.iter().map(|x| x.get(0)).collect())
+            .unwrap_or_default();
         model.maybe.retain(|t| present.contains(t));
         model.acked.extend(std::mem::take(&mut model.maybe));
         if !model.seeded {

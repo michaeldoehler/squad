@@ -63,7 +63,7 @@ pub(crate) struct Inner {
     /// Newest commit timestamp visible to new snapshots.
     pub(crate) last_committed: AtomicU64,
     /// Snapshot timestamps in use, with reference counts.
-        pub(crate) snapshots: Snapshots,
+    pub(crate) snapshots: Snapshots,
     pub(crate) locks: LockManager,
     pub(crate) next_txn_id: AtomicU64,
     /// Number of live serializable transactions; commits only record their
@@ -92,7 +92,7 @@ pub(crate) struct Deferred {
 const MAX_DEFERRED_KEYS: usize = 1 << 20;
 
 impl Inner {
-        /// Takes a snapshot at the latest commit and registers it so that the
+    /// Takes a snapshot at the latest commit and registers it so that the
     /// versions it can see are kept. `hint` spreads transactions over the
     /// registry. Returns the timestamp and the registration to release.
     pub(crate) fn register_snapshot(&self, hint: u64) -> (u64, SnapshotSlot) {
@@ -194,7 +194,7 @@ impl Store {
                 engine,
                 commit_lock: Mutex::new(()),
                 last_committed: AtomicU64::new(last),
-                                snapshots: Snapshots::new(),
+                snapshots: Snapshots::new(),
                 locks: LockManager::default(),
                 next_txn_id: AtomicU64::new(1),
                 serializable_live: AtomicUsize::new(0),
@@ -333,9 +333,30 @@ impl Store {
     /// Removes every version and tombstone that no snapshot can see any
     /// more. Returns the number of engine entries removed.
     pub fn gc(&self) -> Result<u64> {
+        self.gc_encoded(codec::DATA_LO.to_vec(), codec::DATA_HI.to_vec())
+    }
+
+    /// Timestamp of the newest commit.
+    pub fn last_committed(&self) -> u64 {
+        self.inner.last_committed.load(Ordering::SeqCst)
+    }
+
+    /// The oldest timestamp any open snapshot reads at; the newest commit
+    /// if none is open. State replaced at or before it is invisible to
+    /// every present and future snapshot.
+    pub fn oldest_snapshot(&self) -> u64 {
+        self.inner.oldest_snapshot()
+    }
+
+    /// Like [`gc`](Store::gc), limited to keys in `lo..hi`.
+    pub fn gc_range(&self, lo: &[u8], hi: &[u8]) -> Result<u64> {
+        self.gc_encoded(codec::key_start(lo), codec::key_start(hi))
+    }
+
+    fn gc_encoded(&self, lo: Vec<u8>, hi: Vec<u8>) -> Result<u64> {
         let inner = &self.inner;
         let mut removed = 0u64;
-        let mut lo: Bound<Vec<u8>> = Bound::Included(codec::DATA_LO.to_vec());
+        let mut lo: Bound<Vec<u8>> = Bound::Included(lo);
         // State carried across chunks for the user key being processed.
         let mut cur_start: Vec<u8> = Vec::new();
         let mut covered = false; // a version <= horizon was already seen
@@ -349,7 +370,7 @@ impl Store {
                 Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
                 Bound::Unbounded => Bound::Unbounded,
             };
-            let mut chunk = inner.engine.scan(lo_ref, Bound::Excluded(codec::DATA_HI), false, 1024)?;
+            let mut chunk = inner.engine.scan(lo_ref, Bound::Excluded(hi.as_slice()), false, 1024)?;
             let done = chunk.len() < 1024;
             // All versions of a key must be handled in one batch: removing
             // a tombstone in one write and the versions it hides in the

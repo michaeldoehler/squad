@@ -353,11 +353,13 @@ fn snapshots_survive_concurrent_gc() {
             thread::spawn(move || {
                 let mut rounds = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    let mut t = store.begin(if r % 2 == 0 { Isolation::RepeatableRead } else { Isolation::ReadCommitted });
+                    let mut t =
+                        store.begin(if r % 2 == 0 { Isolation::RepeatableRead } else { Isolation::ReadCommitted });
                     for _ in 0..3 {
                         let rows = t.scan(U, U, r % 3 == 0, usize::MAX).unwrap();
                         assert_eq!(rows.len() as u64, KEYS, "a key vanished from a snapshot");
-                        let total: u64 = rows.iter().map(|(_, v)| u64::from_be_bytes(v.as_slice().try_into().unwrap())).sum();
+                        let total: u64 =
+                            rows.iter().map(|(_, v)| u64::from_be_bytes(v.as_slice().try_into().unwrap())).sum();
                         assert_eq!(total, KEYS * 100, "snapshot is not consistent");
                         // Point reads agree with the scan under Repeatable Read.
                         if r % 2 == 0 {

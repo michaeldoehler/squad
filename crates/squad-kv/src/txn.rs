@@ -50,7 +50,7 @@ pub struct Txn {
     inner: Arc<Inner>,
     id: u64,
     isolation: Isolation,
-        snapshot: u64,
+    snapshot: u64,
     /// Registration of `snapshot` with the store.
     slot: crate::store::SnapshotSlot,
     read_only: bool,
@@ -114,13 +114,13 @@ impl Txn {
         if isolation == Isolation::Serializable {
             inner.serializable_live.fetch_add(1, Ordering::SeqCst);
         }
-                        let id = next_id(&inner);
+        let id = next_id(&inner);
         let (snapshot, slot) = inner.register_snapshot(id);
         Txn {
             inner,
             id,
             isolation,
-                        snapshot,
+            snapshot,
             slot,
             read_only: false,
             writes: BTreeMap::new(),
@@ -164,7 +164,7 @@ impl Txn {
     /// every statement; under the other levels it is a no-op.
     pub fn refresh_snapshot(&mut self) {
         if self.isolation == Isolation::ReadCommitted {
-                        self.snapshot = self.inner.advance_snapshot(&mut self.slot);
+            self.snapshot = self.inner.advance_snapshot(&mut self.slot);
         }
     }
 
@@ -490,13 +490,13 @@ impl Txn {
         if self.finished {
             return;
         }
-                self.finished = true;
+        self.finished = true;
         // Most transactions hold no row locks; do not touch the shared
         // lock table for them.
         if !self.locks.is_empty() {
             self.inner.locks.release_all(self.id, self.locks.keys());
         }
-                self.inner.unregister_snapshot(&self.slot);
+        self.inner.unregister_snapshot(&self.slot);
         if self.isolation == Isolation::Serializable {
             self.inner.serializable_live.fetch_sub(1, Ordering::SeqCst);
         }
@@ -567,7 +567,7 @@ impl Txn {
         Ok(())
     }
 
-        /// Makes all buffered writes durable and visible. On error nothing was
+    /// Makes all buffered writes durable and visible. On error nothing was
     /// applied and the transaction is rolled back.
     pub fn commit(mut self) -> Result<()> {
         self.end(true)

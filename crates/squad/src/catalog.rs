@@ -91,7 +91,7 @@ pub struct Table {
     /// True if `pk` is the hidden row id rather than a declared key.
     pub rowid: bool,
     pub indexes: Vec<Index>,
-        pub checks: Vec<Check>,
+    pub checks: Vec<Check>,
     pub foreign_keys: Vec<ForeignKey>,
     /// Set for tables created `USING columnar`.
     #[serde(default)]

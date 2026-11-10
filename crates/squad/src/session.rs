@@ -37,7 +37,7 @@ pub struct Shared {
     pub catalog: Arc<RwLock<Arc<Catalog>>>,
     sequences: Mutex<HashMap<u32, SeqState>>,
     /// Plans of ad-hoc statements, keyed by search path and SQL text.
-        plan_cache: Arc<Mutex<HashMap<String, Arc<Prepared>>>>,
+    plan_cache: Arc<Mutex<HashMap<String, Arc<Prepared>>>>,
     /// Where segments of columnar tables are kept: a directory next to
     /// the database, memory, or a remote bucket.
     objects: RwLock<Arc<dyn squad_object::ObjectStore>>,
@@ -45,7 +45,7 @@ pub struct Shared {
     pub(crate) segments: crate::columnar::SegmentCache,
     /// Rows inserted into columnar tables since their last compaction.
     pub(crate) delta_rows: Mutex<HashMap<u32, u64>>,
-        next_pid: AtomicI32,
+    next_pid: AtomicI32,
     pub database_name: String,
     /// Version of `catalog`, readable without taking its lock. Sessions
     /// keep their own reference to the catalog and only go back to the
@@ -121,17 +121,17 @@ impl Shared {
             Some(bytes) => Catalog::from_bytes(&bytes)?,
             None => Catalog::bootstrap(),
         };
-                drop(txn);
+        drop(txn);
         let version = catalog.version;
         Ok(Arc::new(Shared {
             store,
             catalog: Arc::new(RwLock::new(Arc::new(catalog))),
             sequences: Mutex::new(HashMap::new()),
-                        plan_cache: Arc::new(Mutex::new(HashMap::new())),
+            plan_cache: Arc::new(Mutex::new(HashMap::new())),
             objects: RwLock::new(Arc::new(squad_object::MemoryStore::new())),
             segments: Default::default(),
             delta_rows: Mutex::new(HashMap::new()),
-                        next_pid: AtomicI32::new(1),
+            next_pid: AtomicI32::new(1),
             database_name: database_name.to_string(),
             catalog_version: Arc::new(std::sync::atomic::AtomicU64::new(version)),
             recovery: AtomicBool::new(false),
@@ -187,7 +187,7 @@ impl Shared {
         }
     }
 
-        /// The object store holding the segments of columnar tables.
+    /// The object store holding the segments of columnar tables.
     pub fn objects(&self) -> Arc<dyn squad_object::ObjectStore> {
         self.objects.read().clone()
     }
@@ -200,7 +200,7 @@ impl Shared {
 
     fn publish_catalog(&self, catalog: Arc<Catalog>) {
         let mut current = self.catalog.write();
-                if catalog.version > current.version {
+        if catalog.version > current.version {
             self.catalog_version.store(catalog.version, Ordering::Release);
             *current = catalog;
             self.plan_cache.lock().clear();
@@ -387,7 +387,7 @@ pub(crate) struct TxnState {
     pub(crate) savepoints: Vec<Savepoint>,
     pub(crate) start_time: i64,
     /// Counters to forget when the transaction ends either way.
-        pub(crate) reset_counters: Vec<u32>,
+    pub(crate) reset_counters: Vec<u32>,
     /// Segment objects to delete once the transaction has committed.
     pub(crate) dropped_objects: Vec<String>,
     /// Rows this transaction inserted into columnar tables.
@@ -414,13 +414,13 @@ pub struct Session {
     pub(crate) state: SessionState,
     pub(crate) txn: Option<TxnState>,
     /// Statements created by SQL `PREPARE`.
-        pub(crate) named: HashMap<String, Arc<Prepared>>,
-        /// The committed catalog as of the last time this session looked.
+    pub(crate) named: HashMap<String, Arc<Prepared>>,
+    /// The committed catalog as of the last time this session looked.
     catalog_cache: Arc<Catalog>,
     /// Current plans of prepared statements whose original plan went
     /// stale, keyed by the address of the original (which is kept alive
     /// alongside, so the address cannot be reused).
-        replans: HashMap<usize, (Arc<Prepared>, Arc<Prepared>)>,
+    replans: HashMap<usize, (Arc<Prepared>, Arc<Prepared>)>,
     /// The transaction object of the last finished transaction.
     spare_txn: Option<Txn>,
 }
@@ -435,7 +435,7 @@ pub(crate) fn feature(what: &str) -> Error {
 
 impl Session {
     pub fn new(shared: Arc<Shared>) -> Session {
-                let pid = shared.next_pid.fetch_add(1, Ordering::Relaxed);
+        let pid = shared.next_pid.fetch_add(1, Ordering::Relaxed);
         let catalog_cache = shared.catalog.read().clone();
         Session {
             shared,
@@ -451,9 +451,9 @@ impl Session {
                 pid,
             },
             txn: None,
-                                    named: HashMap::new(),
+            named: HashMap::new(),
             catalog_cache,
-                        replans: HashMap::new(),
+            replans: HashMap::new(),
             spare_txn: None,
         }
     }
@@ -480,7 +480,7 @@ impl Session {
     }
 
     /// The catalog visible to the next statement.
-        pub(crate) fn catalog(&self) -> Arc<Catalog> {
+    pub(crate) fn catalog(&self) -> Arc<Catalog> {
         match &self.txn {
             Some(t) if t.dirty || t.txn.isolation() != Isolation::ReadCommitted => t.catalog.clone(),
             _ if self.catalog_cache.version == self.shared.catalog_version.load(Ordering::Acquire) => {
@@ -500,7 +500,7 @@ impl Session {
 
     /// The latest committed catalog, through the session's own reference.
     fn latest_catalog(&mut self) -> Arc<Catalog> {
-                if self.catalog_cache.version != self.shared.catalog_version.load(Ordering::Acquire) {
+        if self.catalog_cache.version != self.shared.catalog_version.load(Ordering::Acquire) {
             // A private copy: its reference count is then only touched by
             // this session, not by every session on every statement.
             self.catalog_cache = Arc::new((**self.shared.catalog.read()).clone());
@@ -619,7 +619,7 @@ impl Session {
         }
         let key = format!("{}\u{0}{}", self.state.search_path.join(","), sql);
         let hit = self.shared.plan_cache.lock().get(&key).cloned()?;
-                (hit.catalog_version == self.catalog_version()).then_some(hit)
+        (hit.catalog_version == self.catalog_version()).then_some(hit)
     }
 
     fn cached(&mut self, sql: &str) -> Result<Arc<Prepared>> {
@@ -751,12 +751,12 @@ impl Session {
     /// Runs a prepared statement.
     pub fn execute_prepared(&mut self, stmt: &Arc<Prepared>, params: &[Value]) -> Result<QueryResult> {
         // Re-plan if the schema or the search path changed since planning.
-                let current_version = self.catalog_version();
+        let current_version = self.catalog_version();
         let stale = match &stmt.kind {
             Kind::Plan { .. } => stmt.catalog_version != current_version || stmt.search_path != self.state.search_path,
             _ => false,
         };
-                let replanned;
+        let replanned;
         let stmt = if stale {
             // The caller keeps its handle to the outdated plan, so remember
             // the new one instead of planning again on every execution.
@@ -772,7 +772,10 @@ impl Session {
                     let types: Vec<Option<Type>> = stmt.param_types.iter().cloned().map(Some).collect();
                     let new = self.prepare(&stmt.sql, &types)?;
                     if new.columns.iter().map(|c| &c.ty).ne(stmt.columns.iter().map(|c| &c.ty)) {
-                        return Err(Error::new(sqlstate::FEATURE_NOT_SUPPORTED, "cached plan must not change result type"));
+                        return Err(Error::new(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "cached plan must not change result type",
+                        ));
                     }
                     if self.replans.len() >= 1024 {
                         self.replans.clear();
@@ -848,7 +851,7 @@ impl Session {
     /// Makes sure a transaction is open and its snapshot and catalog are
     /// current for a new statement.
     pub(crate) fn start_statement(&mut self) -> Result<&mut TxnState> {
-                if self.txn.is_none() {
+        if self.txn.is_none() {
             // A new transaction starts with the latest snapshot and catalog.
             self.begin(None, false)?;
             return Ok(self.txn.as_mut().unwrap());
@@ -913,11 +916,11 @@ impl Session {
     // ---------------------------------------------------------------
 
     pub(crate) fn begin(&mut self, isolation: Option<Isolation>, explicit: bool) -> Result<()> {
-                let isolation = isolation.unwrap_or(self.state.default_isolation);
+        let isolation = isolation.unwrap_or(self.state.default_isolation);
         let shared = self.shared.clone();
         let recovery = shared.in_recovery();
         let gate = shared.replay_shared();
-                let catalog = self.latest_catalog();
+        let catalog = self.latest_catalog();
         // Reuse the previous transaction object where there is one.
         let mut txn = match self.spare_txn.take() {
             Some(mut txn) => {
@@ -938,7 +941,7 @@ impl Session {
             batch: false,
             savepoints: Vec::new(),
             start_time: now_micros(),
-                        reset_counters: Vec::new(),
+            reset_counters: Vec::new(),
             dropped_objects: Vec::new(),
             columnar_inserted: HashMap::new(),
         });
@@ -950,7 +953,7 @@ impl Session {
         if t.failed {
             return Ok(());
         }
-                let TxnState { mut txn, catalog, dirty, dropped_objects, columnar_inserted, .. } = t;
+        let TxnState { mut txn, catalog, dirty, dropped_objects, columnar_inserted, .. } = t;
         let result = txn.end(true);
         self.spare_txn = Some(txn);
         result?;
@@ -959,12 +962,13 @@ impl Session {
         }
         // Segment objects the transaction replaced are no longer named by
         // any manifest a new snapshot can read.
+        // They are deleted once the snapshots that began before this
+        // commit, and may still read the old manifest, are gone.
         if !dropped_objects.is_empty() {
-            let store = self.shared.objects();
-            for key in &dropped_objects {
-                self.shared.segments.forget(key);
-                let _ = store.delete(key);
-            }
+            self.shared.segments.retire(self.shared.store.last_committed(), dropped_objects);
+        }
+        if self.shared.segments.has_retired() {
+            self.shared.segments.sweep(self.shared.store.oldest_snapshot(), &*self.shared.objects());
         }
         // Columnar tables with a large delta are compacted right away, by
         // the session that pushed them over the threshold.
@@ -983,7 +987,16 @@ impl Session {
         for table in due {
             // Best effort: a failure leaves the rows in the delta, where
             // they stay correct and visible.
-            let _ = self.compact_table(table);
+            if self.compact_table(table).is_ok() {
+                // The moved delta rows leave tombstones that every scan of
+                // the delta would have to step over; remove those no
+                // snapshot needs any more.
+                if let Some(next) = table.checked_add(1) {
+                    let lo = crate::catalog::object_prefix(table);
+                    let hi = crate::catalog::object_prefix(next);
+                    let _ = self.shared.store.gc_range(&lo, &hi);
+                }
+            }
         }
         Ok(())
     }
@@ -993,7 +1006,10 @@ impl Session {
     pub fn compact_table(&mut self, table_id: u32) -> Result<u64> {
         self.shared.check_writable("compaction")?;
         if self.txn.is_some() {
-            return Err(Error::new(sqlstate::ACTIVE_SQL_TRANSACTION, "compaction cannot run inside a transaction block"));
+            return Err(Error::new(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "compaction cannot run inside a transaction block",
+            ));
         }
         self.begin(Some(Isolation::ReadCommitted), false)?;
         let catalog = self.txn.as_ref().unwrap().catalog.clone();
@@ -1092,7 +1108,7 @@ impl Session {
                 None => Arc::new(Catalog::bootstrap()),
             };
         }
-                let mut catalog = (*t.catalog).clone();
+        let mut catalog = (*t.catalog).clone();
         let before = catalog.to_bytes();
         let result = f(&mut catalog, &mut t.txn, &shared, &mut self.state)?;
         // A statement that changed nothing (`IF NOT EXISTS` on an existing

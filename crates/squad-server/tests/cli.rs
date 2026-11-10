@@ -135,10 +135,15 @@ fn remote_copy_and_restore() {
     let data = dir.path().join("data");
     let remote = format!("file://{}", dir.path().join("remote").display());
     let run = |args: &[&str], script: &str| {
-        let mut child = squad().args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut child =
+            squad().args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
         let out = child.wait_with_output().unwrap();
-        (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     };
     let (ok, _, err) = run(
         &["shell", data.to_str().unwrap(), "--remote", &remote, "--remote-sync", "sync"],
@@ -170,7 +175,8 @@ fn remote_copy_and_restore() {
         run(&["shell", data.to_str().unwrap(), "--remote", &remote, "--remote-restore"], "SELECT count(*) FROM t;\n");
     assert!(ok && out.contains("501"), "{out}{err}");
 
-    let (ok, _, err) = output(squad().args(["serve", "--memory", "--remote-sync", "sometimes", "--remote", "memory://"]));
+    let (ok, _, err) =
+        output(squad().args(["serve", "--memory", "--remote-sync", "sometimes", "--remote", "memory://"]));
     assert!(!ok && err.contains("invalid --remote-sync mode"), "{err}");
 }
 
@@ -255,6 +261,7 @@ fn replica_served_over_the_wire_and_promoted() {
     assert!(!ok && err.contains("cannot be combined"), "{err}");
     let (ok, _, err) = output(squad().args(["serve", &path("x"), "--poll-interval", "5"]));
     assert!(!ok && err.contains("needs --replica-of"), "{err}");
-    let (ok, _, err) = output(squad().args(["serve", &path("x"), "--replica-of", &format!("file://{}", path("nothing"))]));
+    let (ok, _, err) =
+        output(squad().args(["serve", &path("x"), "--replica-of", &format!("file://{}", path("nothing"))]));
     assert!(!ok && err.contains("cannot open replica"), "{err}");
 }

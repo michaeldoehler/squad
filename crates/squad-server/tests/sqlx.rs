@@ -96,12 +96,14 @@ fn queries_binds_and_transactions() {
         let mut tx = pool.begin().await.unwrap();
         sqlx::query("UPDATE users SET score = score + 1 WHERE name = $1").bind("Ada").execute(&mut *tx).await.unwrap();
         tx.rollback().await.unwrap();
-        let score: f64 = sqlx::query_scalar("SELECT score FROM users WHERE name = 'Ada'").fetch_one(&pool).await.unwrap();
+        let score: f64 =
+            sqlx::query_scalar("SELECT score FROM users WHERE name = 'Ada'").fetch_one(&pool).await.unwrap();
         assert_eq!(score, 1.5);
         let mut tx = pool.begin().await.unwrap();
         sqlx::query("UPDATE users SET score = score + 1 WHERE name = $1").bind("Ada").execute(&mut *tx).await.unwrap();
         tx.commit().await.unwrap();
-        let score: f64 = sqlx::query_scalar("SELECT score FROM users WHERE name = 'Ada'").fetch_one(&pool).await.unwrap();
+        let score: f64 =
+            sqlx::query_scalar("SELECT score FROM users WHERE name = 'Ada'").fetch_one(&pool).await.unwrap();
         assert_eq!(score, 2.5);
 
         // Array parameters.
@@ -189,7 +191,8 @@ fn custom_enum_types() {
             .unwrap();
         let m: Mood = sqlx::query_scalar("SELECT m FROM kv WHERE k = 'a'").fetch_one(&pool).await.unwrap();
         assert_eq!(m, Mood::Happy);
-        let k: String = sqlx::query_scalar("SELECT k FROM kv WHERE m = $1").bind(Mood::Sad).fetch_one(&pool).await.unwrap();
+        let k: String =
+            sqlx::query_scalar("SELECT k FROM kv WHERE m = $1").bind(Mood::Sad).fetch_one(&pool).await.unwrap();
         assert_eq!(k, "b");
         let text: String = sqlx::query_scalar("SELECT m::text FROM kv WHERE k = 'a'").fetch_one(&pool).await.unwrap();
         assert_eq!(text, "happy");

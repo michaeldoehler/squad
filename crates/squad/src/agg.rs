@@ -78,7 +78,7 @@ fn out_of_range(what: &str) -> Error {
 impl<'p> Runner<'p> {
     fn new(call: &'p AggCall, func: &'p AggFunc) -> Runner<'p> {
         let acc = match func {
-                        AggFunc::CountStar | AggFunc::Count | AggFunc::ApproxCountDistinct => Acc::Count(0),
+            AggFunc::CountStar | AggFunc::Count | AggFunc::ApproxCountDistinct => Acc::Count(0),
             AggFunc::ApproxPercentile(_) => Acc::Array(Vec::new()),
             AggFunc::Sum | AggFunc::Avg => match call.ret {
                 Type::Float4 | Type::Float8 => Acc::SumFloat(0.0),
@@ -98,7 +98,7 @@ impl<'p> Runner<'p> {
                 Acc::Moments(0.0, 0.0, 0.0, (call.ret == Type::Numeric).then_some((Decimal::ZERO, Decimal::ZERO)))
             }
         };
-                // Outside columnar tables an "approximate" distinct count is exact.
+        // Outside columnar tables an "approximate" distinct count is exact.
         let distinct = call.distinct || matches!(func, AggFunc::ApproxCountDistinct);
         Runner { call, func, acc, n: 0, distinct: distinct.then(HashSet::new), ordered: Vec::new() }
     }
@@ -285,7 +285,7 @@ impl<'p> Runner<'p> {
                 (Some(b), _) => Value::Int8(b),
             },
             Acc::Text(s) => s.map_or(Value::Null, Value::Text),
-                        Acc::Array(mut items) if matches!(self.func, AggFunc::ApproxPercentile(_)) => {
+            Acc::Array(mut items) if matches!(self.func, AggFunc::ApproxPercentile(_)) => {
                 let AggFunc::ApproxPercentile(p) = self.func else { unreachable!() };
                 if items.is_empty() {
                     return Ok(Value::Null);
