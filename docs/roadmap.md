@@ -18,18 +18,24 @@ The original specification planned four phases, each with a gate.
 | 2 Drop-in (L3, L4) | catalogs, SQLSTATEs, sqlx | done through the wire protocol: an sqlx application runs unchanged. A native in-process sqlx driver is open. |
 | 3 Server and operations (L5) | wire protocol, backup, `COPY` | done, except TLS, point-in-time recovery and query cancellation |
 
+Beyond the original plan, squad has gained columnar tables for
+analytics ([analytics](analytics.md)) and durable storage in object
+stores including S3 ([cloud storage](cloud-storage.md)).
+
 ## Known limits
 
 Correctness and compatibility limits are listed in
 [compatibility](compatibility.md). The engineering limits that matter
 when sizing a workload:
 
-- **Analytical queries are slow.** squad is built for OLTP: point
-  lookups, short range scans, small transactions. A full scan decodes
-  every row and currently processes on the order of one million rows per
-  second per core. There is no columnar storage, no vectorized execution
-  and no parallel query. Large `GROUP BY` reports over tens of millions
-  of rows are the wrong workload today.
+- **Scans of ordinary tables are slow.** The row store is built for
+  point lookups, short range scans and small transactions; a full scan
+  decodes every row and processes well under a million rows per second
+  per core. Data that is aggregated in bulk belongs in a columnar table,
+  where the same queries are hundreds to thousands of times faster — as
+  long as they have the shape the column engine handles (see
+  [analytics](analytics.md)). Joins, window functions and expressions
+  inside aggregates over columnar tables still run in the row engine.
 - **The planner has no statistics.** Access paths are chosen by rules and
   joins run in the order they are written. Queries joining many large
   tables may need to be written with the selective table first.
@@ -87,21 +93,16 @@ Roughly in order of expected value. Nothing here is scheduled.
 
 **Analytics**
 
-squad's first planned large application is event analytics — product and
-web analytics, error tracking — which stresses exactly what the engine
-is weakest at today: wide scans and aggregations over append-mostly
-tables. That workload needs work beyond the list above:
+Columnar tables cover the core of an event-analytics workload today.
+What that workload still needs:
 
-- a column-oriented, compressed storage format for append-mostly tables,
-  alongside the row store;
-- vectorized execution for scans, filters and aggregations, and parallel
-  query;
-- partitioning by time, with cheap dropping of old partitions;
-- approximate aggregates (distinct counts, quantiles) and materialized
-  rollups that are maintained incrementally;
-- beyond one machine: sharding by tenant, and replicas for read
-  scale-out.
-
-Until then, an analytics product on squad should keep raw events
-compact, query through pre-aggregated tables maintained at ingest, and
-keep any single query's scan to what an index range can deliver.
+- more queries on the fast path: expressions inside aggregates,
+  `FILTER`, joins of a columnar table with small ordinary tables,
+  time zones other than UTC for time buckets;
+- reading only the needed column chunks from remote storage, instead of
+  whole segments, and spilling large aggregations to disk;
+- `UPDATE` and schema changes on columnar tables; cleanup of segment
+  objects left behind by a crash;
+- funnel, retention and sessionization functions;
+- materialized rollups maintained incrementally;
+- indexes on `jsonb` properties.

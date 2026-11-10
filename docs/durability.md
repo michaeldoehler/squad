@@ -13,6 +13,7 @@ data/
 ├── wal/
 │   └── 00000007.wal     write-ahead log segments
 ├── checkpoint.journal   exists only while a checkpoint is being written
+├── objects/             segments of columnar tables (unless a remote store is configured)
 └── LOCK                 held while the database is open
 ```
 
@@ -102,8 +103,14 @@ snapshot. It is taken while the database is in use; commits are not
 blocked while the files are copied. To restore, open the backup
 directory (or copy it into place).
 
-Point-in-time recovery from archived log segments and streaming
-replication are not implemented yet; see the [roadmap](roadmap.md).
+A backup made this way contains the row store. Segments of columnar
+tables are separate files under `objects/`; copy that directory as well
+(segments are immutable, so a plain file copy taken after the backup is
+consistent with it or newer).
+
+For a continuously maintained copy in an object store, including S3, and
+restore on another machine, see [cloud storage](cloud-storage.md).
+Point-in-time recovery is not implemented yet.
 
 ## Moving data in and out
 

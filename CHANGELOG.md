@@ -37,3 +37,12 @@ versions may change the API and the on-disk format.
   SQL level, and integration tests with psql, pgbench, pg_dump output,
   tokio-postgres and sqlx.
 - **Benchmarks** against PostgreSQL and SQLite (`squad-bench`).
+- **Columnar tables** (`CREATE TABLE … USING columnar`): rows are
+  inserted transactionally into a delta and compacted into immutable,
+  compressed column segments; aggregations run vectorized and in
+  parallel in `squad-columnar`; `approx_count_distinct` and
+  `approx_percentile`.
+- **Object storage** (`squad-object`): memory, local directory and
+  S3-compatible stores. The row store can keep a durable, restorable
+  copy in an object store, with synchronous or asynchronous shipping
+  and writer fencing.

@@ -62,6 +62,10 @@ How the evidence is produced is described in [testing](testing.md).
   DEFAULT` / `DROP DEFAULT` / `SET NOT NULL` / `DROP NOT NULL` / `TYPE …
   USING` / `ADD GENERATED … AS IDENTITY`, `ADD CONSTRAINT`, `DROP
   CONSTRAINT`, `RENAME TO`, `RENAME COLUMN`, `RENAME CONSTRAINT`.
+- **Columnar tables** (not in PostgreSQL): `CREATE TABLE … USING
+  columnar [WITH (order_by = 'a, b')]`, with the aggregates
+  `approx_count_distinct(x)` and `approx_percentile(x, p)`. See
+  [analytics](analytics.md).
 - **Other objects:** `CREATE [UNIQUE] INDEX` on columns, `DROP INDEX`;
   `CREATE SEQUENCE`, `ALTER SEQUENCE`, `nextval`, `currval`, `setval`,
   `lastval`; `CREATE TYPE … AS ENUM`, `ALTER TYPE … ADD VALUE`; `CREATE

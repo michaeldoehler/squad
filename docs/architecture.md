@@ -1,8 +1,10 @@
 # Architecture
 
-squad is built as four layers, each a crate with a narrow interface to the
-one below. A statement travels down through them; nothing reaches around a
-layer.
+squad is built in layers, each a crate with a narrow interface to the one
+below. A statement travels down through them; nothing reaches around a
+layer. Two further crates sit beside the row store: the column engine
+for analytical tables and the object store interface that both the
+column segments and the remote copy of the row store are written to.
 
 ```text
  application (Rust)                    psql, drivers, ORMs, other languages
@@ -155,6 +157,31 @@ databases.
 
 On one core this takes about 1.1 µs end to end (see
 [benchmarks](benchmarks.md)).
+
+## Columnar tables (`squad-columnar`, `squad::columnar`)
+
+A table created `USING columnar` keeps new rows in the row store — its
+*delta* — and moves them, in one transaction, into immutable
+column-oriented segments. The list of segments is a versioned record in
+the transactional store, which is what makes the two parts one table:
+a snapshot that sees a segment in the manifest does not see its rows in
+the delta, and the other way round.
+
+`squad-columnar` knows nothing about SQL. It defines the segment format
+(row groups of encoded, compressed column chunks with statistics and
+bloom filters) and a vectorized, parallel engine for filters and
+aggregations over segments plus in-memory batches. The planner hands it
+aggregations it can express; other queries read segments as rows through
+the ordinary executor. See [analytics](analytics.md).
+
+## Object storage (`squad-object`)
+
+One small interface — put, get, ranged get, list, delete, conditional
+put — with implementations for memory, a local directory and
+S3-compatible services. Column segments are stored through it, and so is
+the remote copy of the row store: its log as immutable objects and its
+snapshots as content-addressed chunks. See
+[cloud storage](cloud-storage.md).
 
 ## Server (`squad-server`)
 
