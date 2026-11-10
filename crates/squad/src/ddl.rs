@@ -2539,8 +2539,15 @@ pub(crate) fn run_utility(sess: &mut Session, stmt: &N, _params: &[Value]) -> Re
                     .filter(|t| t.columnar.is_some() && (wanted.is_empty() || wanted.contains(&t.id)))
                     .map(|t| t.id)
                     .collect();
+                let compacted = !ids.is_empty();
                 for id in ids {
                     sess.compact_table(id)?;
+                }
+                // Compaction deletes the delta rows it moved; without this
+                // their tombstones would slow every scan of the delta
+                // until the next VACUUM.
+                if compacted {
+                    sess.shared.store.gc()?;
                 }
             }
             done(if s.is_vacuumcmd { "VACUUM" } else { "ANALYZE" })
