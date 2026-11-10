@@ -2203,7 +2203,15 @@ fn transaction(sess: &mut Session, stmt: &pb::TransactionStmt) -> Result<QueryRe
                 let value = arg.and_then(const_text).unwrap_or_default();
                 match name {
                     "transaction_isolation" => isolation = Some(parse_isolation(&value)?),
-                    "transaction_read_only" => read_only = matches!(value.as_str(), "1" | "on" | "true"),
+                    "transaction_read_only" => {
+                        read_only = matches!(value.as_str(), "1" | "on" | "true");
+                        if !read_only && sess.shared.in_recovery() {
+                            return Err(Error::new(
+                                sqlstate::READ_ONLY_SQL_TRANSACTION,
+                                "cannot set transaction read-write mode on a read replica",
+                            ));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2415,6 +2423,13 @@ pub(crate) fn run_utility(sess: &mut Session, stmt: &N, _params: &[Value]) -> Re
                     Isolation::RepeatableRead => "repeatable read".to_string(),
                     Isolation::Serializable => "serializable".to_string(),
                 }
+            } else if s.name.eq_ignore_ascii_case("transaction_read_only") {
+                // The open transaction's mode; a replica is always read-only.
+                let read_only = match &sess.txn {
+                    Some(t) if t.explicit => t.txn.is_read_only(),
+                    _ => sess.shared.in_recovery(),
+                };
+                if read_only { "on" } else { "off" }.to_string()
             } else {
                 show_setting(&sess.state, &s.name)?
             };
