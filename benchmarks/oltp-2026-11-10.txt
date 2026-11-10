@@ -1,0 +1,37 @@
+# cargo run --release -p squad-bench -- --rows 100000 --ops 20000 --threads 4 --postgres 'host=<socket dir> port=54332 user=postgres dbname=bench'
+# 4 vCPU, 15 GiB RAM, ext4. squad SyncMode::Sync; SQLite 3 WAL, synchronous=FULL; PostgreSQL 16.15, fsync=on,
+# synchronous_commit=on, shared_buffers=256MB, reached through a Unix socket.
+# Load average 2.7 at start: other build jobs were running, so absolute numbers are pessimistic,
+# most of all for the client/server system.
+
+rows: 100000, operations per measurement: 20000, threads for concurrent runs: 4
+
+workload                                     system      p50 (µs)   p99 (µs)        ops/s
+point select by primary key                  squad           1.48       2.71       612815
+point select by primary key                  sqlite          1.46       3.10       564351
+point select by primary key                  postgres       50.26      96.94        18650
+
+index lookup, 10 rows                        squad          12.29      44.82        70612
+index lookup, 10 rows                        sqlite          1.93       3.54       471836
+index lookup, 10 rows                        postgres       66.16     149.22        13882
+
+update one row + durable commit              squad         125.41     287.42         7490
+update one row + durable commit              sqlite        123.09     412.13         6634
+update one row + durable commit              postgres      199.70     620.47         4233
+
+insert one row + durable commit              squad         123.58     281.21         7581
+insert one row + durable commit              sqlite        122.84     277.76         7454
+insert one row + durable commit              postgres      159.29     428.74         5524
+
+2-row transaction + durable commit           squad         152.73     474.28         4786
+2-row transaction + durable commit           sqlite        145.91     488.71         5466
+2-row transaction + durable commit           postgres      423.34     827.67         2218
+
+point select, 4 threads                      squad           5.66      63.31       301043
+point select, 4 threads                      sqlite          3.78      56.23       341323
+point select, 4 threads                      postgres       12.45      33.41       289711
+
+2-row transaction, 4 threads                 squad         299.30     855.95         9487
+2-row transaction, 4 threads                 sqlite        145.18     577.57         5045
+2-row transaction, 4 threads                 postgres      552.73    1160.49         6964
+
