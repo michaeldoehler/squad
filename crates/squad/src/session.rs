@@ -34,10 +34,10 @@ struct SeqState {
 pub struct Shared {
     pub store: Store,
     /// Latest committed catalog.
-    pub catalog: RwLock<Arc<Catalog>>,
+    pub catalog: Arc<RwLock<Arc<Catalog>>>,
     sequences: Mutex<HashMap<u32, SeqState>>,
     /// Plans of ad-hoc statements, keyed by search path and SQL text.
-        plan_cache: Mutex<HashMap<String, Arc<Prepared>>>,
+        plan_cache: Arc<Mutex<HashMap<String, Arc<Prepared>>>>,
     /// Where segments of columnar tables are kept: a directory next to
     /// the database, memory, or a remote bucket.
     objects: RwLock<Arc<dyn squad_object::ObjectStore>>,
@@ -50,16 +50,59 @@ pub struct Shared {
     /// Version of `catalog`, readable without taking its lock. Sessions
     /// keep their own reference to the catalog and only go back to the
     /// shared one when this number changes.
-    catalog_version: std::sync::atomic::AtomicU64,
+    catalog_version: Arc<std::sync::atomic::AtomicU64>,
     /// True while this database follows a writer as a read replica.
     recovery: AtomicBool,
     /// On a replica, a session holds this shared while it takes a catalog
     /// and a snapshot, and the apply loop holds it exclusively while it
     /// makes a schema change visible, so the two always belong together.
-    replay_gate: RwLock<()>,
+    replay_gate: Arc<RwLock<()>>,
     /// The replication machinery, if the database was opened as a
     /// replica. It stays after promotion.
     pub(crate) replica: std::sync::OnceLock<crate::replica::Replica>,
+}
+
+/// What the apply loop of a read replica changes in a database. It
+/// shares these parts with [`Shared`] without keeping the database
+/// itself open, so that dropping the last handle closes the database on
+/// the thread that drops it.
+#[derive(Clone)]
+pub(crate) struct ReplayTarget {
+    pub(crate) store: Store,
+    gate: Arc<RwLock<()>>,
+    catalog: Arc<RwLock<Arc<Catalog>>>,
+    catalog_version: Arc<std::sync::atomic::AtomicU64>,
+    plan_cache: Arc<Mutex<HashMap<String, Arc<Prepared>>>>,
+}
+
+impl ReplayTarget {
+    /// Runs `publish`, which makes a commit visible, together with the
+    /// change of catalog that commit made.
+    pub(crate) fn replay_catalog(&self, catalog: Arc<Catalog>, publish: impl FnOnce()) {
+        let _gate = self.gate.write();
+        publish();
+        let mut current = self.catalog.write();
+        self.catalog_version.store(catalog.version, Ordering::Release);
+        *current = catalog;
+        self.plan_cache.lock().clear();
+    }
+
+    /// Adopts the state of a replaced local copy.
+    pub(crate) fn replay_reload(&self) -> Result<()> {
+        let _gate = self.gate.write();
+        self.store.replay_reset()?;
+        let txn = self.store.begin(Isolation::ReadCommitted);
+        let catalog = match txn.get(CATALOG_KEY)? {
+            Some(bytes) => Catalog::from_bytes(&bytes)?,
+            None => Catalog::bootstrap(),
+        };
+        drop(txn);
+        let mut current = self.catalog.write();
+        self.catalog_version.store(catalog.version, Ordering::Release);
+        *current = Arc::new(catalog);
+        self.plan_cache.lock().clear();
+        Ok(())
+    }
 }
 
 fn table_lock_key(id: u32) -> Vec<u8> {
@@ -82,17 +125,17 @@ impl Shared {
         let version = catalog.version;
         Ok(Arc::new(Shared {
             store,
-            catalog: RwLock::new(Arc::new(catalog)),
+            catalog: Arc::new(RwLock::new(Arc::new(catalog))),
             sequences: Mutex::new(HashMap::new()),
-                        plan_cache: Mutex::new(HashMap::new()),
+                        plan_cache: Arc::new(Mutex::new(HashMap::new())),
             objects: RwLock::new(Arc::new(squad_object::MemoryStore::new())),
             segments: Default::default(),
             delta_rows: Mutex::new(HashMap::new()),
                         next_pid: AtomicI32::new(1),
             database_name: database_name.to_string(),
-            catalog_version: std::sync::atomic::AtomicU64::new(version),
+            catalog_version: Arc::new(std::sync::atomic::AtomicU64::new(version)),
             recovery: AtomicBool::new(false),
-            replay_gate: RwLock::new(()),
+            replay_gate: Arc::new(RwLock::new(())),
             replica: std::sync::OnceLock::new(),
         }))
     }
@@ -122,32 +165,15 @@ impl Shared {
         self.in_recovery().then(|| self.replay_gate.read())
     }
 
-    /// Replica: runs `publish`, which makes a commit visible, together
-    /// with the change of catalog that commit made.
-    pub(crate) fn replay_catalog(&self, catalog: Arc<Catalog>, publish: impl FnOnce()) {
-        let _gate = self.replay_gate.write();
-        publish();
-        let mut current = self.catalog.write();
-        self.catalog_version.store(catalog.version, Ordering::Release);
-        *current = catalog;
-        self.plan_cache.lock().clear();
-    }
-
-    /// Replica: adopts the state of a replaced local copy.
-    pub(crate) fn replay_reload(&self) -> Result<()> {
-        let _gate = self.replay_gate.write();
-        self.store.replay_reset()?;
-        let txn = self.store.begin(Isolation::ReadCommitted);
-        let catalog = match txn.get(CATALOG_KEY)? {
-            Some(bytes) => Catalog::from_bytes(&bytes)?,
-            None => Catalog::bootstrap(),
-        };
-        drop(txn);
-        let mut current = self.catalog.write();
-        self.catalog_version.store(catalog.version, Ordering::Release);
-        *current = Arc::new(catalog);
-        self.plan_cache.lock().clear();
-        Ok(())
+    /// The parts of this database the apply loop of a replica changes.
+    pub(crate) fn replay_target(&self) -> ReplayTarget {
+        ReplayTarget {
+            store: self.store.clone(),
+            gate: self.replay_gate.clone(),
+            catalog: self.catalog.clone(),
+            catalog_version: self.catalog_version.clone(),
+            plan_cache: self.plan_cache.clone(),
+        }
     }
 
     /// The node stopped being a replica: forget what was derived from a

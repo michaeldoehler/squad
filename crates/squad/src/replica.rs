@@ -8,12 +8,12 @@
 //! schema, and runs the thread that polls the object store.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use squad_kv::{KvError, Store};
+use squad_kv::Store;
 use squad_object::ObjectStore;
 use squad_storage::{
     DiskOptions, ReplayHooks, ReplicaEngine, ReplicaStatus, RemoteConfig, RemoteSync, StorageError, SyncMode,
@@ -21,7 +21,7 @@ use squad_storage::{
 };
 
 use crate::catalog::{Catalog, CATALOG_KEY};
-use crate::session::Shared;
+use crate::session::{ReplayTarget, Shared};
 use crate::{sqlstate, Error, Result};
 
 /// Options for opening a read replica.
@@ -154,68 +154,77 @@ impl Drop for Replica {
         self.stop.store(true, Ordering::Release);
         if let Some(handle) = self.thread.get_mut().take() {
             handle.thread().unpark();
-            // The apply thread itself may hold the last reference.
-            if handle.thread().id() != thread::current().id() {
-                let _ = handle.join();
-            }
+            let _ = handle.join();
         }
     }
 }
 
 /// Follows what the engine applies on behalf of the layers above it.
-struct Hooks<'a> {
-    shared: &'a Shared,
+struct Hooks {
+    target: ReplayTarget,
     /// Commit timestamp of the batch being applied.
     commit: Option<u64>,
     /// The catalog that batch stores, if it changes the schema.
     catalog: Option<Arc<Catalog>>,
 }
 
-impl<'a> Hooks<'a> {
-    fn new(shared: &'a Shared) -> Hooks<'a> {
-        Hooks { shared, commit: None, catalog: None }
+impl Hooks {
+    fn new(target: ReplayTarget) -> Hooks {
+        Hooks { target, commit: None, catalog: None }
     }
 }
 
-impl ReplayHooks for Hooks<'_> {
+impl ReplayHooks for Hooks {
     fn prepare(&mut self, batch: WriteBatch) -> WriteBatch {
         self.catalog = Store::replayed_value(&batch, CATALOG_KEY)
             .flatten()
             .and_then(|bytes| Catalog::from_bytes(&bytes).ok())
             .map(Arc::new);
-        let (batch, commit) = self.shared.store.replay_prepare(batch);
+        let (batch, commit) = self.target.store.replay_prepare(batch);
         self.commit = commit;
         batch
     }
 
     fn applied(&mut self, _lsn: u64) {
         let Some(ts) = self.commit.take() else { return };
-        let store = &self.shared.store;
+        let store = &self.target.store;
         match self.catalog.take() {
             // The commit and the schema it brings appear together.
-            Some(catalog) => self.shared.replay_catalog(catalog, || store.replay_publish(ts)),
+            Some(catalog) => self.target.replay_catalog(catalog, || store.replay_publish(ts)),
             None => store.replay_publish(ts),
         }
     }
 
     fn before_rebase(&mut self) {
-        self.shared.store.replay_invalidate();
+        self.target.store.replay_invalidate();
     }
 
     fn after_rebase(&mut self) -> squad_storage::Result<()> {
-        self.shared.replay_reload().map_err(|e| StorageError::Corruption(e.to_string()))
+        self.target.replay_reload().map_err(|e| StorageError::Corruption(e.to_string()))
     }
 }
 
-fn run(weak: Weak<Shared>, engine: Arc<ReplicaEngine>, stop: Arc<AtomicBool>, interval: Duration) {
+/// The apply loop. It holds the engine and the parts of the database it
+/// changes, not the database: when the last handle is dropped, the
+/// database's `Replica` stops and joins this thread, and the directory
+/// is closed by the time that drop returns.
+fn run(mut hooks: Hooks, engine: Arc<ReplicaEngine>, stop: Arc<AtomicBool>, interval: Duration) {
+    let mut last = Instant::now();
     loop {
-        thread::park_timeout(interval);
+        // Unparked early only to stop; a spurious wakeup waits again.
+        let wait = interval.saturating_sub(last.elapsed());
+        if !wait.is_zero() {
+            thread::park_timeout(wait);
+        }
         if stop.load(Ordering::Acquire) || engine.is_promoted() {
             return;
         }
-        let Some(shared) = weak.upgrade() else { return };
+        if last.elapsed() < interval {
+            continue;
+        }
         // A failed poll is recorded in the status and tried again.
-        let _ = engine.poll(&mut Hooks::new(&shared));
+        let _ = engine.poll(&mut hooks);
+        last = Instant::now();
     }
 }
 
@@ -237,14 +246,14 @@ pub(crate) fn open(dir: &std::path::Path, config: ReplicaConfig) -> Result<Arc<S
     // Segments of columnar tables are read from where the writer puts them.
     shared.set_objects(config.store.clone());
     // Start from everything that is in the object store right now.
-    engine.poll(&mut Hooks::new(&shared))?;
+    engine.poll(&mut Hooks::new(shared.replay_target()))?;
     let stop = Arc::new(AtomicBool::new(false));
     let thread = {
-        let (weak, engine, stop) = (Arc::downgrade(&shared), engine.clone(), stop.clone());
+        let (hooks, engine, stop) = (Hooks::new(shared.replay_target()), engine.clone(), stop.clone());
         let interval = config.poll_interval.max(Duration::from_millis(1));
         thread::Builder::new()
             .name("squad-replica".into())
-            .spawn(move || run(weak, engine, stop, interval))
+            .spawn(move || run(hooks, engine, stop, interval))
             .map_err(|e| Error::new(sqlstate::IO_ERROR, e.to_string()))?
     };
     let _ = shared.replica.set(Replica { engine, stop, thread: Mutex::new(Some(thread)) });
@@ -265,24 +274,14 @@ pub(crate) fn status(shared: &Shared) -> Option<ReplicationStatus> {
 /// next poll.
 pub(crate) fn catch_up(shared: &Shared) -> Result<ReplicationStatus> {
     let r = replica(shared)?;
-    r.engine.poll(&mut Hooks::new(shared))?;
+    r.engine.poll(&mut Hooks::new(shared.replay_target()))?;
     Ok(ReplicationStatus::new(r.engine.status()))
 }
 
 /// Makes this replica the writer.
 pub(crate) fn promote(shared: &Shared) -> Result<()> {
     let r = replica(shared)?;
-    r.engine.promote(&mut Hooks::new(shared))?;
+    r.engine.promote(&mut Hooks::new(shared.replay_target()))?;
     shared.replay_finished();
     Ok(())
-}
-
-/// Uploads everything a promoted replica has written.
-pub(crate) fn flush(shared: &Shared) -> Result<()> {
-    Ok(replica(shared)?.engine.flush_remote()?)
-}
-
-#[allow(dead_code)]
-fn _kv_error_is_convertible(e: KvError) -> Error {
-    e.into()
 }
