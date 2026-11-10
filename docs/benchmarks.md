@@ -47,8 +47,8 @@ How to read this:
 - **Point reads** cost about a microsecond in-process — the same as
   SQLite, and one to two orders of magnitude less than a round trip to a
   PostgreSQL server on the same machine. This is the reason to embed a
-  database. The specification's goal (p50 below 2 µs, p99 below 10 µs)
-  is met.
+  database. The design target (p50 below 2 µs, p99 below 10 µs) is
+  met.
 - **Durable single-row writes** are bounded by `fsync`; all three systems
   are within a factor of two, with squad at or ahead of PostgreSQL. The
   goal (insert throughput at least PostgreSQL's at equal durability) is
@@ -88,8 +88,8 @@ pgbench -h 127.0.0.1 -U squad -c 16 -j 4 -T 20 -M prepared squad
 pgbench -h 127.0.0.1 -U squad -c 16 -j 4 -T 20 -M prepared -S squad
 ```
 
-The specification set a goal of three times PostgreSQL's throughput on
-this benchmark. **That goal is not met.** Over the wire protocol squad
+The design target was three times PostgreSQL's throughput on this
+benchmark. **That target is not met.** Over the wire protocol squad
 does the same work as PostgreSQL — parse messages, run a statement, wait
 for the log — plus a thread per connection, and its advantage of having
 no network hop does not exist here. The result says that squad's server
@@ -211,9 +211,9 @@ single-row inserts get slower with more shards because the shards share
 one disk and lose group commit; on separate machines each shard has its
 own log.
 
-## Against the specification's goals
+## Against the design targets
 
-| Goal | Result | Met |
+| Target | Result | Met |
 | --- | --- | --- |
 | Point select p50 < 2 µs, p99 < 10 µs | 1.5 µs / 2.7 µs under load; 1.1 µs / 1.5 µs quiet | yes |
 | Insert with commit: throughput ≥ PostgreSQL at equal durability | 7,580/s vs 5,520/s | yes |

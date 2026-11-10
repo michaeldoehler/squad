@@ -1,0 +1,16 @@
+name: Feature request
+description: Missing SQL feature, API or operational capability
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need and why
+      description: The workload or use case. Check docs/roadmap.md and docs/compatibility.md first.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Example
+      description: The statement or API call you would like to work, and how PostgreSQL behaves if applicable.

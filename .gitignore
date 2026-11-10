@@ -3,3 +3,4 @@
 .DS_Store
 /data
 *.squad-tmp
+/.claude/

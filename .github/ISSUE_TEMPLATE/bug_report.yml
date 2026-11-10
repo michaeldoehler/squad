@@ -1,0 +1,33 @@
+name: Bug report
+description: Wrong result, error, crash or data problem
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For security problems, do not open an issue — see SECURITY.md.
+        squad follows PostgreSQL: if a statement behaves differently from PostgreSQL 16 and the difference is not listed in docs/compatibility.md, that is a bug.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The statements or code you ran, what squad returned, and what you expected (ideally what PostgreSQL returns).
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: A minimal SQL script or Rust snippet.
+      render: sql
+  - type: input
+    id: version
+    attributes:
+      label: squad version or commit
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      description: OS, storage (local disk, S3 provider), embedded or server mode
