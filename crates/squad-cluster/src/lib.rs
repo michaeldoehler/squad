@@ -675,24 +675,31 @@ impl State {
 
     /// Runs statements on several shards at once, one thread per shard.
     fn fan_out(&mut self, inner: &Inner, jobs: &[(usize, &str)], params: &[Value]) -> Result<Vec<(usize, Result<Output>)>> {
-        for (shard, _) in jobs {
+        let jobs: Vec<(usize, &str, &[Value])> = jobs.iter().map(|(s, q)| (*s, *q, params)).collect();
+        self.fan_out_each(inner, &jobs)
+    }
+
+    /// Like [`fan_out`](Self::fan_out), with parameters per shard.
+    fn fan_out_each(&mut self, inner: &Inner, jobs: &[(usize, &str, &[Value])]) -> Result<Vec<(usize, Result<Output>)>> {
+        for (shard, _, _) in jobs {
             self.conn(inner, *shard)?;
         }
-        let mut work: Vec<(usize, &str, &mut ShardConn)> = Vec::with_capacity(jobs.len());
+        let mut work: Vec<(usize, &str, &[Value], &mut ShardConn)> = Vec::with_capacity(jobs.len());
         for (i, conn) in self.conns.iter_mut().enumerate() {
-            if let (Some((_, sql)), Some(conn)) = (jobs.iter().find(|(s, _)| *s == i), conn.as_mut()) {
-                work.push((i, sql, conn));
+            if let (Some((_, sql, params)), Some(conn)) = (jobs.iter().find(|(s, _, _)| *s == i), conn.as_mut()) {
+                work.push((i, sql, params, conn));
             }
         }
         if work.len() <= 1 {
-            return Ok(work.into_iter().map(|(i, sql, conn)| (i, conn.run(sql, params))).collect());
+            return Ok(work.into_iter().map(|(i, sql, params, conn)| (i, conn.run(sql, params))).collect());
         }
         Ok(std::thread::scope(|scope| {
             let mut work = work.into_iter();
             let first = work.next();
-            let handles: Vec<_> = work.map(|(i, sql, conn)| (i, scope.spawn(move || conn.run(sql, params)))).collect();
+            let handles: Vec<_> =
+                work.map(|(i, sql, params, conn)| (i, scope.spawn(move || conn.run(sql, params)))).collect();
             let mut results = Vec::with_capacity(handles.len() + 1);
-            if let Some((i, sql, conn)) = first {
+            if let Some((i, sql, params, conn)) = first {
                 results.push((i, conn.run(sql, params)));
             }
             for (i, h) in handles {
@@ -1006,6 +1013,108 @@ impl State {
         }
     }
 
+    /// Bulk insert: rows are grouped by shard and sent as one statement
+    /// per shard, column by column.
+    fn insert_rows(&mut self, inner: &Inner, table: &str, columns: &[&str], rows: Vec<Vec<Value>>) -> Result<u64> {
+        if columns.is_empty() {
+            return Err(Error::new(sqlstate::SYNTAX_ERROR, "insert_rows needs the names of the columns"));
+        }
+        if let Some(bad) = rows.iter().find(|r| r.len() != columns.len()) {
+            return Err(Error::new(
+                sqlstate::SYNTAX_ERROR,
+                format!("a row has {} values, but {} columns are named", bad.len(), columns.len()),
+            ));
+        }
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let generation = inner.generation.load(Ordering::SeqCst);
+        if self.generation != generation {
+            self.generation = generation;
+            self.conns.iter_mut().flatten().for_each(ShardConn::reset);
+        }
+        let meta = inner.meta.read().clone();
+        let list = columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+        let home = self.home();
+        let types = self.conn(inner, home)?.describe(&format!("SELECT {list} FROM {} LIMIT 0", quote_ident(table)))?;
+        let mut casts = Vec::with_capacity(types.len());
+        for (i, c) in types.iter().enumerate() {
+            if matches!(c.ty, Type::Array(_) | Type::Record | Type::Void | Type::Unknown) {
+                return Err(unsupported(format!("insert_rows into column \"{}\" of type {}", c.name, c.ty.name()))
+                    .with_hint("Use INSERT … VALUES for tables with array columns."));
+            }
+            casts.push(format!("${}::{}[]", i + 1, c.ty.name()));
+        }
+        let sql = format!("INSERT INTO {} ({list}) SELECT * FROM unnest({})", quote_ident(table), casts.join(", "));
+
+        // Shard of every row.
+        let all = Self::all_shards(inner);
+        let mut by_shard: BTreeMap<usize, Vec<Vec<Value>>> = BTreeMap::new();
+        let reference = match meta.tables.get(table) {
+            Some(Class::Distributed { column, kind }) => {
+                let pos = columns.iter().position(|c| c == column).ok_or_else(|| {
+                    unsupported(format!(
+                        "insert_rows into distributed table \"{table}\" without its distribution column \"{column}\""
+                    ))
+                })?;
+                if all.len() == 1 {
+                    by_shard.insert(0, rows);
+                } else {
+                    for row in rows {
+                        by_shard.entry(meta.shard_of(*kind, &row[pos])?).or_default().push(row);
+                    }
+                }
+                false
+            }
+            Some(Class::Reference) => {
+                by_shard.insert(0, rows);
+                true
+            }
+            None if all.len() == 1 => {
+                by_shard.insert(0, rows);
+                false
+            }
+            None => return Err(route::undeclared_error(table)),
+        };
+        // Rows to arrays, one per column.
+        let mut params: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
+        for (shard, rows) in by_shard {
+            let mut cols: Vec<Vec<Value>> = (0..columns.len()).map(|_| Vec::with_capacity(rows.len())).collect();
+            for row in rows {
+                for (col, v) in cols.iter_mut().zip(row) {
+                    col.push(v);
+                }
+            }
+            params.insert(shard, cols.into_iter().map(Value::Array).collect());
+        }
+        if reference {
+            if self.txn.is_some() {
+                return Err(unsupported("writing to a reference table inside a transaction")
+                    .with_hint("A reference table is written on every shard, and shards do not share a transaction."));
+            }
+            let p = &params[&0];
+            let mut results = Vec::new();
+            for shard in all {
+                let r = self.conn(inner, shard).and_then(|c| c.run(&sql, p));
+                let failed = r.is_err();
+                results.push((shard, r));
+                if failed {
+                    break;
+                }
+            }
+            let first = results.first().and_then(|(_, r)| r.as_ref().ok()).map_or(0, |o| o.affected);
+            combine("The write to the reference table", results)?;
+            return Ok(first);
+        }
+        if params.len() == 1 {
+            let (shard, p) = params.iter().next().unwrap();
+            return Ok(self.on_shard(inner, *shard, &sql, p)?.affected);
+        }
+        self.outside_txn("An insert of rows with distribution keys on different shards")?;
+        let jobs: Vec<(usize, &str, &[Value])> = params.iter().map(|(s, p)| (*s, sql.as_str(), p.as_slice())).collect();
+        Ok(combine("The insert", self.fan_out_each(inner, &jobs)?)?.affected)
+    }
+
     /// `squad_distribute` (with a column) and `squad_reference`.
     fn declare(&mut self, inner: &Inner, table: &str, column: Option<&str>) -> Result<Output> {
         let function = if column.is_some() { "squad_distribute" } else { "squad_reference" };
@@ -1119,6 +1228,18 @@ impl ClusterConnection {
     /// Runs one or more statements separated by semicolons.
     pub fn batch_execute(&self, sql: &str) -> Result<()> {
         self.run(sql, &[]).map(|_| ())
+    }
+
+    /// Inserts many rows at once: the bulk path, in place of `COPY`.
+    ///
+    /// `columns` names the columns the values of each row belong to; for a
+    /// distributed table the distribution column must be among them. Rows
+    /// are grouped by shard and every shard receives its rows as one
+    /// statement, all shards at the same time. Like a multi-row INSERT
+    /// that spans shards, this is not atomic across shards: if one shard
+    /// fails, the rows of the others stay.
+    pub fn insert_rows(&self, table: &str, columns: &[&str], rows: Vec<Vec<Value>>) -> Result<u64> {
+        self.state.lock().insert_rows(&self.inner, table, columns, rows)
     }
 
     /// Checks a statement and returns a handle that runs it. Routing is

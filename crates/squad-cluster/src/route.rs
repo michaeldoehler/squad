@@ -394,7 +394,7 @@ fn select_keys(sel: &pb::SelectStmt, env: &Env) -> Result<Keys> {
     level_keys(&level, env, false)
 }
 
-fn undeclared_error(table: &str) -> Error {
+pub(crate) fn undeclared_error(table: &str) -> Error {
     Error::new(
         sqlstate::FEATURE_NOT_SUPPORTED,
         format!("table \"{table}\" is neither distributed nor a reference table"),
@@ -519,6 +519,9 @@ pub(crate) fn analyze(stmt: &pb::Node, text: &str, env: &Env) -> Result<Plan> {
                     let mut keys = Vec::with_capacity(values.len());
                     for row in values {
                         let Some(N::List(list)) = row.node.as_ref() else { return Err(Error::internal("malformed VALUES")) };
+                        if matches!(list.items.get(pos).and_then(|n| n.node.as_ref()), Some(N::AConst(c)) if c.isnull) {
+                            return Err(Error::new(sqlstate::NOT_NULL_VIOLATION, "the distribution column cannot be null"));
+                        }
                         let key = list.items.get(pos).and_then(operand).ok_or_else(|| {
                             unsupported(format!(
                                 "an expression as the value of distribution column \"{column}\"; use a constant or a parameter"
@@ -613,10 +616,37 @@ pub(crate) fn analyze(stmt: &pb::Node, text: &str, env: &Env) -> Result<Plan> {
             }
             Ok(Plan::Everywhere { ddl: true, dropped })
         }
+        N::RenameStmt(r) => {
+            let table = r.relation.as_ref().map(relname).unwrap_or_default();
+            match env.meta.tables.get(&table) {
+                Some(_) if r.rename_type == pb::ObjectType::ObjectTable as i32 => {
+                    Err(unsupported(format!("renaming \"{table}\", a distributed or reference table"))
+                        .with_hint("The cluster records table classes by name. Create the table under the new name and move the rows."))
+                }
+                Some(Class::Distributed { column, .. })
+                    if r.rename_type == pb::ObjectType::ObjectColumn as i32 && r.subname == *column =>
+                {
+                    Err(unsupported(format!("renaming distribution column \"{column}\" of \"{table}\"")))
+                }
+                _ => Ok(Plan::Everywhere { ddl: true, dropped: Vec::new() }),
+            }
+        }
+        N::AlterTableStmt(a) => {
+            let table = a.relation.as_ref().map(relname).unwrap_or_default();
+            if let Some(Class::Distributed { column, .. }) = env.meta.tables.get(&table) {
+                for cmd in &a.cmds {
+                    let Some(N::AlterTableCmd(c)) = cmd.node.as_ref() else { continue };
+                    let changes = c.subtype == pb::AlterTableType::AtDropColumn as i32
+                        || c.subtype == pb::AlterTableType::AtAlterColumnType as i32;
+                    if changes && c.name == *column {
+                        return Err(unsupported(format!("dropping or retyping distribution column \"{column}\" of \"{table}\"")));
+                    }
+                }
+            }
+            Ok(Plan::Everywhere { ddl: true, dropped: Vec::new() })
+        }
         N::CreateStmt(_)
         | N::IndexStmt(_)
-        | N::AlterTableStmt(_)
-        | N::RenameStmt(_)
         | N::CreateSeqStmt(_)
         | N::AlterSeqStmt(_)
         | N::CreateEnumStmt(_)
