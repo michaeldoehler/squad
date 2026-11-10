@@ -55,9 +55,13 @@ const CHUNK: usize = 1 << 20;
 /// Records waiting for upload are dropped beyond this size; the next
 /// snapshot then covers them.
 const MAX_PENDING: usize = 256 << 20;
-const MARKER_FILE: &str = "REMOTE";
+pub(crate) const MARKER_FILE: &str = "REMOTE";
+/// Present in a directory that is the working copy of a read replica.
+/// Such a directory holds nothing the object store does not, so it may be
+/// replaced by a fresh download at any time.
+pub(crate) const REPLICA_FILE: &str = "REPLICA";
 const SNAPSHOT_TMP: &str = "remote-snapshot.tmp";
-const DATA_FILE: &str = "data.db";
+pub(crate) const DATA_FILE: &str = "data.db";
 
 /// When a commit counts as safe in the object store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,14 +124,14 @@ pub struct RemoteStats {
     pub chunks_reused: u64,
 }
 
-fn remote_err(e: squad_object::Error) -> StorageError {
+pub(crate) fn remote_err(e: squad_object::Error) -> StorageError {
     StorageError::Remote(e.to_string())
 }
 
-fn claim_key(epoch: u64) -> String {
+pub(crate) fn claim_key(epoch: u64) -> String {
     format!("writer/claim-{epoch:020}")
 }
-fn base_key(epoch: u64) -> String {
+pub(crate) fn base_key(epoch: u64) -> String {
     format!("writer/base-{epoch:020}")
 }
 fn wal_prefix(epoch: u64) -> String {
@@ -192,22 +196,64 @@ impl Manifest {
     }
 }
 
-/// What the object store holds, as far as it can be restored.
-struct RemoteState {
-    /// Epochs with an established base, ascending: `(epoch, base lsn)`.
-    epochs: Vec<(u64, u64)>,
-    /// Highest claimed epoch, established or not.
-    max_claim: u64,
-    /// Newest valid snapshot: `(epoch, lsn)`.
-    snapshot: Option<(u64, u64)>,
-    /// Log objects to replay after the snapshot, in order:
-    /// `(key, first, last, limit)`; records above `limit` are ignored.
-    wal: Vec<(String, u64, u64, u64)>,
-    /// LSN the database reaches after replay.
-    lsn: u64,
+/// A log object that continues the sequence.
+pub(crate) struct WalObject {
+    pub(crate) key: String,
+    /// Epoch of the writer that uploaded it.
+    pub(crate) epoch: u64,
+    /// Records above this LSN are ignored: the next writer took over there.
+    pub(crate) limit: u64,
 }
 
-fn read_remote(store: &dyn ObjectStore) -> Result<RemoteState> {
+/// What the object store holds, as far as it can be restored.
+pub(crate) struct RemoteState {
+    /// Epochs with an established base, ascending: `(epoch, base lsn)`.
+    pub(crate) epochs: Vec<(u64, u64)>,
+    /// Highest claimed epoch, established or not.
+    pub(crate) max_claim: u64,
+    /// Newest valid snapshot: `(epoch, lsn)`.
+    pub(crate) snapshot: Option<(u64, u64)>,
+    /// Log objects to replay, in order, starting after the snapshot (or
+    /// after the LSN the listing was asked to continue from).
+    pub(crate) wal: Vec<WalObject>,
+    /// LSN the database reaches after replay.
+    pub(crate) lsn: u64,
+}
+
+impl RemoteState {
+    /// LSN up to which the records of `epoch` count, if it is established.
+    pub(crate) fn limit(&self, epoch: u64) -> Option<u64> {
+        let i = self.epochs.iter().position(|(e, _)| *e == epoch)?;
+        Some(self.epochs.get(i + 1).map_or(u64::MAX, |(_, base)| *base))
+    }
+
+    /// The epoch whose writer produced the record at `lsn`.
+    pub(crate) fn epoch_at(&self, lsn: u64) -> Option<u64> {
+        self.epochs.iter().rev().find(|(_, base)| *base <= lsn).or(self.epochs.first()).map(|e| e.0)
+    }
+
+    /// True if a directory at `lsn` whose history ends in `epoch` holds a
+    /// prefix of the history in the object store.
+    pub(crate) fn contains(&self, epoch: u64, lsn: u64) -> bool {
+        let base = self.epochs.iter().find(|(e, _)| *e == epoch).map(|e| e.1);
+        matches!((base, self.limit(epoch)), (Some(base), Some(limit)) if base <= lsn && lsn <= limit)
+    }
+}
+
+/// Highest claimed epoch.
+pub(crate) fn max_claim(store: &dyn ObjectStore) -> Result<u64> {
+    let claims = store.list("writer/claim-").map_err(remote_err)?;
+    Ok(claims.iter().filter_map(|m| m.key.strip_prefix("writer/claim-")?.parse::<u64>().ok()).max().unwrap_or(0))
+}
+
+pub(crate) fn read_remote(store: &dyn ObjectStore) -> Result<RemoteState> {
+    read_remote_from(store, None)
+}
+
+/// Reads the remote state. With `from`, the log objects returned are the
+/// ones that continue a copy standing at that LSN instead of the ones
+/// that continue the newest snapshot.
+pub(crate) fn read_remote_from(store: &dyn ObjectStore, from: Option<u64>) -> Result<RemoteState> {
     let mut max_claim = 0;
     let mut epochs = Vec::new();
     for meta in store.list("writer/").map_err(remote_err)? {
@@ -237,7 +283,7 @@ fn read_remote(store: &dyn ObjectStore) -> Result<RemoteState> {
         }
     }
 
-    let mut lsn = snapshot.map_or(0, |s| s.1);
+    let mut lsn = from.unwrap_or(snapshot.map_or(0, |s| s.1));
     let mut wal = Vec::new();
     for (epoch, _) in &epochs {
         let lim = limit(*epoch).unwrap_or(u64::MAX);
@@ -253,7 +299,7 @@ fn read_remote(store: &dyn ObjectStore) -> Result<RemoteState> {
             // Usable if it continues the sequence without a gap.
             if first <= lsn + 1 && last > lsn && lsn < lim {
                 lsn = last.min(lim);
-                wal.push((key, first, last, lim));
+                wal.push(WalObject { key, epoch: *epoch, limit: lim });
             }
         }
     }
@@ -269,7 +315,12 @@ fn data_file_lsn(first_page: &[u8]) -> Result<u64> {
 
 /// Downloads the remote state into the empty directory `dir` and returns
 /// the opened engine, positioned at the last restorable commit.
-fn materialize(store: &dyn ObjectStore, state: &RemoteState, dir: &Path, opts: &DiskOptions) -> Result<DiskEngine> {
+pub(crate) fn materialize(
+    store: &dyn ObjectStore,
+    state: &RemoteState,
+    dir: &Path,
+    opts: &DiskOptions,
+) -> Result<DiskEngine> {
     let vfs = &opts.vfs;
     vfs.create_dir_all(dir)?;
     if let Some((epoch, lsn)) = state.snapshot {
@@ -296,7 +347,7 @@ fn materialize(store: &dyn ObjectStore, state: &RemoteState, dir: &Path, opts: &
         vfs.sync_dir(dir)?;
     }
     let engine = DiskEngine::open(dir, opts.clone())?;
-    for (key, _, _, limit) in &state.wal {
+    for WalObject { key, limit, .. } in &state.wal {
         let bytes = store.get(key).map_err(remote_err)?.ok_or_else(|| vanished(key))?;
         let mut off = 0;
         while let Some((lsn, ops, next)) = wal::read_record(&bytes, off) {
@@ -334,7 +385,7 @@ fn materialize(store: &dyn ObjectStore, state: &RemoteState, dir: &Path, opts: &
     Ok(engine)
 }
 
-const VANISHED: &str = "was removed while it was being restored";
+pub(crate) const VANISHED: &str = "was removed while it was being restored";
 
 /// An object listed a moment ago is gone: a live writer uploaded a newer
 /// snapshot and cleaned up. The restore starts over from the new state.
@@ -344,7 +395,11 @@ fn vanished(key: &str) -> StorageError {
 
 /// Restores into `dir`, starting over when a concurrent writer replaces
 /// the snapshot being read.
-fn materialize_latest(store: &dyn ObjectStore, dir: &Path, opts: &DiskOptions) -> Result<(DiskEngine, RemoteState)> {
+pub(crate) fn materialize_latest(
+    store: &dyn ObjectStore,
+    dir: &Path,
+    opts: &DiskOptions,
+) -> Result<(DiskEngine, RemoteState)> {
     let mut attempt = 0;
     loop {
         let state = read_remote(store)?;
@@ -359,17 +414,17 @@ fn materialize_latest(store: &dyn ObjectStore, dir: &Path, opts: &DiskOptions) -
     }
 }
 
-fn dir_is_empty(opts: &DiskOptions, dir: &Path) -> Result<bool> {
+pub(crate) fn dir_is_empty(opts: &DiskOptions, dir: &Path) -> Result<bool> {
     Ok(!opts.vfs.exists(&dir.join(DATA_FILE))?)
 }
 
 /// Removes a database from a local directory.
-fn wipe(opts: &DiskOptions, dir: &Path) -> Result<()> {
+pub(crate) fn wipe(opts: &DiskOptions, dir: &Path) -> Result<()> {
     let vfs = &opts.vfs;
     for name in vfs.list(&dir.join("wal"))? {
         vfs.remove(&dir.join("wal").join(name))?;
     }
-    for name in [DATA_FILE, "data.db.tmp", "data.db.restore", "checkpoint.journal", MARKER_FILE] {
+    for name in [DATA_FILE, "data.db.tmp", "data.db.restore", "checkpoint.journal", MARKER_FILE, REPLICA_FILE] {
         if vfs.exists(&dir.join(name))? {
             vfs.remove(&dir.join(name))?;
         }

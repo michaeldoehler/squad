@@ -2456,6 +2456,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "squad-cluster"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "pg_query",
+ "postgres",
+ "squad",
+ "squad-server",
+ "tempfile",
+]
+
+[[package]]
 name = "squad-columnar"
 version = "0.1.0"
 dependencies = [

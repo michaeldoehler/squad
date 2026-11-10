@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/squad-storage", "crates/squad-kv", "crates/squad", "crates/squad-server", "crates/squad-bench", "crates/squad-columnar", "crates/squad-object", "crates/squad-sqllogictest", "crates/squad-difftest"]
+members = ["crates/squad-storage", "crates/squad-kv", "crates/squad", "crates/squad-server", "crates/squad-bench", "crates/squad-columnar", "crates/squad-object", "crates/squad-cluster", "crates/squad-sqllogictest", "crates/squad-difftest"]
 
 [workspace.package]
 version = "0.1.0"
