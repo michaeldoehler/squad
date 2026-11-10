@@ -1,0 +1,15 @@
+[package]
+name = "squad-difftest"
+description = "Differential fuzzer: runs generated SQL against squad and PostgreSQL and compares the results."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+squad.workspace = true
+postgres = "0.19"
+rand = "0.8"

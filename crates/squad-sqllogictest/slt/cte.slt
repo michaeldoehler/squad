@@ -1,0 +1,147 @@
+# Common table expressions, plain and recursive.
+
+statement ok
+CREATE TABLE node (id int PRIMARY KEY, parent int, name text)
+
+statement ok
+INSERT INTO node VALUES (1, NULL, 'root'), (2, 1, 'a'), (3, 1, 'b'), (4, 2, 'a1'), (5, 2, 'a2'), (6, 4, 'a1x')
+
+query I
+WITH x AS (SELECT 1 AS n) SELECT * FROM x
+----
+1
+
+query TI
+WITH x AS (SELECT id, name FROM node WHERE parent = 1), y AS (SELECT count(*) AS c FROM x) SELECT x.name, y.c FROM x, y ORDER BY 1
+----
+a 2
+b 2
+
+query T
+WITH x (a, b) AS (SELECT id, name FROM node) SELECT b FROM x WHERE a = 3
+----
+b
+
+query II
+WITH x AS (SELECT 1 AS v), y AS (SELECT v + 1 AS v FROM x) SELECT x.v, y.v FROM x, y
+----
+1 2
+
+query I
+WITH x AS (SELECT id FROM node) SELECT count(*) FROM x a JOIN x b ON a.id = b.id
+----
+6
+
+query IT
+WITH x AS (SELECT 1 AS n) SELECT (SELECT n FROM x), EXISTS (SELECT 1 FROM x WHERE n = 2)
+----
+1 f
+
+query I
+WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5) SELECT i FROM n
+----
+1
+2
+3
+4
+5
+
+query I
+WITH RECURSIVE n (i) AS (SELECT 1 UNION SELECT (i % 3) + 1 FROM n) SELECT i FROM n ORDER BY i
+----
+1
+2
+3
+
+query I
+WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100) SELECT sum(i) FROM n
+----
+5050
+
+query ITI
+WITH RECURSIVE sub AS (SELECT id, name, 0 AS depth FROM node WHERE id = 2 UNION ALL SELECT t.id, t.name, sub.depth + 1 FROM node t JOIN sub ON t.parent = sub.id) SELECT * FROM sub ORDER BY depth, id
+----
+2 a 0
+4 a1 1
+5 a2 1
+6 a1x 2
+
+query T
+WITH RECURSIVE path AS (SELECT id, name AS p FROM node WHERE parent IS NULL UNION ALL SELECT t.id, path.p || '/' || t.name FROM node t JOIN path ON t.parent = path.id) SELECT p FROM path ORDER BY p
+----
+root
+root/a
+root/a/a1
+root/a/a1/a1x
+root/a/a2
+root/b
+
+query I
+WITH RECURSIVE up AS (SELECT id, parent FROM node WHERE id = 6 UNION ALL SELECT n.id, n.parent FROM node n JOIN up ON n.id = up.parent) SELECT id FROM up ORDER BY id
+----
+1
+2
+4
+6
+
+query I
+WITH RECURSIVE fib (a, b) AS (SELECT 0, 1 UNION ALL SELECT b, a + b FROM fib WHERE b < 50) SELECT a FROM fib
+----
+0
+1
+1
+2
+3
+5
+8
+13
+21
+34
+
+query II
+WITH RECURSIVE t (n, f) AS (SELECT 1, 1 UNION ALL SELECT n + 1, f * (n + 1) FROM t WHERE n < 6) SELECT * FROM t
+----
+1 1
+2 2
+3 6
+4 24
+5 120
+6 720
+
+query IT
+WITH ins AS (INSERT INTO node VALUES (7, 3, 'b1') RETURNING id, name) SELECT * FROM ins
+----
+7 b1
+
+query I
+WITH del AS (DELETE FROM node WHERE id = 7 RETURNING name) SELECT count(*) FROM del
+----
+1
+
+query I
+WITH upd AS (UPDATE node SET name = name || '!' WHERE parent = 4 RETURNING id) SELECT id FROM upd
+----
+6
+
+query T
+SELECT name FROM node WHERE id = 6
+----
+a1x!
+
+statement ok
+WITH moved AS (DELETE FROM node WHERE parent = 2 RETURNING id, name) INSERT INTO node SELECT id + 100, 3, name FROM moved
+
+query IIT
+SELECT * FROM node WHERE parent = 3 ORDER BY id
+----
+104 3 a1
+105 3 a2
+
+query error (42P01)
+WITH x AS (SELECT 1) SELECT * FROM y
+
+query error (22P02)
+WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT 'x' FROM n) SELECT * FROM n
+
+query error (42712)
+WITH x AS (SELECT 1), x AS (SELECT 2) SELECT * FROM x

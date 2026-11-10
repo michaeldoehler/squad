@@ -1,0 +1,34 @@
+[package]
+name = "squad"
+description = "An embeddable, Postgres-compatible OLTP database for Rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["database", "postgres", "embedded", "sql", "mvcc"]
+categories = ["database-implementations"]
+
+[features]
+# The S3 client for remote storage (`squad::object::S3Store`, `s3://` URLs).
+s3 = ["squad-object/s3"]
+
+[dependencies]
+squad-storage.workspace = true
+squad-kv.workspace = true
+squad-object = { path = "../squad-object", version = "0.1.0", default-features = false }
+squad-columnar = { path = "../squad-columnar", version = "0.1.0" }
+parking_lot.workspace = true
+pg_query = "18.1"
+rust_decimal = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono-tz = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,39 @@
+[package]
+name = "squad-server"
+description = "Postgres wire-protocol server and command-line shell for the squad database."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "squad_server"
+
+[[bin]]
+name = "squad"
+path = "src/main.rs"
+# The library crate `squad` owns the documentation path of that name.
+doc = false
+
+[dependencies]
+squad = { workspace = true, features = ["s3"] }
+parking_lot.workspace = true
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false }
+base64 = "0.22"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
+tokio-postgres = "0.7"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+bytes = "1"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "derive", "migrate", "chrono", "uuid", "json", "rust_decimal"] }
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
+rust_decimal = "1"

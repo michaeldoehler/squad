@@ -1,0 +1,87 @@
+-- Common table expressions.
+CREATE TABLE tree (id int PRIMARY KEY, parent int, name text);
+INSERT INTO tree VALUES (1, NULL, 'root'), (2, 1, 'a'), (3, 1, 'b'), (4, 2, 'a1'), (5, 2, 'a2'), (6, 4, 'a1x');
+WITH x AS (SELECT 1 AS n) SELECT * FROM x;
+n
+1
+(1 row)
+WITH x AS (SELECT id, name FROM tree WHERE parent = 1), y AS (SELECT count(*) AS c FROM x) SELECT x.name, y.c FROM x, y ORDER BY 1;
+name|c
+a|2
+b|2
+(2 rows)
+WITH x (a, b) AS (SELECT id, name FROM tree) SELECT b FROM x WHERE a = 3;
+b
+b
+(1 row)
+WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5) SELECT i FROM n;
+i
+1
+2
+3
+4
+5
+(5 rows)
+WITH RECURSIVE n (i) AS (SELECT 1 UNION SELECT (i % 3) + 1 FROM n) SELECT i FROM n ORDER BY i;
+i
+1
+2
+3
+(3 rows)
+WITH RECURSIVE sub AS (SELECT id, name, 0 AS depth FROM tree WHERE id = 2 UNION ALL SELECT t.id, t.name, sub.depth + 1 FROM tree t JOIN sub ON t.parent = sub.id) SELECT * FROM sub ORDER BY depth, id;
+id|name|depth
+2|a|0
+4|a1|1
+5|a2|1
+6|a1x|2
+(4 rows)
+WITH RECURSIVE path AS (SELECT id, name::text AS p FROM tree WHERE parent IS NULL UNION ALL SELECT t.id, path.p || '/' || t.name FROM tree t JOIN path ON t.parent = path.id) SELECT p FROM path ORDER BY p;
+p
+root
+root/a
+root/a/a1
+root/a/a1/a1x
+root/a/a2
+root/b
+(6 rows)
+WITH RECURSIVE fib (a, b) AS (SELECT 0, 1 UNION ALL SELECT b, a + b FROM fib WHERE b < 50) SELECT a FROM fib;
+a
+0
+1
+1
+2
+3
+5
+8
+13
+21
+34
+(10 rows)
+WITH a AS (SELECT 1 AS v), b AS (SELECT v + 1 AS v FROM a) SELECT a.v, b.v FROM a, b;
+v|v
+1|2
+(1 row)
+WITH x AS (SELECT 1 AS n) SELECT (SELECT n FROM x), EXISTS (SELECT 1 FROM x WHERE n = 2);
+n|exists
+1|f
+(1 row)
+WITH ins AS (INSERT INTO tree VALUES (7, 3, 'b1') RETURNING id, name) SELECT * FROM ins;
+id|name
+7|b1
+(1 row)
+WITH del AS (DELETE FROM tree WHERE id = 7 RETURNING name) SELECT count(*) FROM del;
+count
+1
+(1 row)
+WITH upd AS (UPDATE tree SET name = name || '!' WHERE parent = 4 RETURNING id) SELECT id FROM upd;
+id
+6
+(1 row)
+SELECT name FROM tree WHERE id = 6;
+name
+a1x!
+(1 row)
+WITH x AS (SELECT 1) SELECT * FROM y;
+ERROR:  42P01
+WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT 'x' FROM n) SELECT * FROM n;
+ERROR:  22P02

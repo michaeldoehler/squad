@@ -1,0 +1,14 @@
+# cargo run --release -p squad --example replication_bench
+# 4 vCPU, 15 GiB RAM. Writer, replicas and the object store (a local
+# directory, file://) on the same machine and disk; RemoteSync::Sync.
+# Other jobs (test builds) were active on the machine during the run.
+# "lag" is the time from the writer's commit returning until the row is
+# visible on a replica that polls at the given interval (300 commits each).
+
+writer: 20000 single-row commits shipped synchronously in 16.84s (1187 commits/s)
+replica: opened from an empty directory and applied 20003 log records (220000 rows) in 788.76ms (25360 records/s, 278919 rows/s)
+replica: opened from a snapshot of 220000 rows in 271.69ms
+lag with a 1 ms poll interval: p50 12.94ms, p99 36.89ms, max 47.35ms
+lag with a 10 ms poll interval: p50 22.38ms, p99 36.54ms, max 61.71ms
+lag with a 100 ms poll interval: p50 113.57ms, p99 133.32ms, max 147.27ms
+promotion until the first commit of the new writer: 103.67ms

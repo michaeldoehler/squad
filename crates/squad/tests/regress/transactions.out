@@ -1,0 +1,161 @@
+-- Transaction control within one session.
+CREATE TABLE acct (id int PRIMARY KEY, balance int NOT NULL CHECK (balance >= 0));
+INSERT INTO acct VALUES (1, 100), (2, 50);
+BEGIN;
+UPDATE acct SET balance = balance - 30 WHERE id = 1;
+UPDATE acct SET balance = balance + 30 WHERE id = 2;
+SELECT * FROM acct ORDER BY id;
+id|balance
+1|70
+2|80
+(2 rows)
+COMMIT;
+SELECT * FROM acct ORDER BY id;
+id|balance
+1|70
+2|80
+(2 rows)
+BEGIN;
+DELETE FROM acct;
+SELECT count(*) FROM acct;
+count
+0
+(1 row)
+ROLLBACK;
+SELECT count(*) FROM acct;
+count
+2
+(1 row)
+-- an error aborts the transaction until rollback
+BEGIN;
+UPDATE acct SET balance = balance - 500 WHERE id = 1;
+ERROR:  23514
+SELECT 1;
+ERROR:  25P02
+UPDATE acct SET balance = 0;
+ERROR:  25P02
+COMMIT;
+SELECT * FROM acct ORDER BY id;
+id|balance
+1|70
+2|80
+(2 rows)
+-- savepoints
+BEGIN;
+INSERT INTO acct VALUES (3, 1);
+SAVEPOINT a;
+INSERT INTO acct VALUES (4, 1);
+SAVEPOINT b;
+INSERT INTO acct VALUES (4, 1);
+ERROR:  23505
+ROLLBACK TO SAVEPOINT b;
+INSERT INTO acct VALUES (5, 1);
+ROLLBACK TO a;
+INSERT INTO acct VALUES (6, 1);
+RELEASE SAVEPOINT a;
+ROLLBACK TO a;
+ERROR:  3B001
+ROLLBACK;
+BEGIN;
+INSERT INTO acct VALUES (3, 1);
+SAVEPOINT a;
+INSERT INTO acct VALUES (4, 1);
+ROLLBACK TO a;
+COMMIT;
+SELECT id FROM acct ORDER BY id;
+id
+1
+2
+3
+(3 rows)
+SAVEPOINT nope;
+ERROR:  25P01
+ROLLBACK TO nope;
+ERROR:  25P01
+-- transactional DDL
+BEGIN;
+CREATE TABLE tmp (x int);
+INSERT INTO tmp VALUES (1);
+ALTER TABLE acct ADD COLUMN note text;
+SELECT note FROM acct WHERE id = 1;
+note
+NULL
+(1 row)
+ROLLBACK;
+SELECT * FROM tmp;
+ERROR:  42P01
+SELECT note FROM acct;
+ERROR:  42703
+BEGIN;
+DROP TABLE acct;
+SELECT * FROM acct;
+ERROR:  42P01
+ROLLBACK;
+SELECT count(*) FROM acct;
+count
+3
+(1 row)
+-- isolation levels and read only
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SHOW transaction_isolation;
+transaction_isolation
+serializable
+(1 row)
+SELECT count(*) FROM acct;
+count
+3
+(1 row)
+COMMIT;
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SHOW transaction_isolation;
+transaction_isolation
+repeatable read
+(1 row)
+ROLLBACK;
+SHOW transaction_isolation;
+transaction_isolation
+read committed
+(1 row)
+BEGIN READ ONLY;
+SELECT count(*) FROM acct;
+count
+3
+(1 row)
+INSERT INTO acct VALUES (9, 9);
+ERROR:  25006
+ROLLBACK;
+START TRANSACTION;
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SHOW transaction_isolation;
+transaction_isolation
+repeatable read
+(1 row)
+COMMIT;
+-- settings
+SHOW search_path;
+search_path
+"$user", public
+(1 row)
+SET search_path TO public;
+SHOW search_path;
+search_path
+public
+(1 row)
+SET TIME ZONE 'UTC';
+SHOW TimeZone;
+TimeZone
+UTC
+(1 row)
+SHOW nosuch_setting;
+ERROR:  42704
+SET application_name = 'regress';
+SHOW application_name;
+application_name
+regress
+(1 row)
+SELECT current_setting('application_name'), current_schema(), current_database() IS NOT NULL;
+current_setting|current_schema|?column?
+regress|public|t
+(1 row)
+COMMIT;
+ROLLBACK;

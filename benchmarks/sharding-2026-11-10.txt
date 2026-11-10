@@ -1,0 +1,54 @@
+# cargo run --release -p squad-cluster --example cluster_bench -- 2000000 1,2,4
+# 4 vCPU, 15 GiB RAM. Local shards (directories on one disk), default
+# configuration: every commit is forced to disk. Load average about 2 during
+# the run: another job (test runs) was active on the machine.
+#
+# All shards share this one machine. The numbers show what routing and
+# merging cost and how far shards use the cores of one machine. They do not
+# show scale-out over several machines.
+#
+# Events: columnar table, distributed by project_id, 200 projects, 90 days.
+# Bulk load: ClusterConnection::insert_rows, about 100,000 rows per shard
+# and call. Single-row inserts: prepared INSERT into a row table, 4,000
+# rows in total, one commit per row.
+
+rows: 2000000, projects: 200, bulk batch: 100000 rows per shard
+
+== 1 shard(s) ==
+bulk load (insert_rows):              6.6 s     303956 rows/s
+VACUUM (compaction, all shards):      1.1 s
+rows per shard:                   [2000000]
+single-row inserts, durable commit each:
+  1 connection(s):                     8051 rows/s
+  4 connection(s):                    14991 rows/s
+  8 connection(s):                    28660 rows/s
+
+== 2 shard(s) ==
+bulk load (insert_rows):              5.1 s     391359 rows/s
+VACUUM (compaction, all shards):      0.9 s
+rows per shard:                   [950000, 1050000]
+single-row inserts, durable commit each:
+  1 connection(s):                     8087 rows/s
+  4 connection(s):                    15416 rows/s
+  8 connection(s):                    23936 rows/s
+
+== 4 shard(s) ==
+bulk load (insert_rows):              4.7 s     421731 rows/s
+VACUUM (compaction, all shards):      0.0 s
+rows per shard:                   [500000, 480000, 450000, 570000]
+single-row inserts, durable commit each:
+  1 connection(s):                     7667 rows/s
+  4 connection(s):                    11289 rows/s
+  8 connection(s):                    18611 rows/s
+
+query times in ms (best of 5), by number of shards
+query                                                1 shard  2 shards  4 shards    rows
+one project: events per day, 30 days                    0.70      0.69      0.72      30
+one project: unique users per day (approx)              0.86      1.01      1.55      90
+one project: top 10 paths of one week                   0.63      0.78      1.10       5
+one project: p50/p95 duration                           0.43      0.54      0.74       1
+all shards: count(*)                                    0.14      0.83      1.45       1
+all shards: count and avg duration by event             6.65      7.70      8.59       8
+all shards: events per day by country, one week         4.52      6.77      4.93      70
+all shards: p95 duration per project                    6.97      6.50      9.19     200
+all shards: 20 slowest events                        3111.35   1637.02    890.73      20

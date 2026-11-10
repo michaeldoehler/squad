@@ -1,0 +1,28 @@
+# pgbench 16, scale 10, 16 clients, 4 threads, prepared statements, 20 s per run.
+# 4 vCPU, ext4. Both servers with synchronous commit and fsync on.
+# squad: squad serve <dir> --sync sync (TCP). PostgreSQL 16.15: defaults, shared_buffers=256MB (Unix socket).
+# Load average at start: 1.69 1.06 0.42 (other build jobs were running).
+
+## squad, TPC-B-like
+number of transactions actually processed: 152809
+number of failed transactions: 0 (0.000%)
+latency average = 2.094 ms
+tps = 7640.728123 (without initial connection time)
+
+## PostgreSQL, TPC-B-like
+number of transactions actually processed: 123908
+number of failed transactions: 0 (0.000%)
+latency average = 2.584 ms
+tps = 6192.064644 (without initial connection time)
+
+## squad, select-only
+number of transactions actually processed: 3536605
+number of failed transactions: 0 (0.000%)
+latency average = 0.090 ms
+tps = 176880.439825 (without initial connection time)
+
+## PostgreSQL, select-only
+number of transactions actually processed: 3941372
+number of failed transactions: 0 (0.000%)
+latency average = 0.081 ms
+tps = 197011.732563 (without initial connection time)

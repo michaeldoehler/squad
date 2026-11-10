@@ -1,0 +1,17 @@
+[package]
+name = "squad-kv"
+description = "Transactional MVCC key-value layer of the squad database: snapshots, row locks, deadlock detection and serializable validation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+squad-storage.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rand = "0.8"

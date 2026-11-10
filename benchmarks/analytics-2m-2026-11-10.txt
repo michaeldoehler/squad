@@ -1,0 +1,22 @@
+# cargo run --release -p squad --example analytics_bench -- 2000000
+# 4 vCPU, 15 GiB RAM, in-memory database. Load average about 1 at start;
+# two other jobs (test runs) were active on the machine.
+# Each query: best of three runs. Times in milliseconds.
+
+rows: 2000000
+load row table:                13.7 s     145467 rows/s
+load columnar table:            9.6 s     208004 rows/s (insert, including automatic compaction)
+final VACUUM (compaction):      2.2 s
+
+query                                              row (ms) columnar (ms)  speed-up
+count(*) of one week                                 3761.9         2.62     1438x
+events per day, one project, 30 days                 3466.8         0.68     5094x
+top 10 paths, one project, one week                  3393.5         0.79     4313x
+unique users per day, one project (exact)            3465.8         1.25     2783x
+unique users per day, one project (approx)           3463.7         1.15     3013x
+p50/p95/p99 duration per event, all data             4537.5         5.76      788x
+count and avg by country, all data                   3690.4         7.14      517x
+revenue per project, all data                        3850.5         3.64     1059x
+one user's events                                    3523.3         1.33     2642x
+sum over all data                                    3653.8         1.53     2388x
+errors per hour, last day of one project             4284.9         0.66     6453x
