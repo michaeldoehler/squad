@@ -247,9 +247,8 @@ fn a_writer_directory_is_not_overwritten_by_a_replica() {
     let mut unrelated = Model::new();
     write(&b, &mut rng, &mut unrelated, 30);
     drop(b);
-    let err = ReplicaEngine::open(Path::new("/replica"), options(&vfs_b), config(&store, RemoteSync::Sync))
-        .err()
-        .unwrap();
+    let err =
+        ReplicaEngine::open(Path::new("/replica"), options(&vfs_b), config(&store, RemoteSync::Sync)).err().unwrap();
     assert!(matches!(err, StorageError::Invalid(_)), "{err}");
 }
 
@@ -299,8 +298,8 @@ fn promotion_fences_the_writer_and_keeps_every_acknowledged_commit() {
     assert_eq!(contents(&second), model);
 
     // A fresh replica and a restarted promoted node agree.
-    let fresh = ReplicaEngine::open(Path::new("/fresh"), options(&SimVfs::new(12)), config(&store, RemoteSync::Sync))
-        .unwrap();
+    let fresh =
+        ReplicaEngine::open(Path::new("/fresh"), options(&SimVfs::new(12)), config(&store, RemoteSync::Sync)).unwrap();
     catch_up(&fresh);
     assert_eq!(contents(&fresh), model);
     drop(r);
@@ -417,15 +416,15 @@ fn random_promotions() {
         let mut node = 0u64;
         let mut current: Box<dyn Engine> = Box::new(writer(&store, &SimVfs::new(seed * 100)));
         write(&*current, &mut rng, &mut model, 10);
-        let observer =
-            ReplicaEngine::open(Path::new("/observer"), options(&SimVfs::new(seed * 100 + 99)), {
-                config(&store, RemoteSync::Sync)
-            })
-            .unwrap();
+        let observer = ReplicaEngine::open(Path::new("/observer"), options(&SimVfs::new(seed * 100 + 99)), {
+            config(&store, RemoteSync::Sync)
+        })
+        .unwrap();
         for _ in 0..6 {
             node += 1;
             let vfs = SimVfs::new(seed * 100 + node);
-            let next = ReplicaEngine::open(Path::new("/node"), options(&vfs), config(&store, RemoteSync::Sync)).unwrap();
+            let next =
+                ReplicaEngine::open(Path::new("/node"), options(&vfs), config(&store, RemoteSync::Sync)).unwrap();
             for _ in 0..rng.below(30) {
                 let lsn = current.write(random_batch(&mut rng, &mut model)).unwrap();
                 current.sync(lsn).unwrap();
@@ -475,7 +474,8 @@ fn a_refused_stale_writer_disturbs_nobody() {
 
     let claims = store.list("writer/claim-").unwrap().len();
     for _ in 0..3 {
-        let err = TieredEngine::open(Path::new("/db"), options(&vfs_w), config(&store, RemoteSync::Sync)).err().unwrap();
+        let err =
+            TieredEngine::open(Path::new("/db"), options(&vfs_w), config(&store, RemoteSync::Sync)).err().unwrap();
         assert!(matches!(err, StorageError::Invalid(_)), "{err}");
     }
     assert_eq!(store.list("writer/claim-").unwrap().len(), claims);

@@ -175,7 +175,7 @@ fn a_replica_is_read_only() {
     assert_eq!(dump(&r), dump(&w));
     let status = r.query_one("SELECT squad_replication_status()", &[]).unwrap().get::<serde_json::Value>(0);
     assert_eq!(status["role"], "replica");
-    assert_eq!(w.query_one("SELECT squad_replication_status() IS NULL", &[]).unwrap().get::<bool>(0), true);
+    assert!(w.query_one("SELECT squad_replication_status() IS NULL", &[]).unwrap().get::<bool>(0));
     // A writer cannot be "promoted".
     assert!(db.promote().is_err());
 }
@@ -339,7 +339,11 @@ fn columnar_tables_on_a_replica() {
     let same = |r: &Connection, w: &Connection| {
         for q in queries {
             let text = |c: &Connection| {
-                c.query(&format!("SELECT x::text FROM ({q}) x"), &[]).unwrap().iter().map(|r| r.get::<String>(0)).collect::<Vec<_>>()
+                c.query(&format!("SELECT x::text FROM ({q}) x"), &[])
+                    .unwrap()
+                    .iter()
+                    .map(|r| r.get::<String>(0))
+                    .collect::<Vec<_>>()
             };
             assert_eq!(text(r), text(w), "{q}");
         }
@@ -465,8 +469,10 @@ fn promotion_makes_the_replica_the_writer() {
         old_session.query_one("INSERT INTO orders (item, qty) VALUES ('new', 2) RETURNING id", &[]).unwrap().get(0);
     assert!(id > 125, "sequence restarted at {id}");
     assert_eq!(code(&r, "INSERT INTO orders (item, qty) VALUES ('bad', 0)"), "23514");
-    r.batch_execute("CREATE TABLE audit (at timestamptz DEFAULT now(), what text); INSERT INTO audit (what) VALUES ('promoted')")
-        .unwrap();
+    r.batch_execute(
+        "CREATE TABLE audit (at timestamptz DEFAULT now(), what text); INSERT INTO audit (what) VALUES ('promoted')",
+    )
+    .unwrap();
     r.batch_execute("VACUUM").unwrap();
     assert_eq!(count(&r, "SELECT count(*) FROM orders WHERE item = 'ghost'"), 0);
 

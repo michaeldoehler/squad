@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use squad_kv::Store;
 use squad_object::ObjectStore;
 use squad_storage::{
-    DiskOptions, ReplayHooks, ReplicaEngine, ReplicaStatus, RemoteConfig, RemoteSync, StorageError, SyncMode,
+    DiskOptions, RemoteConfig, RemoteSync, ReplayHooks, ReplicaEngine, ReplicaStatus, StorageError, SyncMode,
     WriteBatch,
 };
 
