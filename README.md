@@ -52,6 +52,12 @@ let name: String = stmt.query_one(&[&"ada@example.org"])?.get(0);
 - **Cloud-native storage.** Work in memory and on local disk, keep the
   durable copy in an S3-compatible object store, restore on a fresh
   machine. → [cloud storage](docs/cloud-storage.md)
+- **Read replicas and failover.** Any number of replicas follow the
+  writer through the object store, serve read-only queries and can be
+  promoted; the old writer is fenced. → [replication](docs/replication.md)
+- **Sharding.** `squad-cluster` spreads tenants over several databases,
+  routes single-tenant statements to one shard and merges aggregations
+  across all of them. → [sharding](docs/sharding.md)
 - **The Postgres wire protocol, when you want it.** One call serves the
   embedded database to psql, pgAdmin, migration tools and services in
   other languages. An application written for sqlx and PostgreSQL runs
@@ -110,6 +116,30 @@ let db = Database::open("cache/", Config {
 })?;
 ```
 
+Follow it from another machine, and take over when the writer is gone:
+
+```rust
+use squad::{Database, ReplicaConfig};
+
+let replica = Database::open_replica("replica/", ReplicaConfig::new(store))?;
+replica.connect().query("SELECT count(*) FROM events", &[])?;   // read-only
+replica.promote()?;                                              // now the writer
+```
+
+Spread tenants over several databases:
+
+```rust
+use squad_cluster::{Cluster, ClusterConfig, ShardSpec};
+
+let cluster = Cluster::open(ClusterConfig::new(vec![
+    ShardSpec::local("data/shard-0"),
+    ShardSpec::remote("postgres://squad@10.0.0.2:5432/squad"),
+]))?;
+let db = cluster.connect();
+db.batch_execute("SELECT squad_distribute('events', 'project_id')")?;
+db.query("SELECT event, count(*) FROM events GROUP BY event", &[])?;  // all shards, merged
+```
+
 ## Performance
 
 Measured on a 4-vCPU virtual machine; all systems force every commit to
@@ -129,6 +159,11 @@ not meet.
 | Events per day, one project, 30 days | 3.5 s | 0.7 ms |
 | Unique users per day, one project | 3.5 s | 1.2 ms |
 | p50/p95/p99 duration per event, all data | 4.5 s | 5.8 ms |
+
+A replica that polls every 10 ms shows a commit 22 ms after the writer
+acknowledged it (p50) and applies a backlog at 279,000 rows per second;
+promotion takes 0.1 s. Four shards on the same machine load 422,000
+events per second and cut a full scan from 3.1 s to 0.9 s.
 
 Not yet good: lookups through a secondary index that return many rows,
 read throughput scaling across cores, and large scans of ordinary (row)
@@ -152,6 +187,10 @@ squad's reference is PostgreSQL 16 itself. → [testing](docs/testing.md)
   scenarios at the storage and SQL level.
 - **Concurrency tests** for every isolation level, and equivalence tests
   between columnar and ordinary tables.
+- **Replication tests** with failing object-store requests, crashing
+  replicas and chains of promotions; **cluster tests** that run a random
+  workload on 1 to 7 shards and require the answers of a single
+  database.
 
 ## Installing
 
@@ -159,6 +198,7 @@ squad's reference is PostgreSQL 16 itself. → [testing](docs/testing.md)
 [dependencies]
 squad = "0.1"                                         # add features = ["s3"] for S3 storage
 squad-server = "0.1"   # optional: wire protocol and the `squad` binary
+squad-cluster = "0.1"  # optional: sharding
 ```
 
 Building needs a C compiler, because the PostgreSQL parser is compiled
@@ -169,6 +209,7 @@ cargo install --path crates/squad-server
 squad serve ./data          # serve a database directory on 127.0.0.1:5432
 squad shell ./data          # interactive SQL prompt
 squad backup ./data ./copy
+squad serve ./replica --replica-of s3://my-bucket/prod   # read replica
 ```
 
 ## Documentation
@@ -179,6 +220,8 @@ squad backup ./data ./copy
 | [Server](docs/server.md) | wire protocol, the `squad` command, sqlx and other clients |
 | [Analytics](docs/analytics.md) | columnar tables: how they work, what is fast, limits |
 | [Cloud storage](docs/cloud-storage.md) | object stores, S3, remote durability, restore |
+| [Replication](docs/replication.md) | read replicas, lag, promotion and fencing, failover runbook |
+| [Sharding](docs/sharding.md) | `squad-cluster`: distributed and reference tables, routing, limits |
 | [Transactions](docs/transactions.md) | isolation levels, locking, differences from PostgreSQL |
 | [Durability](docs/durability.md) | on-disk layout, commit, checkpoints, recovery, backup |
 | [Compatibility](docs/compatibility.md) | what is supported, what is not, every known difference |
@@ -193,8 +236,9 @@ squad backup ./data ./copy
 | --- | --- |
 | `squad` | SQL engine and embedding API |
 | `squad-server` | wire-protocol server and the `squad` binary |
-| `squad-storage` | durable key-value engine: B+tree, buffer pool, WAL, recovery, remote tiering |
+| `squad-storage` | durable key-value engine: B+tree, buffer pool, WAL, recovery, remote tiering, replicas |
 | `squad-kv` | transactions: MVCC, row locks, isolation levels |
+| `squad-cluster` | sharding: routing and scatter-gather over several databases |
 | `squad-columnar` | column segment format and vectorized aggregation |
 | `squad-object` | object stores: memory, local directory, S3 |
 | `squad-sqllogictest`, `squad-difftest`, `squad-bench` | test and benchmark tools |

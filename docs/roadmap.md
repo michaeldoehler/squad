@@ -20,7 +20,9 @@ The original specification planned four phases, each with a gate.
 
 Beyond the original plan, squad has gained columnar tables for
 analytics ([analytics](analytics.md)) and durable storage in object
-stores including S3 ([cloud storage](cloud-storage.md)).
+stores including S3 ([cloud storage](cloud-storage.md)), read replicas
+with promotion ([replication](replication.md)) and sharding over several
+databases ([sharding](sharding.md)).
 
 ## Known limits
 
@@ -55,7 +57,12 @@ when sizing a workload:
   one transaction, as does adding a column with a default.
 - **Secondary index lookups fetch the row** even when the index holds
   every requested column (no index-only scans).
-- **Single node.** No replication, no failover.
+- **One writer per database.** Replicas are read-only and asynchronous;
+  promotion is a manual step (or your orchestrator's). See
+  [replication](replication.md).
+- **Sharding is static.** The shard count is fixed when a cluster is
+  created, there are no transactions across shards, and a cluster is
+  reached through the Rust API only. See [sharding](sharding.md).
 - **The data file does not shrink**; freed pages are reused.
 
 ## Roadmap
@@ -86,10 +93,13 @@ Roughly in order of expected value. Nothing here is scheduled.
 **Operations**
 
 12. Point-in-time recovery from archived log segments.
-13. Log shipping to read replicas; logical decoding in `pgoutput` format
-    for change-data-capture tools.
-14. `LISTEN`/`NOTIFY`.
-15. A C ABI for bindings in other languages.
+13. Automatic failover (leader election through the object store),
+    synchronous replicas, and logical decoding in `pgoutput` format for
+    change-data-capture tools.
+14. Shard rebalancing, a wire-protocol front end for clusters, and
+    two-phase commit across shards.
+15. `LISTEN`/`NOTIFY`.
+16. A C ABI for bindings in other languages.
 
 **Analytics**
 

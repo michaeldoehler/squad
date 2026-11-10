@@ -183,6 +183,30 @@ the remote copy of the row store: its log as immutable objects and its
 snapshots as content-addressed chunks. See
 [cloud storage](cloud-storage.md).
 
+## Replicas (`squad-storage::replica`, `squad::replica`)
+
+A replica is the same stack on a different engine. `ReplicaEngine`
+restores the newest snapshot from the object store and applies the log
+objects the writer uploads, each commit as one atomic local write. The
+SQL layer is told about every applied commit: it advances the timestamp
+new snapshots read at and swaps in the catalog when the commit changed
+the schema, so a reader never sees half a transaction or a schema that
+does not match the data. Sessions are read-only until `promote` claims
+the next writer epoch, which fences the previous writer. Details are in
+[replication](replication.md).
+
+## Sharding (`squad-cluster`)
+
+`squad-cluster` sits above the embedding API rather than inside the
+engine: a `Cluster` holds connections to several complete squad
+databases, local or behind the wire protocol. It parses each statement
+with the same PostgreSQL parser, decides from the parse tree whether
+the statement names the distribution key (one shard), needs all shards
+(scatter, then merge aggregates, order and limit on the coordinator) or
+cannot be answered correctly (rejected), and rewrites the statement for
+the shards where needed. Each shard keeps its own transactions, log and
+replicas. Details are in [sharding](sharding.md).
+
 ## Server (`squad-server`)
 
 The server is a thin adapter: one thread per connection reads protocol

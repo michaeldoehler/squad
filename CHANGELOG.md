@@ -46,3 +46,14 @@ versions may change the API and the on-disk format.
   S3-compatible stores. The row store can keep a durable, restorable
   copy in an object store, with synchronous or asynchronous shipping
   and writer fencing.
+- **Read replicas**: `Database::open_replica` follows a writer through
+  the object store and serves read-only sessions (writes fail with
+  SQLSTATE `25006`); `replication_status`, `squad_replication_status()`
+  and `pg_is_in_recovery()` report position and lag; `promote` /
+  `squad_promote()` turn a replica into the writer and fence the old
+  one; `squad serve --replica-of`.
+- **Sharding** (`squad-cluster`): a fixed set of local, in-memory or
+  remote databases as one logical database, with distributed and
+  reference tables, single-shard routing by distribution key,
+  scatter-gather queries with merged aggregates, and transactions bound
+  to one shard.

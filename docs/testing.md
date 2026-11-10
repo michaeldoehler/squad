@@ -213,7 +213,44 @@ random data including NULLs, NaN and extreme values, with and without
 parallelism; error bounds of the approximate aggregates; and 3,000
 random corruptions of segment files, each of which must be detected.
 
+## Replication
+
+`crates/squad-storage/tests/replica.rs` drives the replica engine
+against a writer on an in-memory object store: bootstrap from snapshot
+and log, restart, falling behind the writer's log retention, and
+promotion. Randomized tests make one in six store reads fail and crash
+the replica at random points, and run chains of six promotions; after
+each, replica and writer must hold identical data and no synchronously
+acknowledged commit may be missing.
+
+`crates/squad/tests/replica.rs` tests the SQL level: schema changes and
+columnar tables arriving on a replica, every kind of write being refused
+with `25006`, repeatable-read snapshots staying consistent while replay
+proceeds (readers check an invariant over concurrent transfers), and
+concurrent random writers with a replica polling every millisecond
+followed by a promotion. `crates/squad-server/tests/cli.rs` runs writer
+and replica as separate processes, kills the writer, promotes the
+replica over the wire protocol and lets the old writer rejoin as a
+replica.
+
+## Sharding
+
+`crates/squad-cluster/tests/model.rs` applies the same random inserts,
+updates, deletes and queries to a cluster and to a single database and
+requires equal answers, on 1, 2, 4 and 7 shards and on a cluster that
+mixes local shards with shards behind the wire protocol.
+`tests/cluster.rs` covers what the model cannot: cluster identity on
+reopen (a wrong shard count or order is refused), routing decisions,
+transactions bound to a shard, prepared statements, error propagation,
+and that every query shape that cannot be answered correctly is
+rejected with `0A000` instead of answered wrongly. `tests/remote.rs`
+tests remote shards with enums, numerics, arrays and JSON, and shards
+that are unreachable or come back.
+
 ## What is not tested yet
+
+- Replication and sharding across real machines and networks: all tests
+  run the nodes on one host.
 
 - Long-running soak tests and production workloads: squad has not run in
   production.

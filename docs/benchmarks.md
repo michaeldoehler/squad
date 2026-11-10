@@ -173,6 +173,44 @@ remote_bench`):
 | Remote, `Sync`, 1 thread | 352 µs | 912 µs | 2,430 |
 | Remote, `Sync`, 16 threads | — | — | 4,340 |
 
+## Replication
+
+Writer, replica and object store (a local directory) on the same
+machine, synchronous shipping; other builds were running during the
+measurement. Raw output: `benchmarks/replication-2026-11-10.txt`
+(`cargo run --release -p squad --example replication_bench`).
+
+| | |
+| --- | ---: |
+| Replica applies a backlog | 25,400 commits/s, 279,000 rows/s |
+| Replica opens from a snapshot of 220,000 rows | 0.27 s |
+| Commit visible on replica, 1 ms poll, p50 / p99 | 13 ms / 37 ms |
+| Commit visible on replica, 10 ms poll, p50 / p99 | 22 ms / 37 ms |
+| Commit visible on replica, 100 ms poll, p50 / p99 | 114 ms / 133 ms |
+| Promotion until the new writer's first commit | 0.10 s |
+
+## Sharding
+
+2 million columnar events distributed by project over 1, 2 and 4 shards
+**on the same 4-vCPU machine and disk** — this measures the overhead of
+routing and the gain from parallel scans, not scale-out across machines.
+Raw output: `benchmarks/sharding-2026-11-10.txt` (`cargo run --release
+-p squad-cluster --example cluster_bench`).
+
+| | 1 shard | 2 shards | 4 shards |
+| --- | ---: | ---: | ---: |
+| Bulk load, rows/s | 304,000 | 391,000 | 422,000 |
+| Single-row durable inserts, 8 connections, rows/s | 28,700 | 23,900 | 18,600 |
+| One project: events per day | 0.70 ms | 0.69 ms | 0.72 ms |
+| All shards: `count(*)` | 0.14 ms | 0.83 ms | 1.45 ms |
+| All shards: count and average by event | 6.7 ms | 7.7 ms | 8.6 ms |
+| All shards: 20 slowest events (full scan and sort) | 3,111 ms | 1,637 ms | 891 ms |
+
+Single-tenant queries cost the same on any number of shards. Durable
+single-row inserts get slower with more shards because the shards share
+one disk and lose group commit; on separate machines each shard has its
+own log.
+
 ## Against the specification's goals
 
 | Goal | Result | Met |
