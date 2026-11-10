@@ -722,6 +722,23 @@ pub struct TieredEngine {
     worker: Option<JoinHandle<()>>,
 }
 
+/// Why a local directory at `local_lsn`, last written under
+/// `local_epoch`, cannot continue the history in the object store, if it
+/// cannot.
+fn stale(state: &RemoteState, local_epoch: Option<u64>, local_lsn: u64) -> Option<String> {
+    let remote_epoch = state.epochs.last().map(|e| e.0);
+    let same_lineage = remote_epoch.is_none() || local_epoch == remote_epoch;
+    if same_lineage && local_lsn >= state.lsn {
+        return None;
+    }
+    let why = if same_lineage {
+        format!("the object store is ahead (LSN {} against local {local_lsn})", state.lsn)
+    } else {
+        "the local directory does not descend from the latest writer of the object store".to_string()
+    };
+    Some(format!("{why}; open with `restore` to replace the local directory with the remote state"))
+}
+
 impl TieredEngine {
     /// Opens the database in `dir`, restoring it from the object store if
     /// the directory is empty, and becomes the writer for the remote copy.
@@ -730,44 +747,52 @@ impl TieredEngine {
         let vfs = opts.vfs.clone();
         vfs.create_dir_all(dir)?;
 
-        // Claim the next epoch first: everything a previous writer uploads
-        // from now on either is visible to the listing below or fails that
-        // writer's fence check.
+        // A directory that cannot continue the remote history is refused
+        // before anything is claimed, so that starting a stale copy by
+        // mistake does not stop the writer that is running. The answer
+        // cannot change later: a directory that is behind, or was left
+        // by a replaced writer, stays that way.
+        let local = if dir_is_empty(&opts, dir)? { None } else { Some(DiskEngine::open(dir, opts.clone())?) };
+        let local_epoch = read_marker(&opts, dir)?;
+        if let (Some(disk), false) = (&local, config.restore) {
+            if let Some(why) = stale(&read_remote(&*store)?, local_epoch, disk.last_lsn()) {
+                return Err(StorageError::Invalid(why));
+            }
+        }
+
+        // Claim the next epoch before the state is read for good:
+        // everything a previous writer uploads from now on either is
+        // visible to the listing below or fails that writer's fence check.
         let epoch = claim_epoch(&*store)?;
         let mut state = read_remote(&*store)?;
-        let remote_epoch = state.epochs.last().map(|e| e.0);
-        let local_epoch = read_marker(&opts, dir)?;
 
         let mut needs_snapshot = false;
-        let disk = if dir_is_empty(&opts, dir)? {
-            wipe(&opts, dir)?;
-            let (disk, latest) = materialize_latest(&*store, dir, &opts)?;
-            state = latest;
-            disk
-        } else {
-            let disk = DiskEngine::open(dir, opts.clone())?;
-            let local_lsn = disk.last_lsn();
-            let same_lineage = remote_epoch.is_none() || local_epoch == remote_epoch;
-            if same_lineage && local_lsn >= state.lsn {
-                // The local copy has everything the remote has, and
-                // possibly commits that were never shipped.
-                needs_snapshot = local_lsn > state.lsn || state.snapshot.is_none();
-                disk
-            } else if config.restore {
-                drop(disk);
+        let disk = match local {
+            None => {
                 wipe(&opts, dir)?;
                 let (disk, latest) = materialize_latest(&*store, dir, &opts)?;
                 state = latest;
                 disk
-            } else {
-                let why = if same_lineage {
-                    format!("the object store is ahead (LSN {} against local {local_lsn})", state.lsn)
-                } else {
-                    "the local directory does not descend from the latest writer of the object store".to_string()
-                };
-                return Err(StorageError::Invalid(format!(
-                    "{why}; open with `restore` to replace the local directory with the remote state"
-                )));
+            }
+            Some(disk) => {
+                let local_lsn = disk.last_lsn();
+                match stale(&state, local_epoch, local_lsn) {
+                    // The local copy has everything the remote has, and
+                    // possibly commits that were never shipped.
+                    None => {
+                        needs_snapshot = local_lsn > state.lsn || state.snapshot.is_none();
+                        disk
+                    }
+                    Some(_) if config.restore => {
+                        drop(disk);
+                        wipe(&opts, dir)?;
+                        let (disk, latest) = materialize_latest(&*store, dir, &opts)?;
+                        state = latest;
+                        disk
+                    }
+                    // Another writer got in between the two looks.
+                    Some(why) => return Err(StorageError::Invalid(why)),
+                }
             }
         };
         if state.snapshot.is_none() && disk.last_lsn() > 0 {

@@ -32,7 +32,11 @@ fn serve(args: &[&str]) -> (Child, SocketAddr) {
         .spawn()
         .expect("spawn");
     let mut line = String::new();
-    BufReader::new(child.stderr.take().unwrap()).read_line(&mut line).unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    while !line.contains("listening on") {
+        line.clear();
+        assert!(stderr.read_line(&mut line).unwrap() > 0, "the server exited without listening");
+    }
     let addr = line.trim().rsplit(' ').next().unwrap().parse().unwrap_or_else(|_| panic!("unexpected output: {line}"));
     (child, addr)
 }
@@ -168,4 +172,89 @@ fn remote_copy_and_restore() {
 
     let (ok, _, err) = output(squad().args(["serve", "--memory", "--remote-sync", "sometimes", "--remote", "memory://"]));
     assert!(!ok && err.contains("invalid --remote-sync mode"), "{err}");
+}
+
+#[test]
+fn replica_served_over_the_wire_and_promoted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+    let remote = format!("file://{}", path("remote"));
+    let wait_for = |c: &mut Client, sql: &str, want: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            // Until the replica has applied the change the query may
+            // fail (a column that is not there yet) or answer the old state.
+            let (msgs, _) = c.query(sql);
+            let got: Vec<_> = msgs.iter().filter(|m| m.ty == b'D').map(common::Msg::text_row).collect();
+            if got == vec![vec![Some(want.to_string())]] {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{sql}: still {got:?}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+
+    let (mut writer, waddr) = serve(&[&path("writer"), "--remote", &remote, "--remote-sync", "sync"]);
+    let mut w = Client::connect(waddr);
+    w.rows("CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t SELECT g, 'row ' || g FROM generate_series(1, 100) g");
+    assert_eq!(w.rows("SELECT pg_is_in_recovery()"), vec![vec![Some("f".to_string())]]);
+
+    let (mut replica, raddr) = serve(&[&path("replica"), "--replica-of", &remote, "--poll-interval", "10"]);
+    let mut r = Client::connect(raddr);
+    assert_eq!(r.rows("SELECT count(*) FROM t"), vec![vec![Some("100".to_string())]]);
+    assert_eq!(r.rows("SELECT pg_is_in_recovery()"), vec![vec![Some("t".to_string())]]);
+    assert_eq!(r.rows("SHOW transaction_read_only"), vec![vec![Some("on".to_string())]]);
+    assert_eq!(r.rows("SELECT squad_replication_status() ->> 'role'"), vec![vec![Some("replica".to_string())]]);
+
+    // Commits and schema changes arrive without anyone asking.
+    w.rows("INSERT INTO t VALUES (101, 'new'); ALTER TABLE t ADD COLUMN n int DEFAULT 7");
+    wait_for(&mut r, "SELECT sum(n) FROM t", "707");
+
+    // Writes are refused, in the simple and the extended protocol and
+    // for COPY, and the session stays usable.
+    for sql in ["INSERT INTO t VALUES (200, 'x')", "CREATE TABLE u (i int)", "COPY t FROM STDIN", "BEGIN READ WRITE"] {
+        assert_eq!(r.error(sql), "25006", "{sql}");
+    }
+    r.send(b'P', common::Body::new().cstr("").cstr("DELETE FROM t WHERE id = $1").i16(0));
+    r.send(b'B', common::Body::new().cstr("").cstr("").i16(0).i16(1).param(Some(b"1")).i16(0));
+    r.send(b'E', common::Body::new().cstr("").i32(0));
+    let (msgs, _) = r.sync();
+    let error = msgs.iter().find(|m| m.ty == b'E').expect("the DELETE must fail").fields();
+    assert_eq!(error[&'C'], "25006");
+    assert_eq!(r.rows("SELECT count(*) FROM t"), vec![vec![Some("101".to_string())]]);
+
+    // Failover: the writer dies, the replica is promoted by a client.
+    writer.kill().unwrap();
+    writer.wait().unwrap();
+    assert_eq!(r.rows("SELECT squad_promote()"), vec![vec![Some("t".to_string())]]);
+    assert_eq!(r.rows("SELECT pg_is_in_recovery()"), vec![vec![Some("f".to_string())]]);
+    r.rows("INSERT INTO t VALUES (200, 'after failover')");
+    assert_eq!(r.rows("SELECT squad_replication_status() ->> 'role'"), vec![vec![Some("writer".to_string())]]);
+
+    // The old writer's directory does not come back as a writer...
+    let (ok, _, err) = output(squad().args(["verify", &path("writer"), "--remote", &remote]));
+    assert!(!ok, "the fenced writer opened again: {err}");
+    // ...but as a replica of the new one, and sees its commits.
+    let (mut old, oaddr) = serve(&[&path("writer"), "--replica-of", &remote, "--poll-interval", "10"]);
+    let mut o = Client::connect(oaddr);
+    wait_for(&mut o, "SELECT v FROM t WHERE id = 200", "after failover");
+    old.kill().unwrap();
+    old.wait().unwrap();
+
+    // The promoted node restarts as an ordinary writer.
+    replica.kill().unwrap();
+    replica.wait().unwrap();
+    let (mut again, addr) = serve(&[&path("replica"), "--remote", &remote, "--remote-sync", "sync"]);
+    let mut c = Client::connect(addr);
+    assert_eq!(c.rows("SELECT count(*) FROM t"), vec![vec![Some("102".to_string())]]);
+    c.rows("INSERT INTO t VALUES (201, 'restarted')");
+    again.kill().unwrap();
+    again.wait().unwrap();
+
+    let (ok, _, err) = output(squad().args(["serve", &path("x"), "--replica-of", &remote, "--remote", &remote]));
+    assert!(!ok && err.contains("cannot be combined"), "{err}");
+    let (ok, _, err) = output(squad().args(["serve", &path("x"), "--poll-interval", "5"]));
+    assert!(!ok && err.contains("needs --replica-of"), "{err}");
+    let (ok, _, err) = output(squad().args(["serve", &path("x"), "--replica-of", &format!("file://{}", path("nothing"))]));
+    assert!(!ok && err.contains("cannot open replica"), "{err}");
 }

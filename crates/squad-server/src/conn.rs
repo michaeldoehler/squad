@@ -614,6 +614,11 @@ impl Conn {
     }
 
     fn copy_in(&mut self, req: &CopyRequest) -> Step {
+        // Refused before the client is asked for data.
+        if self.session.shared().in_recovery() {
+            return Err(Error::new(sqlstate::READ_ONLY_SQL_TRANSACTION, "cannot execute COPY FROM on a read replica")
+                .into());
+        }
         let columns: Vec<String> = if req.columns.is_empty() {
             self.session.prepare(&req.select_sql(), &[])?.columns.iter().map(|c| c.name.clone()).collect()
         } else {

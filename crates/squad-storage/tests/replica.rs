@@ -451,3 +451,38 @@ fn random_promotions() {
         assert!(store.list("writer/").unwrap().len() >= 7);
     }
 }
+
+/// Starting a stale copy as a writer by mistake is refused without
+/// claiming the database: the running writer and its replicas go on.
+#[test]
+fn a_refused_stale_writer_disturbs_nobody() {
+    let store = MemoryStore::new();
+    let (vfs_w, vfs_r, vfs_s) = (SimVfs::new(20), SimVfs::new(21), SimVfs::new(22));
+    let mut rng = Rng(20);
+    let mut model = Model::new();
+    let w = writer(&store, &vfs_w);
+    write(&w, &mut rng, &mut model, 20);
+    let r = replica(&store, &vfs_r);
+    let second = ReplicaEngine::open(Path::new("/second"), options(&vfs_s), config(&store, RemoteSync::Sync)).unwrap();
+    r.promote(&mut ()).unwrap();
+    drop(w);
+    write(&r, &mut rng, &mut model, 10);
+
+    let claims = store.list("writer/claim-").unwrap().len();
+    for _ in 0..3 {
+        let err = TieredEngine::open(Path::new("/db"), options(&vfs_w), config(&store, RemoteSync::Sync)).err().unwrap();
+        assert!(matches!(err, StorageError::Invalid(_)), "{err}");
+    }
+    assert_eq!(store.list("writer/claim-").unwrap().len(), claims);
+    // The writer is not fenced and the replica is not held back.
+    write(&r, &mut rng, &mut model, 10);
+    catch_up(&second);
+    assert!(!second.status().waiting_for_takeover);
+    assert_eq!(contents(&second), model);
+
+    // The stale directory can rejoin as a replica: it had shipped
+    // everything it wrote, so it is an earlier state of the same history.
+    let rejoined = ReplicaEngine::open(Path::new("/db"), options(&vfs_w), config(&store, RemoteSync::Sync)).unwrap();
+    catch_up(&rejoined);
+    assert_eq!(contents(&rejoined), model);
+}

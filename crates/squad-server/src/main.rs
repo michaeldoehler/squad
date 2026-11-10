@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use squad::{Config, Database, RemoteConfig, RemoteSync, SyncMode};
+use squad::{Config, Database, RemoteConfig, RemoteSync, ReplicaConfig, SyncMode};
 use squad_server::{Auth, Server, ServerConfig};
 
 const USAGE: &str = "\
@@ -38,6 +38,14 @@ OPTIONS for serve:
                               the object store
     --remote-restore          replace <dir> with the remote state if they
                               disagree
+    --replica-of <url>        serve a read replica of the database whose
+                              writer runs with --remote <url>; <dir> holds
+                              the replica's local copy. Statements that write
+                              fail until `SELECT squad_promote()` makes this
+                              node the writer (--remote-sync then says how it
+                              ships; default sync)
+    --poll-interval <ms>      how often a replica looks for new commits
+                              (default 1000)
 ";
 
 struct Args {
@@ -47,7 +55,7 @@ struct Args {
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
-    const WITH_VALUE: &[&str] = &["--listen", "--unix-socket-dir", "--user", "--password", "--sync", "--remote", "--remote-sync"];
+    const WITH_VALUE: &[&str] = &["--listen", "--unix-socket-dir", "--user", "--password", "--sync", "--remote", "--remote-sync", "--replica-of", "--poll-interval"];
     const FLAGS: &[&str] = &["--memory", "--cleartext-password", "--remote-restore"];
     let mut parsed = Args { positional: Vec::new(), options: HashMap::new(), flags: Vec::new() };
     let mut it = args.iter();
@@ -78,6 +86,30 @@ fn open(args: &Args, dir: Option<&String>) -> Result<Database, String> {
             other => return Err(format!("invalid --sync mode \"{other}\" (expected sync, group or async)")),
         };
     }
+    let memory = args.flags.iter().any(|f| f == "--memory");
+    if let Some(url) = args.options.get("--replica-of").and_then(|v| v.last()) {
+        if memory || args.options.contains_key("--remote") {
+            return Err("--replica-of cannot be combined with --memory or --remote".into());
+        }
+        let dir = dir.ok_or("missing database directory")?;
+        let store = squad::object::open_url(url).map_err(|e| format!("cannot open \"{url}\": {e}"))?;
+        let mut replica = ReplicaConfig::new(store);
+        replica.sync_mode = config.sync_mode;
+        replica.promoted_sync = match args.options.get("--remote-sync").and_then(|v| v.last()).map_or("sync", String::as_str)
+        {
+            "async" => RemoteSync::Async { interval: std::time::Duration::from_secs(1) },
+            "sync" => RemoteSync::Sync,
+            other => return Err(format!("invalid --remote-sync mode \"{other}\" (expected async or sync)")),
+        };
+        if let Some(ms) = args.options.get("--poll-interval").and_then(|v| v.last()) {
+            let ms: u64 = ms.parse().map_err(|_| format!("invalid --poll-interval \"{ms}\" (milliseconds)"))?;
+            replica.poll_interval = std::time::Duration::from_millis(ms.max(1));
+        }
+        return Database::open_replica(dir, replica).map_err(|e| format!("cannot open replica \"{dir}\" of \"{url}\": {e}"));
+    }
+    if args.options.contains_key("--poll-interval") {
+        return Err("--poll-interval needs --replica-of".into());
+    }
     if let Some(url) = args.options.get("--remote").and_then(|v| v.last()) {
         let store = squad::object::open_url(url).map_err(|e| format!("cannot open remote \"{url}\": {e}"))?;
         let mode = match args.options.get("--remote-sync").and_then(|v| v.last()).map_or("async", String::as_str) {
@@ -88,7 +120,7 @@ fn open(args: &Args, dir: Option<&String>) -> Result<Database, String> {
         let restore = args.flags.iter().any(|f| f == "--remote-restore");
         config.remote = Some(RemoteConfig { restore, ..RemoteConfig::new(store, mode) });
     }
-    match (dir, args.flags.iter().any(|f| f == "--memory")) {
+    match (dir, memory) {
         (None, true) => Database::open_in_memory().map_err(|e| e.to_string()),
         (Some(dir), false) => Database::open(dir, config).map_err(|e| format!("cannot open database \"{dir}\": {e}")),
         (Some(_), true) => Err("give either a directory or --memory, not both".into()),
@@ -113,9 +145,13 @@ fn serve(args: &Args) -> Result<(), String> {
         allow_cleartext_password: args.flags.iter().any(|f| f == "--cleartext-password"),
         unix_socket: args.options.get("--unix-socket-dir").and_then(|v| v.last()).map(PathBuf::from),
     };
+    let replica = db.is_replica();
     let listen = args.options.get("--listen").and_then(|v| v.last()).map_or("127.0.0.1:5432", String::as_str);
     let mut server = Server::new(db, config);
     let addr = server.bind(listen).map_err(|e| format!("cannot listen on {listen}: {e}"))?;
+    if replica {
+        eprintln!("serving a read replica; writes fail until SELECT squad_promote() makes this node the writer");
+    }
     eprintln!("squad {} listening on {addr}", env!("CARGO_PKG_VERSION"));
     if let Some(path) = server.unix_socket_path() {
         eprintln!("listening on Unix socket {}", path.display());
