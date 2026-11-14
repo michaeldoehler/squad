@@ -61,7 +61,11 @@ const CANCEL_REQUEST: u32 = 80877102;
 
 /// True once the peer has closed the connection (reads end or fail).
 fn closed_within(s: &mut TcpStream, limit: Duration) -> bool {
-    s.set_read_timeout(Some(limit)).unwrap();
+    // macOS refuses socket options on a connection the peer has already
+    // closed (EINVAL): that, too, means closed.
+    if let Err(e) = s.set_read_timeout(Some(limit)) {
+        return e.kind() == std::io::ErrorKind::InvalidInput;
+    }
     let mut buf = [0u8; 1024];
     loop {
         match s.read(&mut buf) {

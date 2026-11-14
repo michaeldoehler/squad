@@ -46,7 +46,10 @@ fn psql_over_tls_and_notices() {
     };
     let (ok, out, err) = run("verify-full", "\\conninfo");
     assert!(ok, "{err}");
-    assert!(out.contains("SSL connection (protocol: TLSv1.3"), "{out}");
+    // psql up to 17 prints a sentence, psql 18 a table.
+    let tls13 = out.contains("SSL connection (protocol: TLSv1.3")
+        || (out.contains("SSL Connection|true") && out.contains("SSL Protocol|TLSv1.3"));
+    assert!(tls13, "{out}");
     let (ok, _, err) = run("disable", "SELECT 1");
     assert!(!ok && err.contains("no encryption"), "{err}");
     // psql prints the notice of a statement without effect.
