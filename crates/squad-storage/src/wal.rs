@@ -5,24 +5,39 @@
 //! records, one per write batch:
 //!
 //! ```text
-//! len:u32  crc:u32  lsn:u64  payload[len]
+//! len:u32  crc:u32  lsn:u64  synced:u64  payload[len]
 //! payload = count:u32, then per op: kind:u8 (1 put, 0 delete),
 //!           klen:u32, key, and for puts vlen:u32, value
 //! ```
 //!
-//! `crc` is the CRC32C of the LSN and the payload. LSNs are consecutive
-//! across segments, which lets recovery tell a clean continuation from a
-//! torn tail or a stale file.
+//! `crc` is the CRC32C of `lsn`, `synced` and the payload. LSNs are
+//! consecutive across segments, which lets recovery tell a clean
+//! continuation from a torn tail or a stale file.
+//!
+//! `synced` is the highest LSN that was known to be on stable storage
+//! (fsynced, or covered by a checkpoint) when the record was appended.
+//! Recovery uses it to tell a torn tail from corruption: a crash can only
+//! damage records that were not yet synced, so a damaged or missing
+//! record `n` followed by an intact record that says `synced >= n` was
+//! damaged after it had been made durable. Log objects in an object
+//! store use the same record format with `synced` set to zero.
+//!
+//! A record's payload is limited to `u32::MAX` bytes; larger write
+//! batches are refused.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::vfs::{Vfs, VfsFile};
-use crate::{Result, WriteBatch};
+use crate::{Result, StorageError, WriteBatch};
 
-pub const SEG_MAGIC: &[u8; 8] = b"SQWAL001";
+pub const SEG_MAGIC: &[u8; 8] = b"SQWAL002";
+/// Magic of segments written before the `synced` field existed.
+pub const SEG_MAGIC_V1: &[u8; 8] = b"SQWAL001";
 pub const SEG_HEADER: usize = 16;
-const REC_HEADER: usize = 16;
+const REC_HEADER: usize = 24;
+/// Largest payload a record can carry.
+pub const MAX_RECORD_PAYLOAD: u64 = u32::MAX as u64;
 /// Buffered bytes that trigger a write to the file even without a sync.
 const BUF_LIMIT: usize = 1 << 20;
 /// Segments grow in zero-filled steps of this size. Appending inside
@@ -57,10 +72,32 @@ pub fn create_segment(vfs: &dyn Vfs, dir: &Path, seq: u64) -> Result<Arc<dyn Vfs
     Ok(file)
 }
 
-pub fn encode_record(buf: &mut Vec<u8>, lsn: u64, batch: &WriteBatch) {
+/// Size of the payload of `batch`'s record.
+pub fn payload_len(batch: &WriteBatch) -> u64 {
+    4 + batch.ops.iter().map(|(k, v)| 5 + k.len() as u64 + v.as_ref().map_or(0, |v| 4 + v.len() as u64)).sum::<u64>()
+}
+
+/// Appends the record of `batch` to `buf`, with `synced` zero.
+pub fn encode_record(buf: &mut Vec<u8>, lsn: u64, batch: &WriteBatch) -> Result<()> {
+    encode_record_synced(buf, lsn, 0, batch)
+}
+
+/// Appends the record of `batch` to `buf`. Fails, leaving `buf`
+/// untouched, if the payload would exceed [`MAX_RECORD_PAYLOAD`].
+pub fn encode_record_synced(buf: &mut Vec<u8>, lsn: u64, synced: u64, batch: &WriteBatch) -> Result<()> {
+    let len = payload_len(batch);
+    if len > MAX_RECORD_PAYLOAD {
+        return Err(StorageError::Invalid(format!(
+            "a write batch of {len} bytes exceeds the log record limit of {MAX_RECORD_PAYLOAD} bytes"
+        )));
+    }
     let start = buf.len();
-    buf.extend_from_slice(&[0u8; 8]);
+    buf.reserve(REC_HEADER + len as usize);
+    buf.extend_from_slice(&(len as u32).to_le_bytes());
+    buf.extend_from_slice(&[0u8; 4]);
     buf.extend_from_slice(&lsn.to_le_bytes());
+    buf.extend_from_slice(&synced.to_le_bytes());
+    // `len` bounds the count and every length below.
     buf.extend_from_slice(&(batch.ops.len() as u32).to_le_bytes());
     for (k, v) in &batch.ops {
         buf.push(v.is_some() as u8);
@@ -71,10 +108,10 @@ pub fn encode_record(buf: &mut Vec<u8>, lsn: u64, batch: &WriteBatch) {
             buf.extend_from_slice(v);
         }
     }
-    let len = (buf.len() - start - REC_HEADER) as u32;
+    debug_assert_eq!((buf.len() - start - REC_HEADER) as u64, len);
     let crc = crc32c::crc32c(&buf[start + 8..]);
-    buf[start..start + 4].copy_from_slice(&len.to_le_bytes());
     buf[start + 4..start + 8].copy_from_slice(&crc.to_le_bytes());
+    Ok(())
 }
 
 /// One decoded operation: key and, for puts, the value.
@@ -111,21 +148,56 @@ fn decode_payload(mut p: &[u8]) -> Option<Vec<Op<'_>>> {
     p.is_empty().then_some(ops)
 }
 
-/// Decodes the record at `off` of a segment image. Returns the LSN, the
-/// operations and the offset of the next record, or `None` if the bytes at
-/// `off` are not a complete, intact record.
-pub fn read_record(data: &[u8], off: usize) -> Option<(u64, Vec<Op<'_>>, usize)> {
-    let hdr = data.get(off..off + REC_HEADER)?;
+/// A decoded record.
+pub struct Record<'a> {
+    pub lsn: u64,
+    /// Highest LSN known to be durable when the record was appended.
+    pub synced: u64,
+    pub ops: Vec<Op<'a>>,
+    /// Offset of the byte after the record.
+    pub end: usize,
+}
+
+/// Decodes the record at `off` of a segment image or log object, or
+/// returns `None` if the bytes at `off` are not a complete, intact record.
+pub fn decode_record(data: &[u8], off: usize) -> Option<Record<'_>> {
+    let hdr = data.get(off..off.checked_add(REC_HEADER)?)?;
     let len = u32::from_le_bytes(hdr[..4].try_into().unwrap()) as usize;
     let crc = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
     let lsn = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+    let synced = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
     let end = off.checked_add(REC_HEADER)?.checked_add(len)?;
     let body = data.get(off + 8..end)?;
     if crc32c::crc32c(body) != crc {
         return None;
     }
-    let ops = decode_payload(&body[8..])?;
-    Some((lsn, ops, end))
+    let ops = decode_payload(&body[16..])?;
+    Some(Record { lsn, synced, ops, end })
+}
+
+/// Decodes the record at `off` of a segment image. Returns the LSN, the
+/// operations and the offset of the next record, or `None` if the bytes at
+/// `off` are not a complete, intact record.
+pub fn read_record(data: &[u8], off: usize) -> Option<(u64, Vec<Op<'_>>, usize)> {
+    decode_record(data, off).map(|r| (r.lsn, r.ops, r.end))
+}
+
+/// After damage at `off`, the offset of the next intact record whose
+/// LSN lies above `after`, if there is one. Candidates are filtered by
+/// their LSN field before the checksum is computed, so scanning a
+/// zero-filled tail is cheap.
+pub fn resync(data: &[u8], off: usize, after: u64) -> Option<usize> {
+    let mut pos = off.checked_add(1)?;
+    while pos + REC_HEADER <= data.len() {
+        let lsn = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().unwrap());
+        let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        let plausible = lsn > after && lsn - after <= 1 << 40 && len <= data.len() - pos - REC_HEADER;
+        if plausible && decode_record(data, pos).is_some() {
+            return Some(pos);
+        }
+        pos += 1;
+    }
+    None
 }
 
 /// Appender state, guarded by the engine's WAL mutex.
@@ -164,10 +236,12 @@ impl Wal {
         }
     }
 
-    pub fn append(&mut self, batch: &WriteBatch) -> Result<u64> {
+    /// Appends the record of `batch`. `synced` is the highest LSN that
+    /// is on stable storage now.
+    pub fn append(&mut self, batch: &WriteBatch, synced: u64) -> Result<u64> {
         let lsn = self.last_lsn + 1;
         let before = self.buf.len();
-        encode_record(&mut self.buf, lsn, batch);
+        encode_record_synced(&mut self.buf, lsn, synced, batch)?;
         self.bytes += (self.buf.len() - before) as u64;
         self.last_lsn = lsn;
         if self.immediate || self.buf.len() >= BUF_LIMIT {

@@ -932,7 +932,7 @@ impl Engine for TieredEngine {
         // All writes pass through here, so the next LSN is known.
         let lsn = s.disk.last_lsn() + 1;
         let mut record = Vec::new();
-        wal::encode_record(&mut record, lsn, &batch);
+        wal::encode_record(&mut record, lsn, &batch)?;
         let applied = s.disk.write(batch)?;
         debug_assert_eq!(applied, lsn);
         let mut p = s.pending.lock();

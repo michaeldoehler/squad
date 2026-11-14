@@ -14,7 +14,13 @@
 //!   WAL, or a complete journal that recovery re-applies.
 //! * Recovery re-applies a complete journal, then replays WAL records with
 //!   consecutive LSNs above the checkpoint LSN and stops at the first gap
-//!   or damaged record.
+//!   or damaged record. Such a stop is a torn tail if every intact record
+//!   after it was appended before the missing record was synced; then
+//!   nothing that was ever acknowledged as durable is lost and the rest
+//!   is discarded. If a later intact record says the missing one had
+//!   already been synced (see the `synced` field in [`crate::wal`]), the
+//!   log was damaged after the fact and the open fails with
+//!   [`StorageError::Corruption`] instead of dropping committed data.
 
 use std::fmt;
 use std::io;
@@ -374,9 +380,20 @@ impl DiskEngine {
         let mut flushed_lsn = ckpt_lsn;
         let mut reusable = None;
         let flush_limit = (opts.cache_pages as u64 / 2).max(64);
-        'segments: for &seq in &segs {
-            let file = vfs.open(&wal_dir.join(wal::segment_name(seq)))?;
+        // Once a record is missing: its LSN and where it was expected.
+        let mut missing: Option<(u64, String)> = None;
+        // LSN of the last intact record, in log order.
+        let mut last_seen = 0u64;
+        for &seq in &segs {
+            let name = wal::segment_name(seq);
+            let file = vfs.open(&wal_dir.join(&name))?;
             let bytes = read_all(&*file)?;
+            if bytes.len() >= wal::SEG_HEADER && &bytes[..8] == wal::SEG_MAGIC_V1 {
+                return Err(StorageError::Corruption(format!(
+                    "write-ahead log segment {name} has log format 1, written by an earlier squad version; \
+                     open the directory once with that version so that it checkpoints the log"
+                )));
+            }
             if bytes.len() < wal::SEG_HEADER || &bytes[..8] != wal::SEG_MAGIC || bytes[8..16] != seq.to_le_bytes() {
                 continue;
             }
@@ -384,18 +401,42 @@ impl DiskEngine {
                 reusable = Some((file.clone(), seq));
             }
             let mut off = wal::SEG_HEADER;
-            while let Some((lsn, ops, next)) = wal::read_record(&bytes, off) {
-                off = next;
-                if lsn < expected {
+            loop {
+                let Some(rec) = wal::decode_record(&bytes, off) else {
+                    // The zero-filled end of the segment, or damage: go
+                    // on with the next intact record, if there is one.
+                    match wal::resync(&bytes, off, last_seen) {
+                        Some(next) => {
+                            off = next;
+                            continue;
+                        }
+                        None => break,
+                    }
+                };
+                let at = off;
+                off = rec.end;
+                last_seen = last_seen.max(rec.lsn);
+                if missing.is_none() && rec.lsn > expected {
+                    missing = Some((expected, format!("segment {name} before offset {at}")));
+                }
+                if let Some((lsn, place)) = &missing {
+                    if rec.synced >= *lsn {
+                        return Err(StorageError::Corruption(format!(
+                            "write-ahead log is damaged: the record with LSN {lsn} ({place}) is missing or corrupt, \
+                             but the intact record with LSN {} in segment {name} at offset {at} was written after \
+                             it had been made durable. Refusing to open: replaying only up to the damage would \
+                             drop committed transactions. Restore the database from a backup or its remote copy.",
+                            rec.lsn
+                        )));
+                    }
                     continue;
                 }
-                if lsn > expected {
-                    // A gap: everything from here on was never acknowledged
-                    // as part of a consecutive, durable history.
-                    break 'segments;
+                if rec.lsn < expected {
+                    continue;
                 }
+                let lsn = rec.lsn;
                 let mut w = Writer { pool: &pool, meta: &mut meta };
-                for (key, val) in ops {
+                for (key, val) in rec.ops {
                     match val {
                         Some(v) => w.put(key, v)?,
                         None => {
@@ -637,6 +678,13 @@ impl Engine for DiskEngine {
                 return Err(StorageError::Invalid("value exceeds the maximum value length".into()));
             }
         }
+        let len = wal::payload_len(&batch);
+        if len > wal::MAX_RECORD_PAYLOAD {
+            return Err(StorageError::Invalid(format!(
+                "a write batch of {len} bytes exceeds the log record limit of {} bytes",
+                wal::MAX_RECORD_PAYLOAD
+            )));
+        }
         inner.check()?;
         if batch.is_empty() {
             return Ok(inner.wal.lock().last_lsn);
@@ -644,7 +692,8 @@ impl Engine for DiskEngine {
         let lsn = {
             let mut meta = inner.tree.write();
             inner.check()?;
-            let lsn = inner.fail(inner.wal.lock().append(&batch))?;
+            let synced = inner.durable_lsn.load(Ordering::Acquire);
+            let lsn = inner.fail(inner.wal.lock().append(&batch, synced))?;
             let mut w = Writer { pool: &inner.pool, meta: &mut meta };
             let applied = batch.ops.iter().try_for_each(|(k, v)| match v {
                 Some(v) => w.put(k, v),
