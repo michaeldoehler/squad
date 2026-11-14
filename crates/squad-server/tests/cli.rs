@@ -309,6 +309,22 @@ fn stop(child: Running) {
     drop(child);
 }
 
+/// Connects as soon as the server has a free connection slot (the slot of
+/// a client that just left is released asynchronously).
+fn connect_when_free(addr: SocketAddr) -> Client {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let mut c = Client::startup(addr, &[("user", "squad")]);
+        let m = c.recv();
+        if (m.ty, &m.body[..]) == (b'R', &[0, 0, 0, 0][..]) {
+            c.until_ready();
+            return c;
+        }
+        assert!(std::time::Instant::now() < deadline, "no free slot: {:?}", m.fields());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// Pings until the server answers or 10 seconds have passed.
 fn ping_until_ready(addr: SocketAddr) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -451,9 +467,8 @@ fn tls_and_limit_options() {
     let (ok, _, err) = ping(&["--port", &port(addr)]);
     assert!(!ok && err.contains("sorry, too many clients already"), "{err}");
     drop(first);
-    ping_until_ready(addr);
     // The idle timeout frees the slot of a silent client.
-    let mut silent = Client::connect(addr);
+    let mut silent = connect_when_free(addr);
     std::thread::sleep(std::time::Duration::from_millis(600));
     assert_eq!(silent.recv().fields()[&'C'], "57P05");
     ping_until_ready(addr);
