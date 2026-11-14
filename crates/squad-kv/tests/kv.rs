@@ -341,7 +341,7 @@ fn snapshots_survive_concurrent_gc() {
                 t.put_blind(&a.to_be_bytes(), &(va - 1).to_be_bytes()).unwrap();
                 t.put_blind(&b.to_be_bytes(), &(vb + 1).to_be_bytes()).unwrap();
                 t.commit().unwrap();
-                if i % 16 == 0 {
+                if i.is_multiple_of(16) {
                     store.gc().unwrap();
                 }
             }

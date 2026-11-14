@@ -60,8 +60,18 @@ pub(crate) struct Inner {
     pub(crate) engine: Arc<dyn Engine>,
     /// Serializes validation, timestamp assignment and batch application.
     pub(crate) commit_lock: Mutex<()>,
-    /// Newest commit timestamp visible to new snapshots.
+    /// Newest commit timestamp visible to new snapshots. Only durable
+    /// commits are visible: a commit's timestamp is published here after
+    /// the engine confirmed that its log record is durable. Since the
+    /// engine's durability is a prefix of its log, and timestamps are
+    /// assigned in log order, publishing with `fetch_max` keeps the
+    /// visible state a prefix of the commit history.
     pub(crate) last_committed: AtomicU64,
+    /// Newest commit timestamp handed out, under `commit_lock`. Commits
+    /// between `last_committed` and this are in the engine but wait for
+    /// durability; they are invisible to snapshots, but they do count as
+    /// conflicts for concurrent writers.
+    pub(crate) last_assigned: AtomicU64,
     /// Snapshot timestamps in use, with reference counts.
     pub(crate) snapshots: Snapshots,
     pub(crate) locks: LockManager,
@@ -194,6 +204,7 @@ impl Store {
                 engine,
                 commit_lock: Mutex::new(()),
                 last_committed: AtomicU64::new(last),
+                last_assigned: AtomicU64::new(last),
                 snapshots: Snapshots::new(),
                 locks: LockManager::default(),
                 next_txn_id: AtomicU64::new(1),
@@ -336,7 +347,8 @@ impl Store {
         self.gc_encoded(codec::DATA_LO.to_vec(), codec::DATA_HI.to_vec())
     }
 
-    /// Timestamp of the newest commit.
+    /// Timestamp of the newest commit visible to new snapshots. Commits
+    /// become visible once they are durable.
     pub fn last_committed(&self) -> u64 {
         self.inner.last_committed.load(Ordering::SeqCst)
     }
