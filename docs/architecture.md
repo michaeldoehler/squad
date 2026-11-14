@@ -54,7 +54,10 @@ behind the `Engine` trait. It knows nothing about SQL or transactions.
   the data file before a checkpoint ("no-steal"), which is what keeps the
   data file equal to the last checkpoint at all times.
 - **Write-ahead log.** Every write batch is one log record (length,
-  CRC32C, sequence number, operations). Records are logical redo records;
+  CRC32C, sequence number, the highest sequence number already durable,
+  operations). The last field lets recovery tell a torn tail, which it
+  discards, from damage to records that were already durable, which
+  makes the open fail. Records are logical redo records;
   there is no undo in the log because uncommitted data never reaches the
   storage engine (see below). Concurrent commits share one `fsync` (group
   commit). Segments are preallocated so that a commit's `fsync` only
@@ -181,7 +184,9 @@ the ordinary executor. See [analytics](analytics.md).
 
 One small interface — put, get, ranged get, list, delete, conditional
 put — with implementations for memory, a local directory and
-S3-compatible services. Column segments are stored through it, and so is
+S3-compatible services. The remote copy relies only on put and
+read-after-write consistent list; it does not need conditional puts,
+which some S3-compatible services ignore. Column segments are stored through it, and so is
 the remote copy of the row store: its log as immutable objects and its
 snapshots as content-addressed chunks. See
 [cloud storage](cloud-storage.md).

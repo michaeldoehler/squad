@@ -122,6 +122,33 @@ statement, combine the old schema with new data. Operations that rewrite
 rows (`DROP COLUMN`, `ALTER COLUMN TYPE`) are best run while no long
 analytical query on the same table is in flight.
 
+## When a commit becomes visible
+
+A commit is visible to other transactions only once it is durable:
+after the engine's `fsync` of the log (in the `sync` and `group`
+durability modes), and with a remote copy in `Sync` mode after the
+upload of its log record as well. No reader can therefore act on a
+commit that a crash could still take back. Snapshots taken after
+`COMMIT` returned — the committing session's next statement, any other
+session's next statement under Read Committed — see it.
+
+Commits are numbered in the order they enter the log and become visible
+in that order: a commit is never visible before an earlier one. The
+wait happens outside the commit lock, so concurrent commits still share
+one `fsync` or one upload (group commit) and become visible together.
+A transaction that has entered the log but is not yet durable is
+invisible, but a concurrent transaction that writes the same row sees
+the conflict and fails with `40001`, as for any concurrent commit.
+
+If making a commit durable fails (an I/O error, or the remote store is
+unreachable in `Sync` mode), `COMMIT` returns an error and the commit
+stays invisible. Its outcome is unknown, as with any failed commit: it
+may still become durable — for example when the next upload carries it
+— and then visible.
+
+With the `async` durability mode, `sync` returns at once and commits
+are visible immediately, matching what that mode promises.
+
 ## Savepoints
 
 ```sql

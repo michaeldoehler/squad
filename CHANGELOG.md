@@ -7,8 +7,62 @@ versions may change the API and the on-disk format.
 
 ## [Unreleased]
 
+### Changed
+
+- **Writer fencing no longer relies on conditional writes.** Garage and
+  other S3-compatible stores accept `If-None-Match: *` and overwrite
+  anyway, so two writers could hold the same epoch. Epochs are now
+  claimed with uniquely named claim objects and a listing afterwards; a
+  writer acknowledges a commit only after a listing that follows its
+  upload shows no newer claim. Safety needs only read-after-write
+  consistent `PUT` and `LIST`. `RemoteStats::conditional_writes` reports
+  whether the store enforces conditional writes (informational).
+- **Remote format 2.** Claim, base, log and snapshot objects carry the
+  claim id in their keys, and each base names the writer it continues.
+  Object stores written in format 1 by earlier development versions
+  are refused with an error; they are not read or migrated.
+- **Commits become visible only once they are durable** (local `fsync`,
+  and the upload in remote `Sync` mode). Group commit is kept: the wait
+  happens outside the commit lock.
+- **Log format 2** (segment magic `SQWAL002`): each record carries the
+  highest durable log position at the time it was written. Directories
+  with log segments of the earlier format are refused with an error.
+- The S3 client classifies errors (transient: connection errors,
+  timeouts, 5xx, 429, 408, `RequestTimeout`; other 4xx are not
+  retried), retries with exponential backoff and full jitter, has
+  configurable timeouts, uploads objects above 16 MiB in parts, and
+  signs header values with runs of spaces collapsed, as SigV4 requires.
+
+### Fixed
+
+- Damage in the middle of the write-ahead log (a record that later
+  records show was already durable) made recovery drop every later
+  commit silently; the open now fails with a corruption error and
+  leaves the log untouched. A torn tail is still discarded.
+- A write batch whose log record exceeds 4 GiB was written with a
+  truncated length; it is now refused with an error.
+- A replaced writer in the middle of a cleanup could delete chunks of
+  the new writer's first snapshot; cleanup now lists before it checks
+  for a newer claim.
+- A commit waiting for its upload in `Sync` mode could be acknowledged
+  because a snapshot covered it, without a fence check after the
+  snapshot was stored.
+- Log records were uploaded before they were durable locally, so a
+  power loss could leave the local directory behind the store.
+- `LocalStore` did not sync directories it created for an object, so a
+  durable object could vanish with its directory entry after a power
+  loss.
+
 ### Added
 
+- `RemoteConfig::upload_concurrency`: optional second (or further) log
+  upload while one is in flight.
+- Tests against a real S3 service when `SQUAD_TEST_S3_URL` is set
+  (conformance, restore, replica, concurrent promotions), run against
+  Garage 2.5; AWS SigV4 test-suite vectors for the signer; the S3
+  emulator and the memory store can ignore `If-None-Match`.
+- `examples/remote_sync_bench.rs` in `squad-storage`: commits/s and
+  p50/p99 latency against a real store for 1, 8 and 32 writers.
 - **Storage engine** (`squad-storage`): page-based B+tree with a buffer
   pool, write-ahead log with group commit and preallocated segments,
   crash-atomic checkpoints through a double-write journal, recovery on

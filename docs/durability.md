@@ -25,8 +25,15 @@ PostgreSQL data directory cannot be opened; use `pg_dump` to move data
 
 1. The transaction's writes are appended to the log as one record with a
    checksum.
-2. They are applied to the in-memory B+tree and become visible.
-3. The commit waits until the log is on stable storage, then returns.
+2. They are applied to the in-memory B+tree.
+3. The commit waits until the log is on stable storage. Only then does
+   it become visible to other transactions, and `COMMIT` returns.
+   Commits that wait at the same time share one `fsync` and become
+   visible together (see
+   [transactions](transactions.md#when-a-commit-becomes-visible)).
+
+A transaction's log record is limited to 4 GiB; a larger transaction
+fails with an error before anything is written.
 
 | Mode | A commit returns after | Survives process crash | Survives power loss |
 | --- | --- | --- | --- |
@@ -70,7 +77,31 @@ nothing to configure:
    the data file. An incomplete one is deleted.
 2. Log records newer than the last checkpoint are replayed in order.
 3. Replay stops at the first record that is incomplete or fails its
-   checksum — the tail of a commit that was never acknowledged.
+   checksum — normally the tail of a commit that was never
+   acknowledged, which is discarded.
+4. Unless the log shows that the missing record had been made durable:
+   every record carries the highest log position that was on stable
+   storage when it was written. If an intact record after the damage
+   says the damaged one was already synced, the damage happened later
+   (a failing disk, a stray write), and the open **fails** with a
+   corruption error (SQLSTATE `XX001`) that names the segment and
+   position. Nothing is deleted; restore from a backup or from the
+   remote copy. Replaying up to the damage and dropping the rest, as a
+   torn tail is handled, would silently lose committed transactions.
+
+A crash can only tear records that were not yet synced, but the device
+may persist unsynced writes in any order, so intact records after a
+torn one are normal and are not taken as proof of corruption. The limit
+of the detection follows from that: damage to the last records written
+before the latest `fsync` — those no later record vouches for — cannot
+be told apart from a torn tail and is treated as one. On a database
+that keeps committing, every record is soon followed by records that
+vouch for it.
+
+The log format changed for this (segment magic `SQWAL002`). A directory
+whose log still holds segments of the earlier development format is
+refused with an error; open it once with the version that wrote it, so
+that it checkpoints and empties the log.
 
 Because uncommitted transactions never write to the log or the data
 file, there is nothing to undo. Recovery time is proportional to the log
