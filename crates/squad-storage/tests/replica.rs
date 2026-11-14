@@ -252,9 +252,22 @@ fn a_writer_directory_is_not_overwritten_by_a_replica() {
     assert!(matches!(err, StorageError::Invalid(_)), "{err}");
 }
 
+/// A store that enforces conditional writes, and one that ignores them
+/// as Garage does. Fencing must not depend on the difference.
+fn both_kinds() -> [MemoryStore; 2] {
+    let ignoring = MemoryStore::new();
+    ignoring.set_ignore_conditions(true);
+    [MemoryStore::new(), ignoring]
+}
+
 #[test]
 fn promotion_fences_the_writer_and_keeps_every_acknowledged_commit() {
-    let store = MemoryStore::new();
+    for store in both_kinds() {
+        promotion_fences(store);
+    }
+}
+
+fn promotion_fences(store: MemoryStore) {
     let (vfs_w, vfs_r, vfs_s) = (SimVfs::new(9), SimVfs::new(10), SimVfs::new(11));
     let mut rng = Rng(9);
     let mut model = Model::new();
@@ -310,7 +323,12 @@ fn promotion_fences_the_writer_and_keeps_every_acknowledged_commit() {
 
 #[test]
 fn a_replica_does_not_apply_what_a_fenced_writer_ships_late() {
-    let store = MemoryStore::new();
+    for store in both_kinds() {
+        late_uploads_are_not_applied(store);
+    }
+}
+
+fn late_uploads_are_not_applied(store: MemoryStore) {
     let (vfs_w, vfs_r, vfs_s) = (SimVfs::new(13), SimVfs::new(14), SimVfs::new(15));
     let mut rng = Rng(13);
     let mut model = Model::new();
@@ -364,7 +382,7 @@ fn replicas_under_object_store_faults() {
             let state = fault_seed.clone();
             store.set_faults(Some(Box::new(move |op, _| {
                 let x = state.fetch_add(0x9E3779B97F4A7C15, Ordering::Relaxed);
-                if matches!(op, "get" | "list" | "head") && (x >> 20) % 6 == 0 {
+                if matches!(op, "get" | "list" | "head") && (x >> 20).is_multiple_of(6) {
                     Fault::Fail
                 } else {
                     Fault::None
@@ -410,7 +428,7 @@ fn replicas_under_object_store_faults() {
 #[test]
 fn random_promotions() {
     for seed in 0..env("SQUAD_REPLICA_SEEDS", 25) {
-        let store: MemoryStore = MemoryStore::new();
+        let store = both_kinds()[seed as usize % 2].clone();
         let mut rng = Rng(seed + 500);
         let mut model = Model::new();
         let mut node = 0u64;

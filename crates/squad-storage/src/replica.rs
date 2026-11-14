@@ -41,9 +41,9 @@ use squad_object::ObjectStore;
 
 use crate::disk::{DiskEngine, DiskOptions};
 use crate::remote::{
-    base_key, claim_epoch, claim_key, dir_is_empty, materialize_latest, max_claim, read_marker, read_remote,
-    read_remote_from, remote_err, wipe, write_marker, RemoteConfig, RemoteStats, SnapshotState, TieredEngine,
-    DATA_FILE, REPLICA_FILE,
+    base_key, claim_epoch, dir_is_empty, encode_base, materialize_latest, max_claim, probe_conditional_writes,
+    read_marker, read_remote, read_remote_from, remote_err, superseded, wipe, write_marker, RemoteConfig, RemoteStats,
+    SnapshotState, TieredEngine, DATA_FILE, REPLICA_FILE,
 };
 use crate::wal;
 use crate::{Engine, EngineStats, Result, StorageError, VerifyReport, WriteBatch};
@@ -269,7 +269,7 @@ impl ReplicaEngine {
         if state.epochs.is_empty() {
             return Err(StorageError::Invalid("the object store holds no database to follow".into()));
         }
-        let snapshot_lsn = state.snapshot.map_or(0, |s| s.1);
+        let snapshot_lsn = state.snapshot.as_ref().map_or(0, |s| s.1);
         self.remote_lsn.store(state.lsn.max(snapshot_lsn), Ordering::Release);
         // The log no longer reaches back to this copy, or this copy is
         // not part of the history in the store: take the newest snapshot.
@@ -282,8 +282,10 @@ impl ReplicaEngine {
         // any future writer reads the store, so that writer starts after
         // it. Otherwise the newest established writer is being replaced
         // and its records wait until the new starting point is known.
-        let frozen = match (claimant, state.epochs.last()) {
-            (false, Some((newest, _))) if max_claim(store)? > *newest => Some(*newest),
+        let frozen = match (claimant, state.head()) {
+            (false, Some(newest)) if max_claim(store, newest.claim.epoch)? > newest.claim.epoch => {
+                Some(newest.claim.epoch)
+            }
             _ => None,
         };
         let mut waiting = false;
@@ -412,7 +414,8 @@ impl ReplicaEngine {
             return Ok(());
         }
         let store = &*self.store;
-        let epoch = claim_epoch(store)?;
+        let conditional_writes = probe_conditional_writes(store);
+        let claim = claim_epoch(store)?;
         // Everything the old writer uploads from now on either is visible
         // to the rounds below or fails that writer's fence check.
         while self.advance(&mut apply, hooks, true)? > 0 {}
@@ -426,15 +429,28 @@ impl ReplicaEngine {
             }
             _ => return Err(closed()),
         };
-        if store.head(&claim_key(epoch + 1)).map_err(remote_err)?.is_some() {
+        if superseded(store, &claim)? {
             return Err(StorageError::Remote(format!(
-                "another node claimed the database while this one was being promoted (epoch {epoch})"
+                "another node claimed the database while this one was being promoted (epoch {})",
+                claim.epoch
             )));
         }
+        // The local copy holds the history of the writer whose records
+        // were applied last; this node continues exactly that history.
+        let prev = match state.writer(apply.epoch) {
+            Some(prev) if state.contains(apply.epoch, lsn) => prev.clone(),
+            _ => {
+                return Err(StorageError::Remote(format!(
+                    "the local copy (epoch {}, LSN {lsn}) is not a state of the history in the object store; \
+                     promotion can be retried once the replica has caught up",
+                    apply.epoch
+                )))
+            }
+        };
         // From here on this node's uploads count.
-        store.put(&base_key(epoch), lsn.to_string().as_bytes()).map_err(remote_err)?;
-        write_marker(&self.opts, &self.dir, epoch)?;
-        apply.epoch = epoch;
+        store.put(&base_key(&claim), &encode_base(lsn, Some(&prev))).map_err(remote_err)?;
+        write_marker(&self.opts, &self.dir, claim.epoch)?;
+        apply.epoch = claim.epoch;
         let vfs = &self.opts.vfs;
         if vfs.exists(&self.dir.join(REPLICA_FILE))? {
             vfs.remove(&self.dir.join(REPLICA_FILE))?;
@@ -443,7 +459,10 @@ impl ReplicaEngine {
         let mut mode = self.mode.write();
         let Mode::Follower(disk) = std::mem::replace(&mut *mode, Mode::Closed) else { return Err(closed()) };
         let config = RemoteConfig { restore: false, ..self.config.clone() };
-        *mode = Mode::Writer(TieredEngine::start(disk, &self.dir, self.opts.clone(), config, epoch, snapshot, lsn)?);
+        let epoch = claim.epoch;
+        let tiered = TieredEngine::start(disk, &self.dir, self.opts.clone(), config, claim, snapshot, lsn)?;
+        tiered.set_conditional_writes(conditional_writes);
+        *mode = Mode::Writer(tiered);
         self.epoch.store(epoch, Ordering::Release);
         self.waiting.store(false, Ordering::Release);
         self.promoted.store(true, Ordering::Release);

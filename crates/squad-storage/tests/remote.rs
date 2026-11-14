@@ -222,9 +222,22 @@ fn a_stale_directory_is_refused_unless_restore_is_set() {
     assert!(a.verify().unwrap().is_ok());
 }
 
+/// A store that enforces conditional writes, and one that ignores them
+/// as Garage does. Fencing must not depend on the difference.
+fn both_kinds() -> [MemoryStore; 2] {
+    let ignoring = MemoryStore::new();
+    ignoring.set_ignore_conditions(true);
+    [MemoryStore::new(), ignoring]
+}
+
 #[test]
 fn a_superseded_writer_is_fenced() {
-    let store = MemoryStore::new();
+    for store in both_kinds() {
+        superseded_writer_is_fenced(store);
+    }
+}
+
+fn superseded_writer_is_fenced(store: MemoryStore) {
     let (vfs_a, vfs_b) = (SimVfs::new(8), SimVfs::new(9));
     let mut rng = Rng(8);
     let mut model = Model::new();
@@ -427,4 +440,152 @@ fn works_against_s3() {
     assert_eq!(contents(&engine), model);
     assert!(engine.verify().unwrap().is_ok());
     assert!(emulator.keys().iter().all(|k| k.starts_with("prod/db1/")));
+}
+
+/// Over S3, against the emulator in both modes: honouring and ignoring
+/// `If-None-Match: *`.
+#[test]
+fn fencing_against_s3_with_and_without_conditional_writes() {
+    for ignore in [false, true] {
+        let emulator = S3Emulator::start();
+        emulator.set_ignore_if_none_match(ignore);
+        let store: Arc<dyn ObjectStore> = Arc::new(S3Store::new(emulator.config("fence")).unwrap());
+        let cfg = RemoteConfig::new(store.clone(), RemoteSync::Sync);
+        let (vfs_a, vfs_b) = (SimVfs::new(21), SimVfs::new(22));
+        let mut rng = Rng(21);
+        let mut model = Model::new();
+        let a = TieredEngine::open(Path::new("/db"), options(&vfs_a), cfg.clone()).unwrap();
+        assert_eq!(a.remote_stats().conditional_writes, Some(!ignore));
+        for _ in 0..10 {
+            let lsn = a.write(random_batch(&mut rng, &mut model)).unwrap();
+            a.sync(lsn).unwrap();
+        }
+        let b = TieredEngine::open(Path::new("/db"), options(&vfs_b), cfg.clone()).unwrap();
+        assert_eq!(contents(&b), model);
+        let mut ignored = model.clone();
+        let lsn = a.write(random_batch(&mut rng, &mut ignored)).unwrap();
+        assert!(a.sync(lsn).is_err());
+        for _ in 0..10 {
+            let lsn = b.write(random_batch(&mut rng, &mut model)).unwrap();
+            b.sync(lsn).unwrap();
+        }
+        drop(a);
+        drop(b);
+        let vfs = SimVfs::new(23);
+        restore_from(&*store, Path::new("/r"), options(&vfs)).unwrap();
+        assert_eq!(contents(&DiskEngine::open(Path::new("/r"), options(&vfs)).unwrap()), model);
+        assert_eq!(emulator.rejected(), 0);
+    }
+}
+
+/// One writer commits continuously while two more start at the same
+/// instant and then commit continuously too. Each commit writes a key of
+/// its own. Exactly one writer - the one with the highest epoch - can
+/// still commit at the end; every other one was fenced; and every commit
+/// any of them got acknowledged is in the store.
+#[test]
+fn concurrent_writers_one_wins_and_no_acknowledged_commit_is_lost() {
+    for seed in 0..env("SQUAD_REMOTE_CONCURRENT_SEEDS", 6) {
+        let store = &both_kinds()[seed as usize % 2];
+        store.set_faults(Some(Box::new(|_, _| {
+            // Requests take a little while, so that uploads, claims and
+            // listings of different writers interleave.
+            std::thread::sleep(Duration::from_micros(50));
+            Fault::None
+        })));
+        let cfg = config(store, RemoteSync::Sync);
+        let first = TieredEngine::open(Path::new("/db"), options(&SimVfs::new(seed * 10)), cfg.clone()).unwrap();
+        let first: Arc<dyn Engine> = Arc::new(first);
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Commits on `engine` until it is fenced or told to stop; returns
+        // the acknowledged keys and whether it was fenced.
+        let commit_loop = |engine: Arc<dyn Engine>, name: String, stop: Arc<std::sync::atomic::AtomicBool>| {
+            std::thread::spawn(move || {
+                let mut acked = Vec::new();
+                let mut i = 0u64;
+                loop {
+                    if stop.load(Ordering::SeqCst) {
+                        return (acked, false);
+                    }
+                    let key = format!("{name}-{i:05}").into_bytes();
+                    let mut b = WriteBatch::new();
+                    b.put(key.clone(), key.clone());
+                    let result = engine.write(b).and_then(|lsn| engine.sync(lsn));
+                    match result {
+                        Ok(()) => acked.push(key),
+                        Err(_) => return (acked, true),
+                    }
+                    i += 1;
+                }
+            })
+        };
+        let first_loop = commit_loop(first.clone(), "w0".into(), stop.clone());
+        let openers: Vec<_> = (1..=2u64)
+            .map(|n| {
+                let (cfg, start, stop) = (cfg.clone(), start.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    let vfs = SimVfs::new(seed * 10 + n);
+                    let engine = match TieredEngine::open(Path::new("/db"), options(&vfs), cfg) {
+                        Ok(e) => e,
+                        // Superseded while opening: that is a fenced writer too.
+                        Err(StorageError::Remote(_)) => return None,
+                        Err(e) => panic!("open failed: {e}"),
+                    };
+                    let epoch = engine.remote_stats().epoch;
+                    let engine: Arc<dyn Engine> = Arc::new(engine);
+                    let handle = commit_loop(engine.clone(), format!("w{n}"), stop);
+                    Some((epoch, engine, handle))
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(20));
+        start.wait();
+        let opened: Vec<_> = openers.into_iter().filter_map(|h| h.join().unwrap()).collect();
+        assert!(!opened.is_empty(), "seed {seed}: no new writer could open");
+        std::thread::sleep(Duration::from_millis(100));
+        stop.store(true, Ordering::SeqCst);
+
+        let mut acked = Vec::new();
+        let (keys, fenced) = first_loop.join().unwrap();
+        assert!(fenced, "seed {seed}: the first writer was not fenced");
+        acked.extend(keys);
+        let top = opened.iter().map(|o| o.0).max().unwrap();
+        let mut winner = None;
+        for (epoch, engine, handle) in opened {
+            let (keys, fenced) = handle.join().unwrap();
+            acked.extend(keys);
+            if epoch == top {
+                assert!(!fenced, "seed {seed}: the newest writer (epoch {epoch}) was fenced");
+                winner = Some(engine);
+            } else {
+                // It may have stopped before it noticed; it must not
+                // commit any more now.
+                let mut b = WriteBatch::new();
+                b.put(b"late".to_vec(), b"late".to_vec());
+                assert!(engine.write(b).and_then(|lsn| engine.sync(lsn)).is_err(), "seed {seed}: two writers");
+            }
+        }
+        let winner = winner.unwrap();
+        let mut b = WriteBatch::new();
+        b.put(b"last".to_vec(), b"last".to_vec());
+        winner.sync(winner.write(b).unwrap()).unwrap();
+        store.set_faults(None);
+        drop(first);
+        drop(winner);
+
+        let got = restored(store);
+        for key in &acked {
+            assert_eq!(
+                got.get(key),
+                Some(key),
+                "seed {seed}: acknowledged commit {} lost",
+                String::from_utf8_lossy(key)
+            );
+        }
+        assert!(got.contains_key(&b"last"[..]));
+        assert!(!got.contains_key(&b"late"[..]));
+    }
 }
