@@ -4,7 +4,15 @@
 //!
 //! ```text
 //! cargo run --release -p squad --example analytics_bench [-- <rows> [<dir>]]
+//! cargo run --release -p squad --features s3 --example analytics_bench -- <rows> --s3 <url>
 //! ```
+//!
+//! With `--s3`, only the columnar table is loaded, into a database whose
+//! segments live in that bucket (for example a local Garage, see
+//! `scripts/garage-dev.sh`; give the URL a fresh key prefix). Every query
+//! then runs once right after reopening the database — with an empty
+//! segment cache, so every column chunk it needs is fetched from the
+//! bucket — and three more times warm.
 
 use std::time::Instant;
 
@@ -55,7 +63,13 @@ fn time(conn: &Connection, sql: &str) -> (f64, usize) {
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(i) = all.iter().position(|a| a == "--s3") {
+        let rows: i64 = all.first().map_or(2_000_000, |v| v.parse().expect("row count"));
+        remote(rows, all.get(i + 1).expect("--s3 needs a URL"));
+        return;
+    }
+    let mut args = all.into_iter();
     let rows: i64 = args.next().map_or(2_000_000, |v| v.parse().expect("row count"));
     let db = match args.next() {
         Some(dir) => Database::open(dir, Config { sync_mode: SyncMode::Async, ..Config::default() }).unwrap(),
@@ -82,7 +96,64 @@ fn main() {
     );
     println!("final VACUUM (compaction): {:>8.1} s\n", t_compact);
 
-    let queries: &[(&str, &str)] = &[
+    println!("{:<46} {:>12} {:>12} {:>9}", "query", "row (ms)", "columnar (ms)", "speed-up");
+    for (name, sql) in QUERIES {
+        let (row_ms, n1) = time(&conn, &sql.replace("{t}", "events_row"));
+        let (col_ms, n2) = time(&conn, &sql.replace("{t}", "events"));
+        assert_eq!(n1, n2, "{name}: different number of result rows");
+        println!("{name:<46} {row_ms:>12.1} {col_ms:>12.2} {:>8.0}x", row_ms / col_ms);
+    }
+}
+
+/// The columnar table in a database whose segments live in an S3 bucket:
+/// cold (first query after reopening) and warm times.
+#[cfg(feature = "s3")]
+fn remote(rows: i64, url: &str) {
+    let store = squad::object::open_url(url).expect("object store URL");
+    let dir = tempfile::tempdir().unwrap();
+    let config = || Config {
+        sync_mode: SyncMode::Async,
+        remote: Some(squad::RemoteConfig::new(
+            store.clone(),
+            squad::RemoteSync::Async { interval: std::time::Duration::from_millis(200) },
+        )),
+        ..Config::default()
+    };
+    let (t_col, t_compact) = {
+        let db = Database::open(dir.path(), config()).unwrap();
+        let conn = db.connect();
+        conn.batch_execute(&format!(
+            "CREATE TABLE events ({COLUMNS}) USING columnar WITH (order_by = 'project_id, ts')"
+        ))
+        .unwrap();
+        let t_col = load(&conn, "events", rows);
+        let start = Instant::now();
+        conn.batch_execute("VACUUM events").unwrap();
+        (t_col, start.elapsed().as_secs_f64())
+    };
+    println!("rows: {rows}, segments in {}", url.split('?').next().unwrap_or(url));
+    println!("load columnar table:       {:>8.1} s  {:>9.0} rows/s", t_col, rows as f64 / t_col);
+    println!("final VACUUM (compaction): {:>8.1} s\n", t_compact);
+    println!("{:<46} {:>12} {:>12} {:>12}", "query", "cold (ms)", "warm (ms)", "fetches");
+    for (name, sql) in QUERIES {
+        let db = Database::open(dir.path(), config()).unwrap();
+        let conn = db.connect();
+        let sql = sql.replace("{t}", "events");
+        let start = Instant::now();
+        conn.query(&sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let cold = start.elapsed().as_secs_f64() * 1e3;
+        let (_, misses) = db.columnar_cache_stats();
+        let (warm, _) = time(&conn, &sql);
+        println!("{name:<46} {cold:>12.1} {warm:>12.2} {misses:>12}");
+    }
+}
+
+#[cfg(not(feature = "s3"))]
+fn remote(_: i64, _: &str) {
+    panic!("build with --features s3 for --s3");
+}
+
+const QUERIES: &[(&str, &str)] = &[
         ("count(*) of one week", "SELECT count(*) FROM {t} WHERE ts >= '2024-02-01' AND ts < '2024-02-08'"),
         (
             "events per day, one project, 30 days",
@@ -109,12 +180,4 @@ fn main() {
         ("one user's events", "SELECT ts, event, path FROM {t} WHERE user_id = 123457 ORDER BY ts"),
         ("sum over all data", "SELECT sum(duration_ms), count(*) FROM {t}"),
         ("errors per hour, last day of one project", "SELECT date_trunc('hour', ts), count(*) FROM {t} WHERE project_id = 7 AND event = 'error' AND ts >= '2024-03-30' GROUP BY 1 ORDER BY 1"),
-    ];
-    println!("{:<46} {:>12} {:>12} {:>9}", "query", "row (ms)", "columnar (ms)", "speed-up");
-    for (name, sql) in queries {
-        let (row_ms, n1) = time(&conn, &sql.replace("{t}", "events_row"));
-        let (col_ms, n2) = time(&conn, &sql.replace("{t}", "events"));
-        assert_eq!(n1, n2, "{name}: different number of result rows");
-        println!("{name:<46} {row_ms:>12.1} {col_ms:>12.2} {:>8.0}x", row_ms / col_ms);
-    }
-}
+];

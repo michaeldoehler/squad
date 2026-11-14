@@ -13,8 +13,9 @@ use crate::{Error, Result};
 pub struct TableSource {
     pub schema: Arc<Schema>,
     pub segments: Vec<Arc<Segment>>,
-    /// In-memory batches with the table's schema.
-    pub delta: Vec<Batch>,
+    /// In-memory batches with the table's schema (shared, so that a
+    /// cached batch is not copied per query).
+    pub delta: Vec<Arc<Batch>>,
 }
 
 impl TableSource {

@@ -183,6 +183,44 @@ impl Writer for CopyWriter {
     }
 }
 
+/// What the delta costs a query: the same aggregation with growing
+/// deltas and no compaction, against the same rows in segments.
+fn delta_cost(dir: &std::path::Path, batch: usize) {
+    let columnar = squad::ColumnarConfig { background_compaction: false, ..Default::default() };
+    let db = Database::open(dir, Config { columnar, ..Config::default() }).unwrap();
+    let conn = db.connect();
+    conn.batch_execute(SCHEMA).unwrap();
+    let queries = [
+        ("count by event, one project", "SELECT event, count(*) FROM events WHERE project_id = 7 GROUP BY event"),
+        ("events with a property", "SELECT count(*) FROM events WHERE properties ->> 'plan' = 'enterprise'"),
+    ];
+    println!("delta rows   query                                  delta (ms)   segments (ms)");
+    let mut loaded = 0u64;
+    for target in [8_192u64, 16_384, 32_768, 65_536, 131_072, 262_144] {
+        while loaded < target {
+            conn.append("events", &values(loaded, batch)).unwrap();
+            loaded += batch as u64;
+        }
+        let time = |sql: &str| {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let start = Instant::now();
+                conn.query(sql, &[]).unwrap();
+                best = best.min(start.elapsed().as_secs_f64() * 1e3);
+            }
+            best
+        };
+        let in_delta: Vec<f64> = queries.iter().map(|(_, q)| time(q)).collect();
+        conn.batch_execute("VACUUM events").unwrap();
+        for ((name, q), d) in queries.iter().zip(in_delta) {
+            println!("{target:>10}   {name:<36} {d:>10.2} {:>15.2}", time(q));
+        }
+        // Back to an empty table for the next size.
+        conn.batch_execute("TRUNCATE events").unwrap();
+        loaded = 0;
+    }
+}
+
 fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
@@ -201,6 +239,10 @@ fn main() {
     let sync_mode = if has("--async") { SyncMode::Async } else { SyncMode::Sync };
     let tmp = tempfile::tempdir().expect("temp dir");
     let dir = flag("--dir").map_or_else(|| tmp.path().join("db"), std::path::PathBuf::from);
+    if has("--delta-cost") {
+        delta_cost(&dir, batch);
+        return;
+    }
 
     let db = Database::open(&dir, Config { sync_mode, ..Config::default() }).unwrap();
     db.connect().batch_execute(SCHEMA).unwrap();

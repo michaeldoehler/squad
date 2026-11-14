@@ -10,6 +10,13 @@
 //!   and indexes,
 //! * the catalog and the storage structures are intact.
 //!
+//! A second simulation does the same for columnar tables: inserts (SQL
+//! and the append API), deletes, schema changes, compaction and merges by
+//! `VACUUM`, rolled-back transactions, with segments in an object store
+//! that survives the crash. Every acknowledged batch must be present
+//! whole, the column engine and the row path must agree, and `VACUUM`
+//! must clean up every segment object no manifest names.
+//!
 //! `SQUAD_SIM_SEEDS` sets the number of seeds (default 6; CI and nightly runs use more),
 //! `SQUAD_SIM_START` the first seed, to reproduce a failure.
 
@@ -287,5 +294,220 @@ fn sql_crash_simulation() {
     let seeds = env("SQUAD_SIM_SEEDS", 6);
     for seed in start..start + seeds {
         run_seed(seed);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Columnar tables
+// ---------------------------------------------------------------------
+
+const BATCH: i64 = 40;
+
+/// What the columnar workload knows about its batches.
+#[derive(Default)]
+struct ColumnarModel {
+    created: bool,
+    /// Batches whose insert was acknowledged and not deleted since.
+    acked: BTreeSet<i64>,
+    /// Batches whose insert or delete has an unknown outcome.
+    maybe: BTreeSet<i64>,
+    next: i64,
+}
+
+fn open_columnar(vfs: &SimVfs, store: &Arc<squad::object::MemoryStore>, rng: &mut Rng) -> squad::Result<Database> {
+    let options = DiskOptions {
+        sync_mode: SyncMode::Sync,
+        cache_pages: [16, 64, 512][rng.below(3) as usize],
+        checkpoint_wal_bytes: [4 << 10, 64 << 10, 1 << 20][rng.below(3) as usize],
+        vfs: Arc::new(vfs.clone()),
+    };
+    let engine = DiskEngine::open(Path::new("/db"), options)?;
+    // Compaction runs where the workload says (VACUUM), so that a seed
+    // replays the same way; orphans are removed at once.
+    let columnar = squad::ColumnarConfig {
+        background_compaction: false,
+        orphan_grace: std::time::Duration::ZERO,
+        ..Default::default()
+    };
+    Database::with_engine_and_objects(Arc::new(engine), store.clone(), columnar)
+}
+
+fn columnar_step(conn: &Connection, rng: &mut Rng, model: &mut ColumnarModel) -> squad::Result<()> {
+    if !model.created {
+        conn.batch_execute(
+            "CREATE TABLE IF NOT EXISTS ev (batch bigint NOT NULL, k int NOT NULL, p jsonb) \
+             USING columnar WITH (order_by = 'batch')",
+        )?;
+        model.created = true;
+        return Ok(());
+    }
+    match rng.below(14) {
+        0 | 1 => conn.batch_execute("VACUUM ev"),
+        2 => conn.batch_execute("CHECKPOINT"),
+        3 => {
+            let Some(&batch) = model.acked.iter().nth(rng.below(model.acked.len().max(1) as u64) as usize) else {
+                return Ok(());
+            };
+            model.acked.remove(&batch);
+            model.maybe.insert(batch);
+            let n = conn.execute("DELETE FROM ev WHERE batch = $1", &[&batch])?;
+            assert_eq!(n, BATCH as u64, "a batch is deleted whole");
+            model.maybe.remove(&batch);
+            Ok(())
+        }
+        4 => {
+            // Rolled back: no trace, including segments it wrote.
+            conn.batch_execute("BEGIN")?;
+            conn.execute("INSERT INTO ev SELECT -1, g, NULL FROM generate_series(1, 30) g", &[])?;
+            conn.batch_execute("DELETE FROM ev")?;
+            conn.batch_execute("ROLLBACK")
+        }
+        5 => {
+            let column = format!("c{}", rng.below(100));
+            conn.batch_execute(&format!("ALTER TABLE ev ADD COLUMN IF NOT EXISTS {column} int DEFAULT 3"))
+        }
+        _ => {
+            let batch = model.next;
+            model.next += 1;
+            model.maybe.insert(batch);
+            if rng.below(2) == 0 {
+                conn.execute(
+                    "INSERT INTO ev (batch, k, p) SELECT $1, g, jsonb_build_object('b', $1) FROM generate_series(1, $2) g",
+                    &[&batch, &BATCH],
+                )?;
+            } else {
+                let rows: Vec<Vec<squad::Value>> = (1..=BATCH)
+                    .map(|g| {
+                        vec![
+                            squad::Value::Int8(batch),
+                            squad::Value::Int4(g as i32),
+                            squad::Value::Text(format!("{{\"b\": {batch}}}")),
+                        ]
+                    })
+                    .collect();
+                // Extra columns added by ALTER TABLE take their default.
+                let width: i64 = conn
+                    .query_one("SELECT count(*) FROM information_schema.columns WHERE table_name = 'ev'", &[])?
+                    .get(0);
+                let rows: Vec<Vec<squad::Value>> = rows
+                    .into_iter()
+                    .map(|mut r| {
+                        r.resize(width as usize, squad::Value::Int4(3));
+                        r
+                    })
+                    .collect();
+                conn.append("ev", &rows)?;
+            }
+            model.maybe.remove(&batch);
+            model.acked.insert(batch);
+            Ok(())
+        }
+    }
+}
+
+fn columnar_check(db: &Database, store: &squad::object::MemoryStore, model: &mut ColumnarModel, ctx: &str) {
+    use squad::object::ObjectStore as _;
+    let conn = db.connect();
+    let exists = conn
+        .query_one("SELECT count(*) FROM pg_tables WHERE tablename = 'ev'", &[])
+        .unwrap_or_else(|e| panic!("{ctx}: catalog unreadable: {e}"))
+        .get::<i64>(0)
+        == 1;
+    if !exists {
+        assert!(model.acked.is_empty(), "{ctx}: table with acknowledged batches is missing");
+        model.created = false;
+        return;
+    }
+    model.created = true;
+    // The column engine and the row path agree, and see whole batches.
+    for sql in [
+        "SELECT batch, count(*) FROM ev GROUP BY batch ORDER BY batch",
+        "SELECT batch, count(*) FROM ev WHERE k + 0 > 0 AND p ->> 'b' = batch::text GROUP BY batch ORDER BY batch",
+    ] {
+        let rows = conn.query(sql, &[]).unwrap_or_else(|e| panic!("{ctx}: {sql}: {e}"));
+        let present: BTreeSet<i64> = rows.iter().map(|r| r.get::<i64>(0)).collect();
+        for r in &rows {
+            assert_eq!(r.get::<i64>(1), BATCH, "{ctx}: batch {} is partial or duplicated ({sql})", r.get::<i64>(0));
+        }
+        for b in &model.acked {
+            assert!(present.contains(b), "{ctx}: acknowledged batch {b} was lost ({sql})");
+        }
+        for b in &present {
+            assert!(model.acked.contains(b) || model.maybe.contains(b), "{ctx}: batch {b} appeared from nowhere");
+        }
+    }
+    let present: BTreeSet<i64> =
+        conn.query("SELECT DISTINCT batch FROM ev", &[]).unwrap().iter().map(|r| r.get(0)).collect();
+    model.acked = present;
+    model.maybe.clear();
+    // VACUUM removes what crashes left behind; every segment it keeps is
+    // readable.
+    conn.batch_execute("VACUUM ev").unwrap_or_else(|e| panic!("{ctx}: VACUUM failed: {e}"));
+    let n: i64 = conn.query_one("SELECT count(*) FROM ev WHERE k + 0 > 0", &[]).unwrap().get(0);
+    assert_eq!(n, model.acked.len() as i64 * BATCH, "{ctx}: rows changed by VACUUM");
+    let _ = store;
+}
+
+fn run_columnar_seed(seed: u64) {
+    let vfs = SimVfs::new(seed ^ 0xC0_1u64);
+    let store = Arc::new(squad::object::MemoryStore::new());
+    let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0x1234_5678);
+    let mut model = ColumnarModel::default();
+    let rounds = 3 + rng.below(3);
+    for round in 0..=rounds {
+        let ctx = format!("columnar seed {seed} round {round}");
+        let last = round == rounds;
+        if !last {
+            match rng.below(10) {
+                0..=6 => vfs.crash_after(1 + rng.below(1500)),
+                7 => vfs.crash_after(1 + rng.below(60)),
+                _ => vfs.set_error_rate(200 + rng.below(5000)),
+            }
+        }
+        match open_columnar(&vfs, &store, &mut rng) {
+            Ok(db) => {
+                let conn = db.connect();
+                let mut outcome = Ok(());
+                for _ in 0..if last { 30 } else { 200 } {
+                    outcome = columnar_step(&conn, &mut rng, &mut model);
+                    if outcome.is_err() {
+                        break;
+                    }
+                }
+                if let Err(e) = &outcome {
+                    assert!(
+                        vfs.is_crashed() || vfs.injected_errors() > 0,
+                        "{ctx}: unexpected error without an injected fault: {e}"
+                    );
+                }
+                assert!(!last || outcome.is_ok(), "{ctx}: fault-free round failed: {outcome:?}");
+            }
+            Err(e) => {
+                assert!(!last && (vfs.is_crashed() || vfs.injected_errors() > 0), "{ctx}: open failed: {e}");
+            }
+        }
+        vfs.crash();
+        vfs.set_error_rate(0);
+        let db = open_columnar(&vfs, &store, &mut rng).unwrap_or_else(|e| panic!("{ctx}: recovery failed: {e}"));
+        columnar_check(&db, &store, &mut model, &ctx);
+        if last && model.created {
+            // Every object left was named by the manifest: dropping the
+            // table leaves none.
+            use squad::object::ObjectStore as _;
+            db.connect().batch_execute("DROP TABLE ev").unwrap();
+            let left = store.list("columnar/").unwrap();
+            assert!(left.is_empty(), "{ctx}: orphaned segment objects survived VACUUM: {left:?}");
+        }
+        drop(db);
+        vfs.crash();
+    }
+}
+
+#[test]
+fn columnar_crash_simulation() {
+    let start = env("SQUAD_SIM_START", 0);
+    let seeds = env("SQUAD_SIM_SEEDS", 6);
+    for seed in start..start + seeds {
+        run_columnar_seed(seed);
     }
 }

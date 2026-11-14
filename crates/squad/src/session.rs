@@ -1117,8 +1117,11 @@ impl Session {
         let result = txn.end(true);
         self.spare_txn = Some(txn);
         if let Err(e) = result {
-            // Nothing was applied: objects written for it are garbage.
-            self.discard_objects(&written_objects);
+            // A failed commit may still have reached the log (an error
+            // while syncing it), so the objects it wrote may be named by
+            // a manifest after all. They stay; if they are garbage,
+            // `VACUUM` removes them.
+            self.shared.columnar.pending_done(&written_objects);
             return Err(e.into());
         }
         if dirty {

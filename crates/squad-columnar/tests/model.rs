@@ -157,7 +157,7 @@ fn table(rows: &[Vec<Datum>], rng: &mut Rng) -> TableSource {
     for (p, chunk) in rows.chunks(per).enumerate() {
         let batch = Batch::from_rows(schema.clone(), chunk).unwrap();
         if p == parts {
-            source.delta.push(batch);
+            source.delta.push(Arc::new(batch));
             continue;
         }
         let options = WriterOptions {
@@ -212,7 +212,7 @@ fn segments_round_trip() {
             assert_eq!(back.num_rows() as u64, seg.num_rows());
             got.extend(back.to_rows());
         }
-        got.extend(source.delta.iter().flat_map(Batch::to_rows));
+        got.extend(source.delta.iter().flat_map(|b| b.to_rows()));
         assert_rows(got, rows, &format!("seed {seed}"));
     }
 }
@@ -620,7 +620,7 @@ fn sum_of_integers_does_not_overflow_and_decimals_report_overflow() {
     ]));
     let rows = vec![vec![Datum::Int(i64::MAX), Datum::Decimal(i128::MAX)]; 3];
     let mut source = TableSource::new(schema.clone());
-    source.delta.push(Batch::from_rows(schema, &rows).unwrap());
+    source.delta.push(Arc::new(Batch::from_rows(schema, &rows).unwrap()));
     let sum = |agg| aggregate(&source, &AggregateRequest { aggregates: vec![agg], ..Default::default() });
     assert_eq!(sum(Aggregate::Sum(0)).unwrap().row(0), vec![Datum::Decimal(3 * i64::MAX as i128)]);
     assert!(sum(Aggregate::Sum(1)).is_err());

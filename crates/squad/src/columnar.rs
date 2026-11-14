@@ -348,8 +348,20 @@ impl Layout {
             .collect()
     }
 
-    /// A block's batch (columns named by id) in this layout.
-    fn adopt(&self, block: &cs::Batch) -> Result<cs::Batch> {
+    /// A block's batch (columns named by id) in this layout; the block
+    /// itself if it has this layout already.
+    fn adopt(&self, block: &Arc<cs::Batch>) -> Result<Arc<cs::Batch>> {
+        let same = block.schema.columns.len() == self.ids.len()
+            && block
+                .schema
+                .columns
+                .iter()
+                .zip(&self.ids)
+                .zip(&self.schema.columns)
+                .all(|((f, id), want)| f.ty == want.ty && f.name.parse::<u32>().ok() == Some(*id));
+        if same {
+            return Ok(block.clone());
+        }
         let rows = block.num_rows();
         let mut columns = Vec::with_capacity(self.ids.len());
         for (i, id) in self.ids.iter().enumerate() {
@@ -361,7 +373,7 @@ impl Layout {
                 None => cs::Column::constant(ty, &self.missing[i], rows)?,
             });
         }
-        Ok(cs::Batch::new(self.schema.clone(), columns)?)
+        Ok(Arc::new(cs::Batch::new(self.schema.clone(), columns)?))
     }
 }
 
@@ -976,7 +988,7 @@ fn read_delta(table: &Table, layout: &Layout, max_rows: usize, cx: &mut ExecCx) 
             }
         };
         rows += raw.num_rows();
-        parts.push(DeltaPart { block: Some(id), row_keys: Vec::new(), batch: Arc::new(layout.adopt(&raw)?) });
+        parts.push(DeltaPart { block: Some(id), row_keys: Vec::new(), batch: layout.adopt(&raw)? });
     }
     Ok(parts)
 }
@@ -1264,7 +1276,7 @@ impl Node for ColumnarScan<'_> {
                 self.next = (s + 1, 0);
                 let mut source = cs::TableSource::new(self.layout.schema.clone());
                 match part {
-                    Part::Delta(b) => source.delta.push((**b).clone()),
+                    Part::Delta(b) => source.delta.push(b.clone()),
                     Part::Segment(seg) => source.segments.push(seg.clone()),
                 }
                 let request = cs::ScanRequest {
@@ -1445,7 +1457,7 @@ pub(crate) fn aggregate(
     let mut source = cs::TableSource::new(layout.schema.clone());
     // Segments the manifest's statistics rule out are not opened.
     source.segments = open_segments(table, &layout, &manifest, filter.as_ref(), cx)?;
-    source.delta = read_delta(table, &layout, usize::MAX, cx)?.into_iter().map(|d| (*d.batch).clone()).collect();
+    source.delta = read_delta(table, &layout, usize::MAX, cx)?.into_iter().map(|d| d.batch).collect();
     let request = cs::AggregateRequest {
         predicate: filter,
         group_by: keys,
@@ -1726,7 +1738,7 @@ pub(crate) fn delete(plan: &ScanPlan, cx: &mut ExecCx) -> Result<u64> {
                 indexed.columns.push(cs::Column::new(cs::ColumnData::Int64((0..n as i64).collect()), None));
                 indexed.schema = Arc::new(cs::Schema::new(fields));
                 source.schema = indexed.schema.clone();
-                source.delta.push(indexed);
+                source.delta.push(Arc::new(indexed));
                 let request =
                     cs::ScanRequest { projection: vec![layout.schema.len()], predicate: Some(p.clone()), limit: None };
                 let mut out = vec![false; n];
