@@ -64,8 +64,16 @@ How the evidence is produced is described in [testing](testing.md).
   CONSTRAINT`, `RENAME TO`, `RENAME COLUMN`, `RENAME CONSTRAINT`.
 - **Columnar tables** (not in PostgreSQL): `CREATE TABLE … USING
   columnar [WITH (order_by = 'a, b')]`, with the aggregates
-  `approx_count_distinct(x)` and `approx_percentile(x, p)`. See
-  [analytics](analytics.md).
+  `approx_count_distinct(x)` and `approx_percentile(x, p)`. `INSERT`,
+  `COPY FROM`, `DELETE`, `TRUNCATE`, `DROP TABLE`, and `ALTER TABLE`
+  `ADD COLUMN` (constant default), `DROP COLUMN`, `RENAME COLUMN`,
+  `RENAME TO`, `ALTER COLUMN SET/DROP DEFAULT`, `DROP NOT NULL`. Not
+  supported on columnar tables (`0A000`): `UPDATE`, other `ALTER TABLE`
+  actions, `ADD COLUMN` with a volatile default or constraints, indexes,
+  primary key, unique and foreign key constraints, `DELETE … USING`,
+  `DELETE … RETURNING`, `SELECT … FOR UPDATE/SHARE`. `VACUUM` on a
+  columnar table also compacts its delta, merges small segments and
+  removes unreferenced segment objects. See [analytics](analytics.md).
 - **Other objects:** `CREATE [UNIQUE] INDEX` on columns, `DROP INDEX`;
   `CREATE SEQUENCE`, `ALTER SEQUENCE`, `nextval`, `currval`, `setval`,
   `lastval`; `CREATE TYPE … AS ENUM`, `ALTER TYPE … ADD VALUE`; `CREATE

@@ -9,6 +9,53 @@ versions may change the API and the on-disk format.
 
 ### Added
 
+- **Columnar tables in production use**: rows are inserted into the
+  delta as blocks (one key-value entry per insert statement, in
+  columnar form) and compacted by a background thread per database
+  (thresholds by rows, blocks and age in `ColumnarConfig`); merges of
+  small segments stream with bounded memory; dropping the last handle
+  stops the compactor cleanly. Segments are read in ranges (footer,
+  then the needed column chunks) through a byte-bounded LRU cache with
+  single-flight misses, and pruned by manifest statistics before any
+  I/O. `ALTER TABLE ADD/DROP/RENAME COLUMN` on columnar tables without
+  rewriting segments. `jsonb` columns get field bloom filters; `->>`
+  comparisons, `IN`, `IS [NOT] NULL` and `GROUP BY col ->> 'key'` run in
+  the column engine and skip row groups. `VACUUM` removes unreferenced
+  segment objects after a grace period; rolled-back transactions delete
+  the segments they wrote.
+- `Connection::append` / `Session::append`: insert rows given as values
+  without SQL text.
+- `Config::columnar` (`ColumnarConfig`), `Database::open_in_memory_with`,
+  `Database::with_engine_config`, `Database::with_engine_and_objects`,
+  `Database::wait_for_compaction`, `Database::columnar_cache_stats`,
+  `ReplicaConfig::columnar`.
+- `squad-columnar`: `ColumnType::Json`, `Predicate::JsonIn` /
+  `JsonIsNull`, `GroupKey::JsonField`, `Segment::project`,
+  `SegmentStreamWriter`, `merge`, `encode_batch` / `decode_batch`,
+  `ChunkSource::prefetch`, column ids in `SegmentMeta`.
+- Benchmarks: `squad-bench --bin ingest` (ingestion through SQL,
+  prepared statements, `append` and `COPY`), cold-cache runs of
+  `analytics_bench` against an S3 bucket (`--s3`).
+
+### Changed
+
+- Columnar on-disk formats: manifests are written as `SQMANI02` (with
+  column ids), `jsonb` columns as the new `Json` column type, and new
+  delta rows as blocks. Older manifests, segments and one-row-per-key
+  delta rows are still read; databases written by this version cannot
+  be read by earlier ones.
+- Committing no longer compacts a columnar table synchronously in the
+  committing session.
+- `squad_columnar::TableSource::delta` holds `Arc<Batch>`.
+- `DELETE` on a columnar table reads the delta after taking the
+  table's segment lock; in Repeatable Read and Serializable it fails
+  with `40001` if the table changed since the snapshot.
+
+### Fixed
+
+- `SELECT … FOR UPDATE/SHARE` on a columnar table silently skipped rows
+  held in segments; it is now rejected with `0A000`.
+
 - **Storage engine** (`squad-storage`): page-based B+tree with a buffer
   pool, write-ahead log with group commit and preallocated segments,
   crash-atomic checkpoints through a double-write journal, recovery on

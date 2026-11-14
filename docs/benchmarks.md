@@ -158,6 +158,70 @@ thread.
 
 These are not comparisons with ClickHouse or DuckDB; none has been run.
 
+### Segments on S3 (cold cache)
+
+The same two million events with the segments in a local Garage v2.5
+(S3 API on 127.0.0.1, row store on local disk), every query run once
+right after reopening the database, with an empty segment cache, and
+then warm ([raw](../benchmarks/analytics-2m-2026-11-14.txt)):
+
+```sh
+eval "$(scripts/garage-dev.sh start)"
+cargo run --release -p squad --features s3 --example analytics_bench -- 2000000 --s3 "$SQUAD_TEST_S3_URL"
+```
+
+| Query | Cold | Warm | GETs | Read |
+| --- | ---: | ---: | ---: | ---: |
+| `count(*)` of one week | 223 ms | 5.9 ms | 32 | 10.3 MiB |
+| Events per day, one project, 30 days | 112 ms | 3.3 ms | 7 | 0.7 MiB |
+| Top 10 paths, one project, one week | 133 ms | 3.1 ms | 9 | 0.7 MiB |
+| p50/p95/p99 duration per event, all data | 364 ms | 15.8 ms | 63 | 0.2 MiB |
+| One user's events | 241 ms | 1.5 ms | 35 | 2.1 MiB |
+| Errors per hour, one project, last day | 106 ms | 1.9 ms | 4 | 0.4 MiB |
+
+A cold query fetches the segment footer and then only the column chunks
+of the row groups that its filter does not rule out. Most of the cold
+time is request latency (about 20–50 ms
+per request on this busy machine with the current S3 client); requests
+for different ranges run in parallel. Loading through bulk inserts ran
+at 208,000 rows/s; the final `VACUUM` (merging eight segments of
+250,000 rows read back from Garage) took 2.6 s.
+
+The in-memory run of the same benchmark after the changes of this
+release gives the same query times as before within the noise of the
+shared machine (1.4–20 ms per columnar query).
+
+## Ingestion
+
+`squad-bench --bin ingest` inserts events of a product-analytics
+service (`ts`, `project_id`, `event`, `distinct_id`, a `jsonb`
+`properties` of about 200 bytes) into a columnar table from several
+threads, in batches of 1,000, with durable commits (`SyncMode::Sync`),
+while a reader runs a small aggregation every 200 ms
+([raw](../benchmarks/ingest-2026-11-14.txt); 4 vCPU shared with other
+build jobs, load average 7–9, so indicative only):
+
+```sh
+cargo run --release -p squad-bench --bin ingest -- --mode append --threads 8 --events 1000000
+```
+
+| Way in | Before | After | Batch p99 / max, after |
+| --- | ---: | ---: | ---: |
+| `Connection::append`, 8 threads | — | 211,000 events/s | 84 / 128 ms |
+| `Connection::append`, 4 threads | — | 192,000 events/s | 44 / 60 ms |
+| Prepared `INSERT … VALUES` of 1,000 rows, 4 threads | 46,000 events/s | 187,000 events/s | 45 / 56 ms |
+| `COPY FROM STDIN` through the server, 4 clients | 46,000 events/s | 115,000 events/s | 85 / 132 ms |
+| SQL text `INSERT … VALUES` of 1,000 rows, 4 threads | 28,000 events/s | 72,000 events/s | 108 / 221 ms |
+
+Before, every row was a key in the row store and the session whose
+commit pushed a table's delta over 100,000 rows compacted it before
+returning: batches stalled for up to 4.7 s and the reader's query took
+0.5–1.7 s while the delta was large. Now each batch is one delta block,
+compaction runs in the background, the longest batch took 0.13 s and
+the reader's query 16–220 ms (p99) during ingestion, a few ms once it
+settled. SQL text is limited by parsing the statement; `COPY` through
+the server inserts in statements of 64 rows.
+
 ## Remote storage
 
 Commit latency with the write-ahead log shipped to an object store,
