@@ -74,3 +74,28 @@ fn a_directory_as_object_store() {
     // Restoring into a directory that already holds a database is refused.
     assert!(Database::restore_from(&*store, copy.path()).is_err());
 }
+
+#[test]
+fn remote_status_reports_shipping_and_fencing() {
+    let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = Database::open(dir_a.path(), config(&store, RemoteSync::Sync)).unwrap();
+    let conn = a.connect();
+    conn.batch_execute("CREATE TABLE t (id int PRIMARY KEY)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+    let status = a.remote_status().expect("a writer with a remote has a status");
+    assert!(!status.fenced);
+    assert_eq!(status.shipped_lsn, status.local_lsn, "Sync mode ships before a commit returns");
+    assert!(status.local_lsn > 0);
+
+    // A second writer on the same store takes over; the first one is
+    // fenced at its next commit and reports it.
+    let mut takeover = config(&store, RemoteSync::Sync);
+    takeover.remote.as_mut().unwrap().restore = true;
+    let b = Database::open(dir_b.path(), takeover).unwrap();
+    assert!(!b.remote_status().unwrap().fenced);
+    assert!(conn.execute("INSERT INTO t VALUES (2)", &[]).is_err());
+    assert!(a.remote_status().unwrap().fenced);
+
+    assert!(Database::open_in_memory().unwrap().remote_status().is_none());
+}

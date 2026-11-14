@@ -62,6 +62,9 @@ pub struct Shared {
     /// The replication machinery, if the database was opened as a
     /// replica. It stays after promotion.
     pub(crate) replica: std::sync::OnceLock<crate::replica::Replica>,
+    /// The engine, if this database keeps its durable copy in an object
+    /// store as a writer.
+    pub(crate) tiered: std::sync::OnceLock<Arc<squad_storage::TieredEngine>>,
     /// Advisory locks held by the sessions of this database.
     pub(crate) advisory: Arc<crate::advisory::AdvisoryLocks>,
 }
@@ -142,6 +145,7 @@ impl Shared {
             recovery: AtomicBool::new(false),
             replay_gate: Arc::new(RwLock::new(())),
             replica: std::sync::OnceLock::new(),
+            tiered: std::sync::OnceLock::new(),
         }))
     }
 

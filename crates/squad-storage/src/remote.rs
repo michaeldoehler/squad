@@ -153,6 +153,12 @@ pub struct RemoteStats {
     pub conditional_writes: Option<bool>,
     /// Highest LSN known to be in the object store.
     pub shipped_lsn: u64,
+    /// LSN of the newest commit in the local log. `local_lsn -
+    /// shipped_lsn` is how far the object store is behind.
+    pub local_lsn: u64,
+    /// True once this writer saw a newer claim: another writer took over,
+    /// and every further write fails.
+    pub fenced: bool,
     /// LSN of the newest uploaded snapshot.
     pub snapshot_lsn: u64,
     pub wal_objects: u64,
@@ -1359,6 +1365,8 @@ impl TieredEngine {
     pub fn remote_stats(&self) -> RemoteStats {
         let mut stats = self.shared.stats.lock().clone();
         stats.shipped_lsn = self.shared.shipped_lsn.load(Ordering::Acquire);
+        stats.local_lsn = self.shared.disk.last_lsn();
+        stats.fenced = self.shared.fenced.load(Ordering::Acquire);
         stats
     }
 

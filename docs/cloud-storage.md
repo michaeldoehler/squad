@@ -295,6 +295,24 @@ Residual risks, stated plainly:
 | Object store loses or corrupts an object | restore verifies every chunk against its SHA-256 name and every log record against its checksum, and fails with an error naming the object |
 | Both the machine and the bucket are lost | the data is gone; replicate the bucket if that matters |
 
+## Monitoring
+
+`Database::remote_status()` returns the writer's `RemoteStats` (`None`
+without a remote, and on replicas, which have
+`replication_status()` instead). The fields that matter for a health
+check:
+
+| Field | Meaning |
+| --- | --- |
+| `fenced` | another writer has taken over; every further write fails |
+| `local_lsn`, `shipped_lsn` | newest commit in the local log and newest commit in the store; the difference is what a lost machine would lose. It is 0 after every `Sync` commit, at most about one interval in `Async` mode, and grows while the store is unreachable. |
+| `epoch`, `claim_id` | which writer this is |
+| `conditional_writes` | whether the store enforces `If-None-Match` (informational) |
+
+The other fields count uploads, snapshots and chunks. See
+[deployment](deployment.md#health-checks) for how to use them in a
+container health check.
+
 ## What this is not
 
 - **Not multi-writer.** One process writes; a second one takes over

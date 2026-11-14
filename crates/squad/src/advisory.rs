@@ -108,7 +108,10 @@ impl AdvisoryLocks {
                 Wait::No => return Ok(false),
                 Wait::Yes { lock_timeout, interrupted } => {
                     if lock_timeout.is_some_and(|t| started.elapsed() >= t) {
-                        return Err(Error::new(sqlstate::LOCK_NOT_AVAILABLE, "canceling statement due to lock timeout"));
+                        return Err(Error::new(
+                            sqlstate::LOCK_NOT_AVAILABLE,
+                            "canceling statement due to lock timeout",
+                        ));
                     }
                     self.released.wait_for(&mut table, POLL);
                     // Interrupts are checked without the table locked.
@@ -174,7 +177,11 @@ impl AdvisoryLocks {
 
 /// Implements the advisory lock functions for `catalog_fn`. `None` if
 /// `name` is not one of them.
-pub(crate) fn call(name: &str, args: &[crate::types::Value], cx: &mut crate::exec::ExecCx) -> Option<Result<crate::types::Value>> {
+pub(crate) fn call(
+    name: &str,
+    args: &[crate::types::Value],
+    cx: &mut crate::exec::ExecCx,
+) -> Option<Result<crate::types::Value>> {
     use crate::types::Value;
     if !name.contains("advisory") {
         return None;
@@ -216,7 +223,9 @@ pub(crate) fn call(name: &str, args: &[crate::types::Value], cx: &mut crate::exe
         locks.acquire(pid, key, shared, xact, Wait::No).map(Value::Bool)
     } else {
         let mut interrupted = || cx.check_interrupts_now();
-        locks.acquire(pid, key, shared, xact, Wait::Yes { lock_timeout, interrupted: &mut interrupted }).map(|_| Value::Null)
+        locks
+            .acquire(pid, key, shared, xact, Wait::Yes { lock_timeout, interrupted: &mut interrupted })
+            .map(|_| Value::Null)
     };
     Some(result)
 }

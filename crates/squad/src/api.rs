@@ -71,7 +71,10 @@ impl Database {
         let (shared, objects): (Arc<Shared>, Arc<dyn ObjectStore>) = match config.remote {
             Some(remote) => {
                 let objects = remote.store.clone();
-                (Database::open_shared(Arc::new(TieredEngine::open(path.as_ref(), options, remote)?))?, objects)
+                let engine = Arc::new(TieredEngine::open(path.as_ref(), options, remote)?);
+                let shared = Database::open_shared(engine.clone())?;
+                let _ = shared.tiered.set(engine);
+                (shared, objects)
             }
             None => {
                 let shared = Database::open_shared(Arc::new(DiskEngine::open(path.as_ref(), options)?))?;
@@ -236,6 +239,16 @@ impl Database {
     pub fn vacuum(&self) -> Result<u64> {
         self.shared.check_writable("VACUUM")?;
         Ok(self.shared.store.gc()?)
+    }
+
+    /// State of the durable copy in the object store, if this database
+    /// was opened as a writer with [`Config::remote`]: whether another
+    /// writer has taken over (`fenced`), and how far the store is behind
+    /// the local log (`local_lsn - shipped_lsn`). `None` for databases
+    /// without a remote and for replicas, including promoted ones; see
+    /// [`Database::replication_status`] for those.
+    pub fn remote_status(&self) -> Option<crate::RemoteStats> {
+        self.shared.tiered.get().map(|engine| engine.remote_stats())
     }
 
     /// Storage engine counters.
