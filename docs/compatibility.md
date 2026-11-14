@@ -5,18 +5,17 @@ sends: the same statements are accepted, return the same results and fail
 with the same SQLSTATE. It reports itself as `PostgreSQL 16.4 (squad
 <version>)`.
 
-Compatibility is measured, not claimed. The spec for squad defines six
-levels; this page says where each stands and lists every known
-difference. If something is not listed as unsupported or different and
+Compatibility is measured, not claimed. This page groups it into six
+areas, says where each stands and lists every known difference. If something is not listed as unsupported or different and
 does not behave like Postgres, that is a bug.
 
-| Level | Scope | Status | Evidence |
+| Area | Scope | Status | Evidence |
 | --- | --- | --- | --- |
 | L1 SQL core | DDL, DML, joins, subqueries, CTEs (also recursive), aggregates, window functions, `ON CONFLICT`, `RETURNING` | implemented | SQL regression suite compared with PostgreSQL 16; sqllogictest; differential fuzzing |
 | L2 Types and functions | integers, numeric, floats, text, bytea, boolean, date/time, uuid, json/jsonb, arrays, enums; operators and several hundred functions | implemented, with the limits below | value tests with results from PostgreSQL 16 |
 | L3 Semantics | SQLSTATE codes, NULL logic, implicit casts, isolation behaviour | implemented | regression suite compares SQLSTATEs; concurrency tests |
 | L4 Catalog | `pg_catalog`, `information_schema` as tools query them | implemented for psql, sqlx and common ORM introspection | replayed psql and ORM catalog queries |
-| L5 Wire protocol | protocol v3, extended query, `COPY`, SCRAM | implemented without TLS and cancellation | psql, pgbench, pg_dump, tokio-postgres, sqlx |
+| L5 Wire protocol | protocol v3, extended query, `COPY`, SCRAM, TLS, cancel requests | implemented; no direct TLS negotiation (PostgreSQL 17) | psql, pgbench, pg_dump, tokio-postgres, sqlx |
 | L6 Extensions | PL/pgSQL, `LISTEN`/`NOTIFY`, full-text search, extension API | not started | — |
 
 How the evidence is produced is described in [testing](testing.md).

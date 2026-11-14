@@ -26,9 +26,11 @@ let name: String = stmt.query_one(&[&"ada@example.org"])?.get(0);
 ```
 
 > **Status: 0.1, not yet used in production.** squad has an extensive
-> test suite behind it (below), but it is young. Try it next to
+> test suite behind it (below), including crash simulation and tests
+> against a real S3 service (Garage), but it is young. Try it next to
 > PostgreSQL, not in place of your only copy of important data. What is
-> missing is listed in [docs/roadmap.md](docs/roadmap.md).
+> missing is listed in [docs/roadmap.md](docs/roadmap.md); how to run it
+> in containers is in [docs/deployment.md](docs/deployment.md).
 
 ## What you get
 
@@ -50,8 +52,9 @@ let name: String = stmt.query_one(&[&"ada@example.org"])?.get(0);
   millions of rows answer in milliseconds, in the same SQL and the same
   transactions as the rest of your data. → [analytics](docs/analytics.md)
 - **Cloud-native storage.** Work in memory and on local disk, keep the
-  durable copy in an S3-compatible object store, restore on a fresh
-  machine. → [cloud storage](docs/cloud-storage.md)
+  durable copy in an S3-compatible object store such as AWS S3 or
+  Garage, restore on a fresh machine. Writer fencing needs no
+  conditional writes from the store. → [cloud storage](docs/cloud-storage.md)
 - **Read replicas and failover.** Any number of replicas follow the
   writer through the object store, serve read-only queries and can be
   promoted; the old writer is fenced. → [replication](docs/replication.md)
@@ -60,7 +63,7 @@ let name: String = stmt.query_one(&[&"ada@example.org"])?.get(0);
   across all of them. → [sharding](docs/sharding.md)
 - **The Postgres wire protocol, when you want it.** One call serves the
   embedded database to psql, pgAdmin, migration tools and services in
-  other languages. An application written for sqlx and PostgreSQL runs
+  other languages, with SCRAM, TLS and query cancellation. An application written for sqlx and PostgreSQL runs
   against it unchanged. → [server](docs/server.md)
 
 ## A taste
@@ -221,6 +224,7 @@ squad serve ./replica --replica-of s3://my-bucket/prod   # read replica
 | [Analytics](docs/analytics.md) | columnar tables: how they work, what is fast, limits |
 | [Cloud storage](docs/cloud-storage.md) | object stores, S3, remote durability, restore |
 | [Replication](docs/replication.md) | read replicas, lag, promotion and fencing, failover runbook |
+| [Deployment](docs/deployment.md) | running on Docker Swarm with Garage: one writer, replicas, secrets, health checks |
 | [Sharding](docs/sharding.md) | `squad-cluster`: distributed and reference tables, routing, limits |
 | [Transactions](docs/transactions.md) | isolation levels, locking, differences from PostgreSQL |
 | [Durability](docs/durability.md) | on-disk layout, commit, checkpoints, recovery, backup |
