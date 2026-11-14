@@ -32,3 +32,5 @@ rand = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
+# The S3 client, for the tests against a real S3 service (tests/real_s3.rs).
+squad-object = { path = "../squad-object", features = ["s3"] }

@@ -523,7 +523,8 @@ impl Txn {
         }
 
         let horizon = inner.oldest_snapshot();
-        let ts = inner.last_committed.load(Ordering::SeqCst) + 1;
+        // On a promoted replica, `last_committed` moved by replay.
+        let ts = inner.last_assigned.load(Ordering::SeqCst).max(inner.last_committed.load(Ordering::SeqCst)) + 1;
         let mut batch = WriteBatch { ops: Vec::with_capacity(self.writes.len() + 1) };
         for (key, w) in &self.writes {
             let start = codec::key_start(key);
@@ -549,7 +550,7 @@ impl Txn {
         }
         batch.put(codec::META_LAST_TS.to_vec(), ts.to_be_bytes().to_vec());
         let lsn = inner.engine.write(batch)?;
-        inner.last_committed.store(ts, Ordering::SeqCst);
+        inner.last_assigned.store(ts, Ordering::SeqCst);
 
         {
             let mut recent = inner.recent.lock();
@@ -563,12 +564,23 @@ impl Txn {
             }
         }
         drop(guard);
+        // Visible only once durable, so that no reader acts on a commit a
+        // crash could still take back. Concurrent commits share the wait
+        // (group commit in the engine); whichever finishes first publishes
+        // the newest durable timestamp for all of them. If the wait fails
+        // the commit stays invisible until a later commit's durability
+        // covers it; its outcome is then unknown to the caller, as with
+        // any failed commit.
         inner.engine.sync(lsn)?;
+        inner.last_committed.fetch_max(ts, Ordering::SeqCst);
         Ok(())
     }
 
-    /// Makes all buffered writes durable and visible. On error nothing was
-    /// applied and the transaction is rolled back.
+    /// Makes all buffered writes durable and visible. Other transactions
+    /// see the changes only once they are durable; snapshots taken after
+    /// this returns see them. On error the transaction is rolled back; if
+    /// the error came from making the commit durable, the commit may
+    /// still become durable and visible later (its outcome is unknown).
     pub fn commit(mut self) -> Result<()> {
         self.end(true)
     }

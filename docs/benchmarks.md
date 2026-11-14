@@ -160,18 +160,27 @@ These are not comparisons with ClickHouse or DuckDB; none has been run.
 
 ## Remote storage
 
-Commit latency with the write-ahead log shipped to an object store,
-measured against the in-repository S3 emulator on the same machine — so
-without network latency, which in a real deployment is added to every
-`Sync` commit (`cargo run --release -p squad-storage --example
-remote_bench`):
+Commit throughput and latency with the write-ahead log shipped to a
+single-node Garage 2.5 on the same machine, one 120-byte row per commit
+and a local `fsync` on every commit. Other builds were running, so the
+numbers are indicative. Raw output:
+`benchmarks/remote-sync-2026-11-14.txt` (`eval "$(scripts/garage-dev.sh
+start)"; cargo run --release -p squad-storage --example
+remote_sync_bench`).
 
-| Commit of one small row | p50 | p99 | Commits/s |
-| --- | ---: | ---: | ---: |
-| Local only | 130 µs | 396 µs | 6,400 |
-| Remote, `Async` | 111 µs | 424 µs | 7,750 |
-| Remote, `Sync`, 1 thread | 352 µs | 912 µs | 2,430 |
-| Remote, `Sync`, 16 threads | — | — | 4,340 |
+| Mode | Writers | Commits/s | p50 | p99 |
+| --- | ---: | ---: | ---: | ---: |
+| Local only | 1 | 6,811 | 0.12 ms | 0.46 ms |
+| Remote, `Async` (100 ms) | 1 | 7,093 | 0.12 ms | 0.43 ms |
+| Remote, `Sync` | 1 | 202 | 4.85 ms | 8.64 ms |
+| Local only | 32 | 38,958 | 0.47 ms | 4.33 ms |
+| Remote, `Async` (100 ms) | 32 | 52,064 | 0.47 ms | 4.05 ms |
+| Remote, `Sync` | 32 | 2,629 | 10.40 ms | 26.48 ms |
+
+A `Sync` commit waits for one `PUT` and one `LIST`; concurrent commits
+share them (23.8 commits per upload with 32 writers). The full table,
+with 8 writers, is in [cloud storage](cloud-storage.md#request-and-storage-cost).
+`remote_bench` (same crate) still measures snapshot upload volume.
 
 ## Replication
 

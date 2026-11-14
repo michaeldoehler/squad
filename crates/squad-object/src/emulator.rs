@@ -2,15 +2,17 @@
 //!
 //! It implements the operations [`S3Store`](crate::S3Store) uses —
 //! `PutObject` (also conditional), `GetObject` with ranges, `HeadObject`,
-//! `DeleteObject` and `ListObjectsV2` with continuation tokens — and
+//! `DeleteObject`, `ListObjectsV2` with continuation tokens, and
+//! multipart uploads (create, upload part, complete, abort) — and
 //! **verifies the Signature V4 of every request**, so tests against it
 //! exercise the client's signing. It can also fail or drop requests on
-//! demand to test retries.
+//! demand to test retries, and it can ignore `If-None-Match: *` the way
+//! some S3-compatible services do.
 //!
 //! This is test infrastructure, not a storage service: objects live in
 //! memory and one bucket and one credential are known.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -26,18 +28,31 @@ pub const SECRET_KEY: &str = "squad-test-secret/Key+With=Symbols";
 pub const REGION: &str = "eu-test-1";
 pub const BUCKET: &str = "squad-bucket";
 
+/// A multipart upload in progress: its key and the parts received.
+struct Upload {
+    key: String,
+    parts: BTreeMap<u32, Vec<u8>>,
+}
+
 #[derive(Default)]
 struct State {
     objects: Mutex<BTreeMap<String, Vec<u8>>>,
+    uploads: Mutex<HashMap<String, Upload>>,
+    next_upload: AtomicU64,
+    completed_uploads: AtomicU64,
     /// Remaining requests to answer with status 500.
     fail_next: AtomicU64,
     /// Remaining requests to drop without an answer.
     drop_next: AtomicU64,
     /// Remaining writes to apply and then drop without an answer.
     drop_after_next: AtomicU64,
+    /// Remaining multipart completions to apply and then drop.
+    drop_after_completions: AtomicU64,
     requests: AtomicU64,
     rejected: AtomicU64,
     page_size: AtomicU64,
+    /// Treat a conditional `PUT` like a plain one.
+    ignore_if_none_match: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -61,8 +76,16 @@ impl Request {
     }
 }
 
+/// Decrements `counter` if it is above zero; true if it was.
 fn take_one(counter: &AtomicU64) -> bool {
-    counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
+    let mut n = counter.load(Ordering::SeqCst);
+    while n > 0 {
+        match counter.compare_exchange_weak(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => n = now,
+        }
+    }
+    false
 }
 
 impl S3Emulator {
@@ -125,6 +148,18 @@ impl S3Emulator {
         self.state.drop_after_next.store(n, Ordering::SeqCst);
     }
 
+    /// Makes conditional puts (`If-None-Match: *`) overwrite an existing
+    /// object and report success, as Garage does.
+    pub fn set_ignore_if_none_match(&self, ignore: bool) {
+        self.state.ignore_if_none_match.store(ignore, Ordering::SeqCst);
+    }
+
+    /// Completes the next `n` multipart uploads but closes the connection
+    /// instead of confirming them.
+    pub fn drop_after_completions(&self, n: u64) {
+        self.state.drop_after_completions.store(n, Ordering::SeqCst);
+    }
+
     /// Maximum number of keys per list response (default 1000).
     pub fn set_page_size(&self, n: u64) {
         self.state.page_size.store(n.max(1), Ordering::SeqCst);
@@ -138,6 +173,17 @@ impl S3Emulator {
     /// Requests rejected because of a bad signature.
     pub fn rejected(&self) -> u64 {
         self.state.rejected.load(Ordering::SeqCst)
+    }
+
+    /// Multipart uploads completed so far.
+    pub fn completed_multipart_uploads(&self) -> u64 {
+        self.state.completed_uploads.load(Ordering::SeqCst)
+    }
+
+    /// Multipart uploads that were started and neither completed nor
+    /// aborted.
+    pub fn open_multipart_uploads(&self) -> usize {
+        self.state.uploads.lock().len()
     }
 
     /// Keys of all stored objects (bucket-relative).
@@ -250,6 +296,7 @@ fn respond(stream: &mut TcpStream, status: u16, headers: &[(&str, String)], body
         206 => "Partial Content",
         403 => "Forbidden",
         404 => "Not Found",
+        400 => "Bad Request",
         412 => "Precondition Failed",
         416 => "Range Not Satisfiable",
         500 => "Internal Server Error",
@@ -311,13 +358,49 @@ fn serve(stream: TcpStream, state: &State) {
             continue;
         };
         let key = rest.trim_start_matches('/').to_string();
-        let is_write = matches!(req.method.as_str(), "PUT" | "DELETE");
-        let lose_answer = is_write && take_one(&state.drop_after_next);
+        let is_write = matches!(req.method.as_str(), "PUT" | "DELETE" | "POST");
+        let param = |name: &str| req.query.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+        let upload_id = param("uploadId");
+        let completion = req.method == "POST" && upload_id.is_some();
+        let lose_answer =
+            (is_write && take_one(&state.drop_after_next)) || (completion && take_one(&state.drop_after_completions));
         let (status, headers, body): (u16, Vec<(&str, String)>, Vec<u8>) = match (req.method.as_str(), key.is_empty()) {
             ("GET", true) => list(state, &req),
+            ("POST", false) if param("uploads").is_some() => {
+                let id = format!("upload-{}", state.next_upload.fetch_add(1, Ordering::SeqCst));
+                state.uploads.lock().insert(id.clone(), Upload { key: key.clone(), parts: BTreeMap::new() });
+                let xml = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><InitiateMultipartUploadResult><Bucket>{BUCKET}</Bucket>\
+                     <Key>{}</Key><UploadId>{id}</UploadId></InitiateMultipartUploadResult>",
+                    xml_escape(&key)
+                );
+                (200, vec![], xml.into_bytes())
+            }
+            ("PUT", false) if upload_id.is_some() => {
+                let number = param("partNumber").and_then(|n| n.parse::<u32>().ok());
+                let mut uploads = state.uploads.lock();
+                match (uploads.get_mut(upload_id.as_deref().unwrap()), number) {
+                    (Some(upload), Some(n)) if upload.key == key && (1..=10_000).contains(&n) => {
+                        let etag = format!("\"{}\"", &sigv4::sha256_hex(&req.body)[..32]);
+                        upload.parts.insert(n, req.body.clone());
+                        (200, vec![("etag", etag)], Vec::new())
+                    }
+                    (None, _) => (404, vec![], error_xml("NoSuchUpload", "The specified upload does not exist.")),
+                    _ => (400, vec![], error_xml("InvalidArgument", "bad part number")),
+                }
+            }
+            ("POST", false) if upload_id.is_some() => {
+                complete_upload(state, &key, upload_id.as_deref().unwrap(), &req.body)
+            }
+            ("DELETE", false) if upload_id.is_some() => {
+                state.uploads.lock().remove(upload_id.as_deref().unwrap());
+                (204, vec![], Vec::new())
+            }
             ("PUT", false) => {
                 let mut objects = state.objects.lock();
-                if req.header("if-none-match") == Some("*") && objects.contains_key(&key) {
+                let conditional =
+                    req.header("if-none-match") == Some("*") && !state.ignore_if_none_match.load(Ordering::SeqCst);
+                if conditional && objects.contains_key(&key) {
                     (412, vec![], error_xml("PreconditionFailed", "object exists"))
                 } else {
                     objects.insert(key, req.body.clone());
@@ -354,6 +437,61 @@ fn serve(stream: TcpStream, state: &State) {
             return;
         }
     }
+}
+
+/// CompleteMultipartUpload: checks the part list against the parts
+/// received (numbers ascending, ETags matching, every part but the last
+/// at least 5 MiB) and stores their concatenation.
+fn complete_upload(state: &State, key: &str, id: &str, body: &[u8]) -> (u16, Vec<(&'static str, String)>, Vec<u8>) {
+    let mut uploads = state.uploads.lock();
+    let Some(upload) = uploads.get(id).filter(|u| u.key == key) else {
+        return (404, vec![], error_xml("NoSuchUpload", "The specified upload does not exist."));
+    };
+    let text = String::from_utf8_lossy(body);
+    let mut listed = Vec::new();
+    let mut rest: &str = &text;
+    while let Some(start) = rest.find("<Part>") {
+        let end = rest[start..].find("</Part>").map_or(rest.len(), |e| start + e);
+        let item = &rest[start..end];
+        let number = item
+            .split_once("<PartNumber>")
+            .and_then(|(_, r)| r.split_once("</PartNumber>"))
+            .and_then(|(n, _)| n.trim().parse::<u32>().ok());
+        let etag = item
+            .split_once("<ETag>")
+            .and_then(|(_, r)| r.split_once("</ETag>"))
+            .map(|(e, _)| e.replace("&quot;", "\""));
+        match (number, etag) {
+            (Some(n), Some(e)) => listed.push((n, e)),
+            _ => return (400, vec![], error_xml("MalformedXML", "bad part list")),
+        }
+        rest = &rest[end..];
+    }
+    if listed.is_empty() || listed.windows(2).any(|w| w[0].0 >= w[1].0) {
+        return (400, vec![], error_xml("InvalidPartOrder", "parts must be listed in ascending order"));
+    }
+    let mut data = Vec::new();
+    for (i, (n, etag)) in listed.iter().enumerate() {
+        let Some(part) = upload.parts.get(n) else {
+            return (400, vec![], error_xml("InvalidPart", "a listed part was not uploaded"));
+        };
+        if *etag != format!("\"{}\"", &sigv4::sha256_hex(part)[..32]) {
+            return (400, vec![], error_xml("InvalidPart", "ETag mismatch"));
+        }
+        if i + 1 < listed.len() && part.len() < 5 << 20 {
+            return (400, vec![], error_xml("EntityTooSmall", "a part other than the last is below 5 MiB"));
+        }
+        data.extend_from_slice(part);
+    }
+    uploads.remove(id);
+    state.objects.lock().insert(key.to_string(), data);
+    state.completed_uploads.fetch_add(1, Ordering::SeqCst);
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CompleteMultipartUploadResult><Bucket>{BUCKET}</Bucket>\
+         <Key>{}</Key></CompleteMultipartUploadResult>",
+        xml_escape(key)
+    );
+    (200, vec![], xml.into_bytes())
 }
 
 fn list(state: &State, req: &Request) -> (u16, Vec<(&'static str, String)>, Vec<u8>) {

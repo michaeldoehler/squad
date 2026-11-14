@@ -6,7 +6,7 @@
 //! ```
 //!
 //! Without arguments it starts the in-process S3 emulator, so the numbers
-//! show the overhead of the mechanism (HTTP, signing, three requests per
+//! show the overhead of the mechanism (HTTP, signing, two requests per
 //! commit group) without network latency. Pass an `s3://…` or `file://…`
 //! URL to measure a real store.
 

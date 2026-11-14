@@ -12,6 +12,9 @@ const TMP_PREFIX: &str = ".tmp-";
 /// An object is a file at `dir/<key>`. A put writes a temporary file,
 /// syncs it, renames it into place and syncs the directory, so an object
 /// is either completely there or not at all, also after a crash.
+/// Directories a put has to create on the way are synced too, together
+/// with the directories that hold them, so that a durable object is never
+/// lost with a directory entry that was not.
 #[derive(Debug)]
 pub struct LocalStore {
     dir: PathBuf,
@@ -19,6 +22,8 @@ pub struct LocalStore {
 }
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    tests::SYNCED.with(|s| s.borrow_mut().push(dir.to_path_buf()));
     #[cfg(unix)]
     {
         File::open(dir)?.sync_all()
@@ -30,11 +35,48 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// Creates `dir` and any missing ancestors. Returns the directories that
+/// were created, outermost first.
+fn create_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut missing = Vec::new();
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.as_os_str().is_empty() || d.is_dir() {
+            break;
+        }
+        missing.push(d.to_path_buf());
+        cur = d.parent();
+    }
+    missing.reverse();
+    let mut created = Vec::new();
+    for d in missing {
+        match fs::create_dir(&d) {
+            Ok(()) => created.push(d),
+            // Created concurrently by another put; that put syncs it.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && d.is_dir() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(created)
+}
+
+/// Makes the entries of newly created directories durable: each created
+/// directory's parent is synced, innermost first.
+fn sync_created(created: &[PathBuf]) -> io::Result<()> {
+    for d in created.iter().rev() {
+        if let Some(parent) = d.parent().filter(|p| !p.as_os_str().is_empty()) {
+            sync_dir(parent)?;
+        }
+    }
+    Ok(())
+}
+
 impl LocalStore {
     /// Opens the store in `dir`, creating the directory if needed.
     pub fn new(dir: impl Into<PathBuf>) -> Result<LocalStore> {
         let dir = dir.into();
-        fs::create_dir_all(&dir)?;
+        let created = create_dirs(&dir)?;
+        sync_created(&created)?;
         Ok(LocalStore { dir, counter: AtomicU64::new(0) })
     }
 
@@ -46,16 +88,17 @@ impl LocalStore {
         Ok(self.dir.join(key))
     }
 
-    /// Writes `data` to a synced temporary file next to `path`.
-    fn write_tmp(&self, path: &Path, data: &[u8]) -> Result<PathBuf> {
+    /// Writes `data` to a synced temporary file next to `path`. Returns
+    /// it and the directories that had to be created for it.
+    fn write_tmp(&self, path: &Path, data: &[u8]) -> Result<(PathBuf, Vec<PathBuf>)> {
         let parent = path.parent().unwrap_or(&self.dir);
-        fs::create_dir_all(parent)?;
+        let created = create_dirs(parent)?;
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         let tmp = parent.join(format!("{TMP_PREFIX}{}-{n}", std::process::id()));
         let mut f = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
-        Ok(tmp)
+        Ok((tmp, created))
     }
 
     fn walk(&self, dir: &Path, prefix: &str, after: &str, out: &mut Vec<ObjectMeta>) -> Result<()> {
@@ -91,18 +134,19 @@ impl LocalStore {
 impl ObjectStore for LocalStore {
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         let path = self.path(key)?;
-        let tmp = self.write_tmp(&path, data)?;
+        let (tmp, created) = self.write_tmp(&path, data)?;
         if let Err(e) = fs::rename(&tmp, &path) {
             let _ = fs::remove_file(&tmp);
             return Err(e.into());
         }
         sync_dir(path.parent().unwrap_or(&self.dir))?;
+        sync_created(&created)?;
         Ok(())
     }
 
     fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool> {
         let path = self.path(key)?;
-        let tmp = self.write_tmp(&path, data)?;
+        let (tmp, created) = self.write_tmp(&path, data)?;
         // A hard link fails if the target exists, which makes creation
         // atomic and exclusive.
         let linked = fs::hard_link(&tmp, &path);
@@ -110,6 +154,7 @@ impl ObjectStore for LocalStore {
         match linked {
             Ok(()) => {
                 sync_dir(path.parent().unwrap_or(&self.dir))?;
+                sync_created(&created)?;
                 Ok(true)
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
@@ -186,5 +231,42 @@ impl ObjectStore for LocalStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    thread_local! {
+        /// Directories synced by this thread, in order.
+        pub(super) static SYNCED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn synced() -> Vec<PathBuf> {
+        SYNCED.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+
+    #[test]
+    fn new_directories_are_synced_with_their_parents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("store");
+        let store = LocalStore::new(&root).unwrap();
+        // Creating the store's own directory syncs its parent.
+        assert_eq!(synced(), [tmp.path().to_path_buf()]);
+
+        store.put("a/b/c/key", b"x").unwrap();
+        let got = synced();
+        let want = [root.join("a/b/c"), root.join("a/b"), root.join("a"), root.clone()];
+        assert_eq!(got, want, "the new object's directory first, then each new directory's parent");
+
+        // Nothing new to create: only the directory holding the object.
+        store.put("a/b/c/other", b"y").unwrap();
+        assert_eq!(synced(), [root.join("a/b/c")]);
+        assert!(store.put_if_absent("a/d/once", b"z").unwrap());
+        assert_eq!(synced(), [root.join("a/d"), root.join("a")]);
     }
 }

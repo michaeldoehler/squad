@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -26,10 +26,11 @@ type FaultFn = dyn Fn(&str, &str) -> Fault + Send + Sync;
 #[derive(Clone, Default)]
 pub struct MemoryStore {
     objects: Arc<Mutex<BTreeMap<String, Arc<Vec<u8>>>>>,
-    faults: Arc<Mutex<Option<Box<FaultFn>>>>,
+    faults: Arc<Mutex<Option<Arc<FaultFn>>>>,
     puts: Arc<AtomicU64>,
     put_bytes: Arc<AtomicU64>,
     requests: Arc<AtomicU64>,
+    ignore_conditions: Arc<AtomicBool>,
 }
 
 impl MemoryStore {
@@ -41,8 +42,19 @@ impl MemoryStore {
     /// should fail. It receives the operation name (`"put"`, `"get"`,
     /// `"list"`, `"delete"`, `"head"`) and the key or prefix. `None`
     /// removes the hook.
+    ///
+    /// The hook runs outside the store's locks, so concurrent operations
+    /// stay concurrent while it, for example, sleeps.
     pub fn set_faults(&self, hook: Option<Box<FaultFn>>) {
-        *self.faults.lock() = hook;
+        *self.faults.lock() = hook.map(Arc::from);
+    }
+
+    /// Makes [`put_if_absent`](ObjectStore::put_if_absent) behave like a
+    /// plain put that reports success, as some S3-compatible services do
+    /// with `If-None-Match: *` (Garage, for one). For testing code that
+    /// must not rely on conditional writes.
+    pub fn set_ignore_conditions(&self, ignore: bool) {
+        self.ignore_conditions.store(ignore, Ordering::SeqCst);
     }
 
     /// Number of successful puts and the bytes they carried.
@@ -62,7 +74,8 @@ impl MemoryStore {
 
     fn fault(&self, op: &str, key: &str) -> Fault {
         self.requests.fetch_add(1, Ordering::Relaxed);
-        match &*self.faults.lock() {
+        let hook = self.faults.lock().clone();
+        match hook {
             Some(hook) => hook(op, key),
             None => Fault::None,
         }
@@ -80,7 +93,7 @@ impl MemoryStore {
         }
         let created = {
             let mut objects = self.objects.lock();
-            if only_if_absent && objects.contains_key(key) {
+            if only_if_absent && !self.ignore_conditions.load(Ordering::SeqCst) && objects.contains_key(key) {
                 false
             } else {
                 objects.insert(key.to_string(), Arc::new(data.to_vec()));

@@ -24,7 +24,7 @@ one, and needs no open port.
             │                                      │
    ┌────────▼──────────────────────────────────────┴────────┐
    │ object store: file:// or s3://                          │
-   │ wal/…   snapshot/…   chunk/…   writer/claim-n, base-n   │
+   │ wal/…   snapshot/…   chunk/…   writer/claim-…, base-…   │
    └─────────────────────────────────────────────────────────┘
 ```
 
@@ -224,15 +224,18 @@ replica.promote()?;        // or, from any client:  SELECT squad_promote();
 
 Promotion turns a replica into the writer, in this order:
 
-1. It **claims the database** in the object store by creating the next
-   `writer/claim-<n>` object with a conditional put, which only one
-   node can win. From this moment the old writer is **fenced**: its
-   next upload is refused, its commit in flight is not acknowledged
-   (`Sync` mode), and it fails all further writes with
+1. It **claims the database** in the object store: it writes a claim
+   for the next epoch under a name of its own and wins only if a
+   listing afterwards shows no competing claim (see
+   [one writer at a time](cloud-storage.md#one-writer-at-a-time); no
+   conditional writes are needed, so this works on Garage). From this
+   moment the old writer is **fenced**: its commit in flight is not
+   acknowledged (`Sync` mode), and it fails all further writes with
    `remote storage: another writer took over`.
 2. It **applies everything the old writer uploaded**, to the last
    record.
-3. It records its starting position (`writer/base-<n>`), starts
+3. It records its starting position and the writer it continues
+   (`writer/base-<n>-<id>`), starts
    shipping its own log, and accepts writes. Sessions that were open
    before the promotion can write without reconnecting; sequences
    continue after the values the old writer handed out.
@@ -343,9 +346,16 @@ replicas are not disturbed.
   read the writer's store.
 - **Columnar queries can be cancelled** in the window after a
   compaction, as described above.
-- The fencing that makes promotion safe relies on the store's
-  conditional put; see the residual risks listed under
-  [one writer at a time](cloud-storage.md#one-writer-at-a-time).
+- The fencing that makes promotion safe relies on the store's listings
+  showing every completed write (read-after-write consistency, which
+  AWS S3 and Garage in its default mode provide); see the residual risks
+  listed under [one writer at a time](cloud-storage.md#one-writer-at-a-time).
+- If two promotions race and the node that applied the old writer's
+  last records loses, it stays a replica and has applied records that
+  the winner's history may not contain (records the old writer
+  uploaded but never got acknowledged). Its next poll notices that its
+  copy is not part of the history and replaces it with a fresh
+  snapshot; reads in between can see those unacknowledged commits.
 
 ## How it is tested
 
@@ -359,7 +369,13 @@ replicas are not disturbed.
   replica holds must be a state the writer went through, and it must
   reach the writer's state once the faults stop), and chains of six
   promotions in a row with an observer replica following through all
-  of them.
+  of them. The promotion and fencing tests run against a store that
+  enforces conditional writes and against one that ignores them.
+- `crates/squad/tests/real_s3.rs` runs against a real S3 service when
+  `SQUAD_TEST_S3_URL` is set (tested with Garage 2.5): a replica
+  following its writer, and two replicas promoted at the same instant
+  while the old writer commits — exactly one node can commit afterwards
+  and no acknowledged commit is lost.
 - `crates/squad/tests/replica.rs` tests the SQL level: data and schema
   changes arriving, every kind of write being refused with `25006`,
   stable snapshots while the writer updates, deletes and vacuums,

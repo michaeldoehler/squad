@@ -1,0 +1,24 @@
+# 2026-11-14T08:02:27Z, 4 cores shared with two other workers building in parallel: indicative only.
+# Store: Garage v2.5.0 single node (replication_factor 1, sqlite metadata) on 127.0.0.1, same machine.
+# Local disk: tempdir, DiskOptions::default() (SyncMode::Sync, fsync per commit group).
+
+# cargo run --release -p squad-storage --example remote_sync_bench -- --seconds 5 --writers 1,8,32
+remote_sync_bench: store s3://squad-test (prefix squad-bench/remote-sync-18e7daa09d37b33e), 5 s per configuration
+commit = one 120-byte row, local fsync (SyncMode::Sync) on every commit; 1 upload(s) in flight
+mode                        writers    commits  commits/s   p50 (ms)  p99 (ms) commits/upload
+local only                        1      34060       6811       0.12      0.46              -
+remote Async 100ms                1      35468       7093       0.12      0.43          788.2
+remote Sync                       1       1013        202       4.85      8.64            1.0
+local only                        8     123427      24672       0.31      1.09              -
+remote Async 100ms                8     106500      21294       0.24      4.06         2597.6
+remote Sync                       8       5564       1110       5.46     30.88            7.9
+local only                       32     194986      38958       0.47      4.33              -
+remote Async 100ms               32     260533      52064       0.47      4.05         6680.3
+remote Sync                      32      13175       2629      10.40     26.48           23.8
+
+# cargo run --release -p squad-storage --example remote_sync_bench -- --seconds 5 --writers 8,32 --modes sync --uploads 2
+remote_sync_bench: store s3://squad-test (prefix squad-bench/remote-sync-18e7daac648a1a03), 5 s per configuration
+commit = one 120-byte row, local fsync (SyncMode::Sync) on every commit; 2 upload(s) in flight
+mode                        writers    commits  commits/s   p50 (ms)  p99 (ms) commits/upload
+remote Sync                       8       6473       1294       5.07     15.73            7.8
+remote Sync                      32      12797       2547      11.27     30.72           27.7

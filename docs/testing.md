@@ -18,6 +18,9 @@ version 0.1; "run on demand" suites are not part of `cargo test`.
 | Does committed data survive? | Crash simulation, storage | 10,000 + 4,000 seeds on demand; 150 + 40 per test run |
 | | Crash simulation, SQL | 150 seeds on demand; 6 per test run |
 | | Remote tiering fault injection | 1,500 seeds on demand; 60 per test run |
+| | Damaged write-ahead log | mid-log damage refused, torn tails tolerated (`squad-storage/tests/wal.rs`) |
+| Is there only ever one writer? | Fencing and claim tests | concurrent claimants and writers, stores with and without conditional writes |
+| Does it work against real S3? | `SQUAD_TEST_S3_URL` suites (on demand) | conformance, restore, replica, concurrent promotions; run against Garage 2.5 |
 | Are columnar tables equivalent to row tables? | Columnar tests | 35 queries × 10 table states; concurrent compaction |
 | Is the column engine itself correct? | Model tests, corruption fuzzing | randomized against a row-at-a-time reference; 3,000 corruptions |
 
@@ -180,13 +183,23 @@ schema changes must be in place.
 **Remote tiering** (`crates/squad-storage/tests/remote.rs`). The object
 store fails, duplicates or half-applies uploads at random; a restore
 into an empty directory must always produce a state the database
-actually had, with every commit acknowledged in sync mode.
+actually had, with every commit acknowledged in sync mode. Further
+tests start several writers at once on stores that enforce and that
+ignore conditional writes (exactly one survives, no acknowledged commit
+is lost), and run twelve committers against a slow, failing store.
+
+**Damaged log** (`crates/squad-storage/tests/wal.rs`). A bit flipped in
+a record that later records vouch for makes the open fail; damage to
+the last record, or among records synced together, is a torn tail.
+The crash simulations above check that real torn tails are never taken
+for corruption.
 
 ```sh
 SQUAD_SIM_SEEDS=10000 SQUAD_SIM_CONCURRENT_SEEDS=2000 \
     cargo test --release -p squad-storage --test crash_sim
 SQUAD_SIM_SEEDS=500 cargo test --release -p squad --test crash_sim
-SQUAD_REMOTE_SEEDS=1500 cargo test --release -p squad-storage --test remote
+SQUAD_REMOTE_SEEDS=1500 SQUAD_REMOTE_CONCURRENT_SEEDS=100 SQUAD_REPLICA_SEEDS=200 \
+    cargo test --release -p squad-storage --test remote --test replica
 ```
 
 A failing seed is reproduced with `SQUAD_SIM_START=<seed>
@@ -247,6 +260,32 @@ rejected with `0A000` instead of answered wrongly. `tests/remote.rs`
 tests remote shards with enums, numerics, arrays and JSON, and shards
 that are unreachable or come back.
 
+## Real S3
+
+Tests against a real S3 service run when `SQUAD_TEST_S3_URL` is set to
+an `s3://bucket?endpoint=…&region=…&access_key=…&secret_key=…` URL;
+otherwise they pass and print `skipped …: SQUAD_TEST_S3_URL not set`
+(visible also without `--nocapture`). Each test works under a key
+prefix of its own and removes it afterwards, so a shared bucket is
+fine.
+
+```sh
+eval "$(scripts/garage-dev.sh start)"   # a local single-node Garage
+cargo test -p squad-object --features test-util --test conformance
+cargo test -p squad --test real_s3
+```
+
+- `squad-object` conformance: the same suite as for the other stores,
+  plus a multipart upload; it reports whether the service enforces
+  `If-None-Match: *` (Garage 2.5 does not) and expects the
+  corresponding behaviour.
+- `crates/squad/tests/real_s3.rs`: restore after losing the machine, a
+  replica following a writer, two concurrent promotions.
+
+The benchmark of commit throughput against a store is
+`cargo run --release -p squad-storage --example remote_sync_bench`
+(see [cloud storage](cloud-storage.md#request-and-storage-cost)).
+
 ## What is not tested yet
 
 - Replication and sharding across real machines and networks: all tests
@@ -254,8 +293,10 @@ that are unreachable or come back.
 
 - Long-running soak tests and production workloads: squad has not run in
   production.
-- The S3 client against Amazon S3 or MinIO; it is tested against an
-  in-repository emulator that verifies request signatures.
+- The S3 client against Amazon S3 or MinIO. It is tested against an
+  in-repository emulator that verifies request signatures, against
+  Garage 2.5 (`SQUAD_TEST_S3_URL`, see below), and its signer against
+  the published examples of the AWS SigV4 test suite.
 - Platforms other than Linux x86-64 (CI also builds and tests on macOS).
 - Performance regressions: benchmarks are run by hand; there is no
   automated gate, because shared CI machines are too noisy to enforce
