@@ -1,0 +1,71 @@
+# Executor cost of the cancel / statement_timeout check (indicative)
+#
+# 2026-11-14, 4-core VM shared with two parallel cargo builds: noisy.
+# squad-main: commit bed110e. dctx/squad: feat/server-hardening, which
+# looks at the cancel flag and the clock every 256 rows.
+# Both built with: CARGO_PROFILE_RELEASE_DEBUG=0 cargo build --release -p squad-server --bin squad
+# Each round pipes this script into `squad shell` and prints the
+# EXPLAIN ANALYZE execution times; the four queries run three times:
+#
+#   CREATE TABLE t (id int PRIMARY KEY, v int);
+#   INSERT INTO t SELECT g, g % 100 FROM generate_series(1, 1000000) g;
+#   EXPLAIN ANALYZE SELECT count(*) FROM generate_series(1, 5000000);                      -- (1)
+#   EXPLAIN ANALYZE SELECT count(*) FROM generate_series(1, 3000) a, generate_series(1, 3000) b;  -- (2)
+#   EXPLAIN ANALYZE SELECT sum(v) FROM t WHERE v > 10;                                     -- (3)
+#   EXPLAIN ANALYZE SELECT count(*) FROM (SELECT v FROM t ORDER BY v) s;                   -- (4)
+#   (queries 1-4 repeated twice more)
+#
+# Result: no difference beyond the noise between runs.
+
+== squad-main round 1
+ Execution Time: 888.615 ms
+ Execution Time: 386.030 ms
+ Execution Time: 502.715 ms
+ Execution Time: 1149.224 ms
+ Execution Time: 391.996 ms
+ Execution Time: 362.966 ms
+ Execution Time: 421.160 ms
+ Execution Time: 1050.960 ms
+ Execution Time: 390.724 ms
+ Execution Time: 363.163 ms
+ Execution Time: 406.777 ms
+ Execution Time: 999.273 ms
+== dctx/squad round 1
+ Execution Time: 884.989 ms
+ Execution Time: 542.526 ms
+ Execution Time: 412.962 ms
+ Execution Time: 1046.454 ms
+ Execution Time: 370.550 ms
+ Execution Time: 354.105 ms
+ Execution Time: 391.331 ms
+ Execution Time: 996.516 ms
+ Execution Time: 445.014 ms
+ Execution Time: 529.982 ms
+ Execution Time: 421.127 ms
+ Execution Time: 983.953 ms
+== squad-main round 2
+ Execution Time: 898.940 ms
+ Execution Time: 364.319 ms
+ Execution Time: 396.888 ms
+ Execution Time: 1012.783 ms
+ Execution Time: 474.684 ms
+ Execution Time: 452.749 ms
+ Execution Time: 510.854 ms
+ Execution Time: 1074.976 ms
+ Execution Time: 400.397 ms
+ Execution Time: 378.427 ms
+ Execution Time: 391.772 ms
+ Execution Time: 929.188 ms
+== dctx/squad round 2
+ Execution Time: 853.033 ms
+ Execution Time: 355.201 ms
+ Execution Time: 395.321 ms
+ Execution Time: 991.693 ms
+ Execution Time: 391.640 ms
+ Execution Time: 402.223 ms
+ Execution Time: 437.362 ms
+ Execution Time: 924.332 ms
+ Execution Time: 371.157 ms
+ Execution Time: 414.688 ms
+ Execution Time: 391.324 ms
+ Execution Time: 997.507 ms

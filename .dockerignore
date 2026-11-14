@@ -1,0 +1,31 @@
+# Build output and local state
+target/
+**/target/
+data/
+*.squad-tmp
+**/*.rs.bk
+.DS_Store
+
+# Version control and editor/agent settings
+.git/
+.github/
+.claude/
+.idea/
+.vscode/
+
+# Not needed to build the binary
+benchmarks/
+docs/
+*.md
+!README.md
+!crates/**/README.md
+crates/squad-sqllogictest/slt/
+crates/squad/tests/data/
+crates/squad-server/tests/fixtures/
+
+# Secrets that might lie around in a working copy
+*.pem
+*.key
+*.crt
+.env
+.env.*

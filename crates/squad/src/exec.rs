@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use squad_kv::{Cursor, Isolation, LockMode, Txn, WaitPolicy};
 
@@ -50,7 +50,15 @@ pub struct ExecCx<'a> {
     pub dropped_objects: Vec<String>,
     /// Rows inserted into columnar tables by this statement.
     pub columnar_inserted: HashMap<u32, u64>,
+    /// When `statement_timeout` expires.
+    deadline: Option<Instant>,
+    /// Calls of [`ExecCx::check_interrupts`] since the last real check.
+    ticks: u32,
 }
+
+/// How many rows the executor processes between two looks at the cancel
+/// flag and the clock.
+const INTERRUPT_INTERVAL: u32 = 256;
 
 impl<'a> ExecCx<'a> {
     pub fn new(
@@ -69,14 +77,40 @@ impl<'a> ExecCx<'a> {
             outer: Vec::new(),
             nl_left: Vec::new(),
             fn_ctx,
-            session,
             shared,
             sub_cache: (0..subqueries).map(|_| None).collect(),
             ctes: HashMap::new(),
             rows_affected: 0,
             dropped_objects: Vec::new(),
             columnar_inserted: HashMap::new(),
+            deadline: session.statement_timeout.map(|d| Instant::now() + d),
+            ticks: 0,
+            session,
         }
+    }
+
+    /// Fails with SQLSTATE 57014 once the statement was cancelled or ran
+    /// past `statement_timeout`. Loops of the executor call this once per
+    /// row; the flag and the clock are only read every few hundred calls.
+    #[inline]
+    pub(crate) fn check_interrupts(&mut self) -> Result<()> {
+        self.ticks += 1;
+        if self.ticks < INTERRUPT_INTERVAL {
+            return Ok(());
+        }
+        self.ticks = 0;
+        self.check_interrupts_now()
+    }
+
+    #[cold]
+    fn check_interrupts_now(&mut self) -> Result<()> {
+        if self.session.cancel.take() {
+            return Err(crate::session::canceled_error());
+        }
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(Error::new(sqlstate::QUERY_CANCELED, "canceling statement due to statement timeout"));
+        }
+        Ok(())
     }
 
     pub fn wait_policy(&self) -> WaitPolicy {
@@ -225,6 +259,7 @@ pub fn collect(plan: &Plan, cx: &mut ExecCx) -> Result<Vec<Row>> {
     let mut node = open(plan, cx)?;
     let mut rows = Vec::new();
     while let Some(r) = node.next(cx)? {
+        cx.check_interrupts()?;
         rows.push(r);
     }
     Ok(rows)
@@ -561,6 +596,7 @@ impl Node for ScanNode<'_> {
     fn next(&mut self, cx: &mut ExecCx) -> Result<Option<Row>> {
         let table = &self.plan.table;
         loop {
+            cx.check_interrupts()?;
             let bytes = match &mut self.state {
                 ScanState::Done => return Ok(None),
                 ScanState::Point(key) => {
@@ -606,6 +642,7 @@ struct FilterNode<'p> {
 impl Node for FilterNode<'_> {
     fn next(&mut self, cx: &mut ExecCx) -> Result<Option<Row>> {
         while let Some(row) = self.input.next(cx)? {
+            cx.check_interrupts()?;
             if self.pred.test(&row, cx)? {
                 return Ok(Some(row));
             }
@@ -754,6 +791,7 @@ impl Node for NestedLoopNode<'_> {
             }
             let (left, right, pos, matched) = self.current.as_mut().unwrap();
             while *pos < right.len() {
+                cx.check_interrupts()?;
                 let row = concat(left, &right[*pos]);
                 *pos += 1;
                 let ok = match self.on {
@@ -801,6 +839,7 @@ fn nested_loop_outer(
     for l in &lrows {
         let mut matched = false;
         for (i, r) in rrows.iter().enumerate() {
+            cx.check_interrupts()?;
             let row = concat(l, r);
             if match on {
                 Some(on) => on.test(&row, cx)?,
@@ -908,6 +947,7 @@ impl Node for HashJoinNode<'_> {
             if let Some(key) = join_key(self.left_keys, &left, cx)? {
                 if let Some(candidates) = self.table.get(&key) {
                     for &i in candidates.iter().rev() {
+                        cx.check_interrupts()?;
                         let row = concat(&left, &self.build[i]);
                         if match self.filter {
                             Some(f) => f.test(&row, cx)?,
@@ -972,6 +1012,7 @@ pub(crate) fn compare_keys(a: &[Value], b: &[Value], keys: &[SortKey]) -> Orderi
 pub(crate) fn sort_rows(input: Vec<Row>, keys: &[SortKey], cx: &mut ExecCx) -> Result<Vec<Row>> {
     let mut keyed = Vec::with_capacity(input.len());
     for row in input {
+        cx.check_interrupts()?;
         let mut k = Vec::with_capacity(keys.len());
         for key in keys {
             k.push(key.expr.eval(&row, cx)?);
@@ -1115,6 +1156,7 @@ fn srf_rows(func: &Srf, args: Vec<Value>, cx: &mut ExecCx) -> Result<Vec<Row>> {
                     )?;
                     let mut cur = start;
                     while (sign > 0 && cur <= end) || (sign < 0 && cur >= end) {
+                        cx.check_interrupts()?;
                         let v = if tz { Value::TimestampTz(cur) } else { Value::Timestamp(cur) };
                         out.push(one(v.clone()));
                         cur = match (plus.eval)(&cx.fn_ctx, &[v, Value::Interval(Interval { ..step })])? {
@@ -1133,6 +1175,7 @@ fn srf_rows(func: &Srf, args: Vec<Value>, cx: &mut ExecCx) -> Result<Vec<Row>> {
                     }
                     let mut cur = *start;
                     while (step.is_sign_positive() && cur <= *end) || (step.is_sign_negative() && cur >= *end) {
+                        cx.check_interrupts()?;
                         out.push(one(Value::Numeric(cur)));
                         cur += step;
                     }
@@ -1148,6 +1191,7 @@ fn srf_rows(func: &Srf, args: Vec<Value>, cx: &mut ExecCx) -> Result<Vec<Row>> {
                     let wide = matches!(a, Value::Int8(_));
                     let mut cur = start;
                     while (step > 0 && cur <= end) || (step < 0 && cur >= end) {
+                        cx.check_interrupts()?;
                         out.push(one(if wide { Value::Int8(cur) } else { Value::Int4(cur as i32) }));
                         match cur.checked_add(step) {
                             Some(n) => cur = n,

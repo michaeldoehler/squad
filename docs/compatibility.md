@@ -75,16 +75,40 @@ How the evidence is produced is described in [testing](testing.md).
   `RELEASE`, `SET TRANSACTION`. DDL is transactional.
 - **Session:** `SET`, `SHOW`, `RESET`, `SET TIME ZONE`, `PREPARE`,
   `EXECUTE`, `DEALLOCATE`, `DISCARD ALL`, `EXPLAIN [ANALYZE]`,
-  `CHECKPOINT`, `VACUUM`, `ANALYZE`.
+  `CHECKPOINT`, `VACUUM`, `ANALYZE`, `SET statement_timeout`.
+- **`LOCK TABLE`** in the modes `ACCESS SHARE`, `ROW SHARE`, `ROW
+  EXCLUSIVE` and `EXCLUSIVE`, with `NOWAIT`; see
+  [transactions](transactions.md#table-locks). The other modes fail with
+  `0A000`.
 
 ### Accepted without effect
 
-So that dumps and migration scripts run: `CREATE EXTENSION`, `COMMENT
-ON`, `GRANT`, `REVOKE`, `ALTER … OWNER TO`, `CREATE/ALTER/DROP ROLE`,
-`LOCK TABLE`, `SET CONSTRAINTS`, `REINDEX`, `CLUSTER`, `ANALYZE`, table
-storage options, `DEFERRABLE`, and `COLLATE` clauses (text always
-compares bytewise). There are no roles or privileges: whoever can
-connect can do everything.
+So that dumps and migration scripts run, these statements succeed
+without doing anything. Where the missing effect could matter, squad
+sends a warning or notice with the result (a `NoticeResponse` on the
+wire, `QueryResult::notices` in the embedding API); PostgreSQL sends
+none for these statements, so clients that print notices, like psql,
+show an extra line.
+
+| Statement | Message | Why |
+| --- | --- | --- |
+| `GRANT`, `REVOKE` (on objects and roles), `ALTER DEFAULT PRIVILEGES` | WARNING | There are no privileges: whoever can connect can do everything. `GRANT`/`REVOKE` on a table that does not exist still fails with `42P01`. |
+| `CREATE/ALTER/DROP ROLE`, `CREATE USER`, `CREATE GROUP` | WARNING | There are no roles in SQL. Logins are configured on the server ([server](server.md#authentication)). |
+| `ALTER TABLE … ENABLE ROW LEVEL SECURITY` | WARNING | No row-level security; `CREATE POLICY` fails with `0A000`. |
+| `SET CONSTRAINTS … DEFERRED` | WARNING | Constraints are always checked immediately. |
+| `CREATE EXTENSION` | NOTICE | No extensions. Functions squad provides (such as `gen_random_uuid()`) are built in. |
+| `COMMENT ON` | NOTICE | Comments are not stored. |
+| `ALTER … OWNER TO` | NOTICE | No object owners. |
+| `SET CONSTRAINTS … IMMEDIATE` | none | Already the behaviour. |
+| `REINDEX`, `CLUSTER`, `ALTER TABLE … CLUSTER ON` | none | Indexes never need rebuilding; rows are kept in primary key order. No query result can change. |
+| `ANALYZE` | none | There are no statistics to collect. |
+| `ALTER TABLE … SET (storage options)`, `SET STATISTICS`, `SET STORAGE`, `SET LOGGED/UNLOGGED`, `REPLICA IDENTITY`, `VALIDATE CONSTRAINT`, `DISABLE ROW LEVEL SECURITY`, `ENABLE/DISABLE TRIGGER` | none | Physical or planner settings without a counterpart; constraints are validated when they are added; there are no triggers. |
+| `DEFERRABLE` / `INITIALLY DEFERRED` in table definitions | none | Constraints are checked immediately. |
+| `COLLATE` clauses | none | Text always compares bytewise. |
+| `idle_in_transaction_session_timeout` and other unknown settings | none | `SET` stores the value, `SHOW` returns it. |
+
+Advisory lock functions (`pg_advisory_lock` and friends) also succeed
+without locking anything; see [transactions](transactions.md).
 
 `CREATE MATERIALIZED VIEW` creates an ordinary table from the query;
 there is no `REFRESH`.

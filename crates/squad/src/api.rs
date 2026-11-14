@@ -12,7 +12,7 @@ use squad_storage::{
 
 use crate::bind::OutputColumn;
 use crate::convert::{FromSql, ToSql};
-use crate::session::{Prepared, QueryResult, Session, Shared};
+use crate::session::{CancelHandle, Prepared, QueryResult, Session, Shared};
 use crate::types::{Type, Value};
 use crate::{sqlstate, Error, Result};
 
@@ -136,7 +136,9 @@ impl Database {
     /// Opens a new connection (session). Connections are independent:
     /// each has its own transaction state and settings.
     pub fn connect(&self) -> Connection {
-        Connection { inner: Arc::new(Mutex::new(Session::new(self.shared.clone()))) }
+        let session = Session::new(self.shared.clone());
+        let cancel = session.cancel_handle();
+        Connection { inner: Arc::new(Mutex::new(session)), cancel }
     }
 
     /// Opens a raw session, the interface protocol servers build on.
@@ -178,6 +180,7 @@ impl Database {
 #[derive(Clone)]
 pub struct Connection {
     inner: Arc<Mutex<Session>>,
+    cancel: CancelHandle,
 }
 
 fn to_values(params: &[&dyn ToSql]) -> Vec<Value> {
@@ -215,17 +218,17 @@ impl Connection {
     /// parameters. Several statements run as one transaction unless the
     /// text controls transactions itself.
     pub fn batch_execute(&self, sql: &str) -> Result<()> {
-        self.inner.lock().execute(sql).map(|_| ())
+        self.start().execute(sql).map(|_| ())
     }
 
     /// Like [`batch_execute`](Connection::batch_execute), returning the
     /// result of every statement.
     pub fn simple_query(&self, sql: &str) -> Result<Vec<QueryResult>> {
-        self.inner.lock().execute(sql)
+        self.start().execute(sql)
     }
 
     fn run(&self, sql: &str, params: &[&dyn ToSql]) -> Result<QueryResult> {
-        let mut session = self.inner.lock();
+        let mut session = self.start();
         if params.is_empty() {
             let mut results = session.execute(sql)?;
             return results.pop().ok_or_else(|| Error::syntax("empty statement"));
@@ -242,6 +245,38 @@ impl Connection {
     pub fn transaction(&self) -> Result<Transaction<'_>> {
         self.batch_execute("BEGIN")?;
         Ok(Transaction { conn: self, done: false })
+    }
+
+    /// A handle that cancels the statement running on this connection
+    /// from another thread, e.g. when a request deadline passes. The
+    /// statement fails with SQLSTATE `57014`.
+    ///
+    /// A request made while no statement runs is discarded when the next
+    /// statement starts.
+    ///
+    /// ```no_run
+    /// # let db = squad::Database::open_in_memory()?;
+    /// let conn = db.connect();
+    /// let cancel = conn.cancel_handle();
+    /// let worker = std::thread::spawn(move || {
+    ///     conn.query("SELECT count(*) FROM generate_series(1, 100000) a, generate_series(1, 100000) b", &[])
+    /// });
+    /// std::thread::sleep(std::time::Duration::from_secs(1));
+    /// cancel.cancel();
+    /// let err = worker.join().unwrap().unwrap_err();
+    /// assert_eq!(err.code(), "57014");
+    /// # Ok::<(), squad::Error>(())
+    /// ```
+    pub fn cancel_handle(&self) -> CancelHandle {
+        self.cancel.clone()
+    }
+
+    /// Locks the session for a new request. A cancel request that arrived
+    /// while nothing ran is dropped here rather than cancelling this one.
+    fn start(&self) -> parking_lot::MutexGuard<'_, Session> {
+        let session = self.inner.lock();
+        session.clear_cancel();
+        session
     }
 
     /// True while a transaction block is open on this connection.
@@ -292,7 +327,7 @@ pub struct Statement {
 
 impl Statement {
     fn run(&self, params: &[&dyn ToSql]) -> Result<QueryResult> {
-        self.conn.inner.lock().execute_prepared(&self.prepared, &to_values(params))
+        self.conn.start().execute_prepared(&self.prepared, &to_values(params))
     }
 
     /// Runs the statement and returns the number of rows it changed.

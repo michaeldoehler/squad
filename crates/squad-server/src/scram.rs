@@ -16,7 +16,12 @@ fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
 }
 
 /// What the server stores per user instead of the password.
-#[derive(Clone)]
+///
+/// Its text form is PostgreSQL's (`pg_authid.rolpassword`):
+/// `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`, with the
+/// last three in base64. It can be produced with `squad hash-password` or
+/// copied from PostgreSQL.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Verifier {
     pub salt: Vec<u8>,
     pub iterations: u32,
@@ -38,6 +43,59 @@ impl Verifier {
         let stored_key: [u8; 32] = Sha256::digest(client_key).into();
         let server_key = hmac(&salted, b"Server Key");
         Verifier { salt, iterations, stored_key, server_key }
+    }
+}
+
+impl Verifier {
+    /// Parses PostgreSQL's text form of a verifier.
+    pub fn parse(text: &str) -> Result<Verifier, String> {
+        let malformed = || {
+            "malformed SCRAM-SHA-256 verifier (expected SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>)"
+                .to_string()
+        };
+        let rest = text.strip_prefix("SCRAM-SHA-256$").ok_or_else(malformed)?;
+        let (params, keys) = rest.split_once('$').ok_or_else(malformed)?;
+        let (iterations, salt) = params.split_once(':').ok_or_else(malformed)?;
+        let (stored, server) = keys.split_once(':').ok_or_else(malformed)?;
+        let iterations: u32 = iterations.parse().ok().filter(|i| *i > 0).ok_or_else(malformed)?;
+        let salt = B64.decode(salt).map_err(|_| malformed())?;
+        let key = |k: &str| -> Result<[u8; 32], String> {
+            B64.decode(k).ok().and_then(|v| v.try_into().ok()).ok_or_else(malformed)
+        };
+        Ok(Verifier { salt, iterations, stored_key: key(stored)?, server_key: key(server)? })
+    }
+
+    /// True if `password` is the password this verifier was made from.
+    /// Used for clear-text password authentication.
+    pub fn matches_password(&self, password: &str) -> bool {
+        let other = Verifier::with_salt(password, self.salt.clone(), self.iterations);
+        let diff = other
+            .stored_key
+            .iter()
+            .chain(&other.server_key)
+            .zip(self.stored_key.iter().chain(&self.server_key))
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        diff == 0
+    }
+}
+
+impl std::fmt::Display for Verifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SCRAM-SHA-256${}:{}${}:{}",
+            self.iterations,
+            B64.encode(&self.salt),
+            B64.encode(self.stored_key),
+            B64.encode(self.server_key)
+        )
+    }
+}
+
+/// Never prints the keys.
+impl std::fmt::Debug for Verifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Verifier").field("iterations", &self.iterations).finish_non_exhaustive()
     }
 }
 
@@ -153,6 +211,22 @@ mod tests {
         let (proof, server) = client_proof("pencil", &salt, 4096, auth);
         assert_eq!(B64.encode(proof), "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
         assert_eq!(B64.encode(server), "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
+    }
+
+    #[test]
+    fn verifier_text_form_matches_postgresql() {
+        // Produced by PostgreSQL 16: SET password_encryption = 'scram-sha-256';
+        // CREATE ROLE u PASSWORD 'secret'; SELECT rolpassword FROM pg_authid;
+        let pg = "SCRAM-SHA-256$4096:2p69YhUMsuJ9UY9GhURkFg==$btRVJP5LmOQTVAAf2sXJeDPPa4dj3mYOSahIsXWl8SU=:VQGgrY+lvmyvr0xiP+b7VjMzf4JJlB+lf1XRYBAA4Yc=";
+        let parsed = Verifier::parse(pg).unwrap();
+        assert_eq!(parsed.to_string(), pg);
+        assert!(parsed == Verifier::with_salt("secret", parsed.salt.clone(), 4096));
+        assert!(parsed.matches_password("secret"));
+        assert!(!parsed.matches_password("Secret"));
+        for bad in ["", "md5abc", "SCRAM-SHA-256$x:abc$a:b", "SCRAM-SHA-256$4096:c2FsdA==$AAAA:AAAA"] {
+            assert!(Verifier::parse(bad).is_err(), "{bad}");
+        }
+        assert!(!format!("{parsed:?}").contains(&B64.encode(parsed.stored_key)));
     }
 
     #[test]

@@ -4,32 +4,67 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-/// Largest message the server accepts from a client.
-pub const MAX_MESSAGE_LEN: usize = 1 << 30;
+/// Largest message a client may send before it has authenticated. The
+/// startup packet has the same limit in PostgreSQL.
+pub const PRE_AUTH_MAX_MESSAGE_LEN: usize = 10_000;
 
-/// A client connection over TCP or a Unix domain socket.
+type TlsStream = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
+
+/// A client connection over TCP, TLS over TCP, or a Unix domain socket.
 pub enum Stream {
     Tcp(TcpStream),
+    Tls(Box<TlsStream>),
     #[cfg(unix)]
     Unix(UnixStream),
+    /// Only while the connection is being switched to TLS.
+    Detached,
+}
+
+fn detached() -> io::Error {
+    io::Error::new(io::ErrorKind::NotConnected, "connection is being switched to TLS")
 }
 
 impl Stream {
     pub fn try_clone(&self) -> io::Result<Stream> {
         Ok(match self {
             Stream::Tcp(s) => Stream::Tcp(s.try_clone()?),
+            Stream::Tls(s) => Stream::Tcp(s.sock.try_clone()?),
             #[cfg(unix)]
             Stream::Unix(s) => Stream::Unix(s.try_clone()?),
+            Stream::Detached => return Err(detached()),
         })
     }
 
     pub fn shutdown(&self) {
         let _ = match self {
             Stream::Tcp(s) => s.shutdown(Shutdown::Both),
+            Stream::Tls(s) => s.sock.shutdown(Shutdown::Both),
             #[cfg(unix)]
             Stream::Unix(s) => s.shutdown(Shutdown::Both),
+            Stream::Detached => Ok(()),
         };
+    }
+
+    /// True for TCP connections, encrypted or not.
+    pub fn is_tcp(&self) -> bool {
+        matches!(self, Stream::Tcp(_) | Stream::Tls(_))
+    }
+
+    pub fn is_tls(&self) -> bool {
+        matches!(self, Stream::Tls(_))
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.set_read_timeout(timeout),
+            Stream::Tls(s) => s.sock.set_read_timeout(timeout),
+            #[cfg(unix)]
+            Stream::Unix(s) => s.set_read_timeout(timeout),
+            Stream::Detached => Err(detached()),
+        }
     }
 }
 
@@ -37,8 +72,10 @@ impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Stream::Tcp(s) => s.read(buf),
+            Stream::Tls(s) => s.read(buf),
             #[cfg(unix)]
             Stream::Unix(s) => s.read(buf),
+            Stream::Detached => Err(detached()),
         }
     }
 }
@@ -47,16 +84,28 @@ impl Write for Stream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Stream::Tcp(s) => s.write(buf),
+            Stream::Tls(s) => s.write(buf),
             #[cfg(unix)]
             Stream::Unix(s) => s.write(buf),
+            Stream::Detached => Err(detached()),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Stream::Tcp(s) => s.flush(),
+            Stream::Tls(s) => s.flush(),
             #[cfg(unix)]
             Stream::Unix(s) => s.flush(),
+            Stream::Detached => Err(detached()),
         }
+    }
+}
+
+/// A read that ran into the socket's timeout reports `WouldBlock` on Unix.
+fn timed_out(e: io::Error) -> io::Error {
+    match e.kind() {
+        io::ErrorKind::WouldBlock => io::ErrorKind::TimedOut.into(),
+        _ => e,
     }
 }
 
@@ -72,16 +121,87 @@ pub struct Io {
     inbuf: Vec<u8>,
     inpos: usize,
     pub out: Vec<u8>,
+    /// Reads fail with [`io::ErrorKind::TimedOut`] after this instant.
+    pub deadline: Option<Instant>,
+    /// A read timeout is set on the socket.
+    timeout_set: bool,
+    /// Largest typed message accepted.
+    pub max_message: usize,
 }
 
 impl Io {
     pub fn new(stream: Stream) -> Io {
-        Io { stream, inbuf: Vec::with_capacity(8192), inpos: 0, out: Vec::with_capacity(8192) }
+        Io {
+            stream,
+            inbuf: Vec::with_capacity(8192),
+            inpos: 0,
+            out: Vec::with_capacity(8192),
+            deadline: None,
+            timeout_set: false,
+            max_message: PRE_AUTH_MAX_MESSAGE_LEN,
+        }
+    }
+
+    pub fn stream(&self) -> &Stream {
+        &self.stream
+    }
+
+    /// Switches the connection to TLS after the server answered an
+    /// SSLRequest with 'S', and completes the handshake.
+    pub fn start_tls(&mut self, config: Arc<rustls::ServerConfig>) -> io::Result<()> {
+        if self.inbuf.len() > self.inpos {
+            // The client sent data the encryption would not cover
+            // (CVE-2021-23214).
+            return Err(protocol_error("received unencrypted data after SSL request"));
+        }
+        self.flush()?;
+        let Stream::Tcp(sock) = std::mem::replace(&mut self.stream, Stream::Detached) else {
+            return Err(protocol_error("TLS is only available over TCP"));
+        };
+        if let Some(remaining) = self.remaining()? {
+            sock.set_read_timeout(Some(remaining))?;
+            self.timeout_set = true;
+        }
+        let conn = rustls::ServerConnection::new(config).map_err(io::Error::other)?;
+        let mut tls = rustls::StreamOwned::new(conn, sock);
+        while tls.conn.is_handshaking() {
+            tls.conn.complete_io(&mut tls.sock).map_err(timed_out)?;
+        }
+        self.stream = Stream::Tls(Box::new(tls));
+        Ok(())
+    }
+
+    /// Time left until the deadline; an error once it has passed.
+    fn remaining(&self) -> io::Result<Option<Duration>> {
+        match self.deadline {
+            None => Ok(None),
+            Some(d) => match d.checked_duration_since(Instant::now()) {
+                Some(left) if !left.is_zero() => Ok(Some(left)),
+                _ => Err(io::ErrorKind::TimedOut.into()),
+            },
+        }
+    }
+
+    /// Bounds the next socket read by the deadline.
+    fn arm_read_timeout(&mut self) -> io::Result<()> {
+        match self.remaining()? {
+            Some(left) => {
+                self.stream.set_read_timeout(Some(left))?;
+                self.timeout_set = true;
+            }
+            None if self.timeout_set => {
+                self.stream.set_read_timeout(None)?;
+                self.timeout_set = false;
+            }
+            None => {}
+        }
+        Ok(())
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
         if !self.out.is_empty() {
             self.stream.write_all(&self.out)?;
+            self.stream.flush()?;
             self.out.clear();
             if self.out.capacity() > 1 << 20 {
                 self.out.shrink_to(8192);
@@ -103,7 +223,8 @@ impl Io {
         self.flush()?;
         let mut chunk = [0u8; 16384];
         while self.inbuf.len() < n {
-            let got = self.stream.read(&mut chunk)?;
+            self.arm_read_timeout()?;
+            let got = self.stream.read(&mut chunk).map_err(timed_out)?;
             if got == 0 {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
@@ -122,7 +243,7 @@ impl Io {
     /// cancel request): `(code, payload)`.
     pub fn read_startup(&mut self) -> io::Result<(u32, Vec<u8>)> {
         let len = u32::from_be_bytes(self.take(4)?.try_into().unwrap()) as usize;
-        if !(8..=10_000).contains(&len) {
+        if !(8..=PRE_AUTH_MAX_MESSAGE_LEN).contains(&len) {
             return Err(protocol_error("invalid length of startup packet"));
         }
         let body = self.take(len - 4)?;
@@ -141,8 +262,14 @@ impl Io {
         let header = self.take(5)?;
         let ty = header[0];
         let len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
-        if !(4..=MAX_MESSAGE_LEN).contains(&len) {
+        if len < 4 {
             return Err(protocol_error("invalid message length"));
+        }
+        if len > self.max_message {
+            return Err(protocol_error(format!(
+                "message of {len} bytes exceeds the limit of {} bytes",
+                self.max_message
+            )));
         }
         Ok(Some((ty, self.take(len - 4)?.to_vec())))
     }

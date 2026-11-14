@@ -164,6 +164,46 @@ match conn.execute("INSERT INTO users (email) VALUES ($1)", &[&email]) {
 }
 ```
 
+## Notices
+
+Some statements succeed with a warning or notice, for example `GRANT`,
+which squad accepts without effect (see
+[compatibility](compatibility.md#accepted-without-effect)). They arrive
+in `QueryResult::notices` of `Connection::simple_query` and of the
+`Session` methods; `execute`, `query` and `batch_execute` discard them.
+
+```rust
+for r in conn.simple_query("GRANT SELECT ON users TO reporting")? {
+    for n in &r.notices {
+        eprintln!("{n}");   // WARNING: squad has no privileges; GRANT has no effect
+    }
+}
+```
+
+## Cancelling and timeouts
+
+A statement can be stopped from another thread, for example when an
+HTTP request's deadline passes:
+
+```rust
+let cancel = conn.cancel_handle();          // cheap to clone, Send + Sync
+let timer = std::thread::spawn(move || {
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    cancel.cancel();
+});
+match conn.query("SELECT … expensive …", &[]) {
+    Err(e) if e.code() == sqlstate::QUERY_CANCELED => { /* gave up */ }
+    other => { other?; }
+}
+```
+
+The statement fails with SQLSTATE `57014`, and its transaction is rolled
+back (inside a transaction block, the block is marked failed). A cancel
+request made while no statement runs is discarded when the next one
+starts. `SET statement_timeout = '2s'` does the same per statement
+without a second thread. What is and is not interruptible is listed in
+[transactions](transactions.md#cancelling-statements-and-statement_timeout).
+
 ## Using several threads
 
 ```rust
@@ -197,8 +237,10 @@ let server = db.serve("127.0.0.1:5432")?;
 // the embedded API.
 ```
 
-See [server](server.md) for authentication, Unix sockets and tool
-compatibility.
+`serve` trusts every client, so it only accepts loopback addresses; to
+listen on other interfaces, configure passwords (and TLS) through
+`squad_server::Server`. See [server](server.md) for authentication, TLS,
+limits, Unix sockets and tool compatibility.
 
 ## Maintenance
 

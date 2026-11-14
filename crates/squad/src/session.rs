@@ -311,10 +311,45 @@ pub struct SessionState {
     pub settings: HashMap<String, String>,
     pub tz: chrono_tz::Tz,
     pub lock_timeout: Option<Duration>,
+    /// `statement_timeout`: a statement running longer fails with 57014.
+    pub statement_timeout: Option<Duration>,
     pub currval: HashMap<u32, i64>,
     pub lastval: Option<i64>,
     pub default_isolation: Isolation,
     pub pid: i32,
+    pub(crate) cancel: CancelHandle,
+    /// Notices raised by the running statement.
+    pub(crate) notices: Vec<crate::Notice>,
+}
+
+/// Asks the statement running on a session to stop, from another thread.
+///
+/// The executor checks the request between rows; the statement then fails
+/// with SQLSTATE `57014` ("canceling statement due to user request") and
+/// its transaction is rolled back like after any other error. A request
+/// made while no statement runs is discarded when the next statement
+/// starts through [`Connection`](crate::Connection) or the wire protocol.
+#[derive(Debug, Clone, Default)]
+pub struct CancelHandle(Arc<AtomicBool>);
+
+impl CancelHandle {
+    /// Requests cancellation of the running statement.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// True if a request is pending; clears it.
+    pub(crate) fn take(&self) -> bool {
+        self.0.load(Ordering::Relaxed) && self.0.swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn clear(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn canceled_error() -> Error {
+    Error::new(sqlstate::QUERY_CANCELED, "canceling statement due to user request")
 }
 
 /// Command tag and kind of a statement.
@@ -368,6 +403,9 @@ pub struct QueryResult {
     /// Postgres command tag, e.g. `INSERT 0 1`.
     pub tag: String,
     pub rows_affected: u64,
+    /// Warnings and notices the statement raised, e.g. that it was
+    /// accepted without effect.
+    pub notices: Vec<crate::Notice>,
 }
 
 pub(crate) struct TxnState {
@@ -445,10 +483,13 @@ impl Session {
                 settings: HashMap::new(),
                 tz: chrono_tz::UTC,
                 lock_timeout: None,
+                statement_timeout: None,
                 currval: HashMap::new(),
                 lastval: None,
                 default_isolation: Isolation::ReadCommitted,
                 pid,
+                cancel: CancelHandle::default(),
+                notices: Vec::new(),
             },
             txn: None,
             named: HashMap::new(),
@@ -468,6 +509,26 @@ impl Session {
 
     pub fn state_mut(&mut self) -> &mut SessionState {
         &mut self.state
+    }
+
+    /// A handle with which another thread can cancel the statement this
+    /// session is running.
+    pub fn cancel_handle(&self) -> CancelHandle {
+        self.state.cancel.clone()
+    }
+
+    /// Discards a cancel request that arrived while no statement ran.
+    /// Call it before starting a new request.
+    pub fn clear_cancel(&self) {
+        self.state.cancel.clear();
+    }
+
+    /// Fails with 57014 if a cancel request is pending (and clears it).
+    pub fn check_canceled(&self) -> Result<()> {
+        if self.state.cancel.take() {
+            return Err(canceled_error());
+        }
+        Ok(())
     }
 
     pub fn status(&self) -> TxnStatus {
@@ -793,7 +854,8 @@ impl Session {
             stmt
         };
 
-        match &stmt.kind {
+        self.state.notices.clear();
+        let result = match &stmt.kind {
             Kind::Empty => Ok(QueryResult::default()),
             Kind::Utility(node) => {
                 let n = node.node.as_ref().ok_or_else(|| Error::internal("empty utility statement"))?;
@@ -811,7 +873,19 @@ impl Session {
                 let result = self.run_plan(stmt, plan, *subqueries, tables, *read_only, &params);
                 self.after_statement(result)
             }
-        }
+        };
+        let notices = std::mem::take(&mut self.state.notices);
+        result.map(|mut r| {
+            // `EXECUTE` returns the result of the statement it ran, which
+            // already carries that statement's notices.
+            r.notices.extend(notices);
+            r
+        })
+    }
+
+    /// Queues a notice for the result of the running statement.
+    pub(crate) fn notice(&mut self, notice: crate::Notice) {
+        self.state.notices.push(notice);
     }
 
     fn check_not_failed(&self) -> Result<()> {
@@ -908,7 +982,7 @@ impl Session {
             Tag::Delete => (format!("DELETE {affected}"), affected),
             Tag::Other(t) => (t.to_string(), affected),
         };
-        Ok(QueryResult { columns: stmt.columns.clone(), rows, tag, rows_affected })
+        Ok(QueryResult { columns: stmt.columns.clone(), rows, tag, rows_affected, notices: Vec::new() })
     }
 
     // ---------------------------------------------------------------
@@ -1126,6 +1200,13 @@ impl Session {
     /// Takes the exclusive table lock that keeps writers out during DDL.
     pub(crate) fn lock_table_exclusive(txn: &mut Txn, id: u32, wait: WaitPolicy) -> Result<()> {
         txn.lock(&table_lock_key(id), LockMode::Exclusive, wait)?;
+        Ok(())
+    }
+
+    /// Takes the table lock in `mode` until the end of the transaction:
+    /// shared is what writers hold, exclusive what DDL holds.
+    pub(crate) fn lock_table(txn: &mut Txn, id: u32, mode: LockMode, wait: WaitPolicy) -> Result<()> {
+        txn.lock(&table_lock_key(id), mode, wait)?;
         Ok(())
     }
 

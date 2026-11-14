@@ -19,7 +19,7 @@ use crate::exec::{decode_table_row, row_key};
 use crate::expr::Row;
 use crate::session::{feature, QueryResult, Session, SessionState};
 use crate::types::{Type, Value};
-use crate::{sqlstate, Error, Result};
+use crate::{sqlstate, Error, Notice, Result};
 
 const ROWID_COLUMN: &str = "__rowid";
 
@@ -82,7 +82,8 @@ pub(crate) fn show_setting(state: &SessionState, name: &str) -> Result<String> {
         "datestyle" => "ISO, MDY".to_string(),
         "intervalstyle" => "postgres".to_string(),
         "max_identifier_length" => "63".to_string(),
-        "statement_timeout" | "idle_in_transaction_session_timeout" => "0".to_string(),
+        "statement_timeout" => state.statement_timeout.map_or("0".to_string(), |d| format!("{}ms", d.as_millis())),
+        "idle_in_transaction_session_timeout" => "0".to_string(),
         "application_name" => String::new(),
         "extra_float_digits" => "1".to_string(),
         "client_min_messages" => "notice".to_string(),
@@ -162,6 +163,7 @@ pub(crate) fn apply_setting(state: &mut SessionState, name: &str, value: Option<
             };
         }
         "lock_timeout" => state.lock_timeout = value.map(parse_duration_ms).transpose()?.flatten(),
+        "statement_timeout" => state.statement_timeout = value.map(parse_duration_ms).transpose()?.flatten(),
         "default_transaction_isolation" => {
             state.default_isolation = value.map(parse_isolation).transpose()?.unwrap_or_default();
         }
@@ -1674,13 +1676,19 @@ fn alter_table_cmd(sess: &mut Session, rv: &pb::RangeVar, cmd: &pb::AlterTableCm
                 Ok(())
             })
         }
-        A::AtChangeOwner
-        | A::AtSetRelOptions
+        A::AtChangeOwner => {
+            sess.notice(Notice::info("squad has no object owners; ALTER ... OWNER TO has no effect"));
+            Ok(())
+        }
+        A::AtEnableRowSecurity => {
+            sess.notice(Notice::warning("squad has no row-level security; ENABLE ROW LEVEL SECURITY has no effect"));
+            Ok(())
+        }
+        A::AtSetRelOptions
         | A::AtResetRelOptions
         | A::AtClusterOn
         | A::AtSetLogged
         | A::AtSetUnLogged
-        | A::AtEnableRowSecurity
         | A::AtDisableRowSecurity
         | A::AtSetStatistics
         | A::AtSetStorage
@@ -2313,6 +2321,7 @@ fn set_variable(sess: &mut Session, stmt: &pb::VariableSetStmt) -> Result<QueryR
             sess.state.search_path = vec!["public".to_string()];
             sess.state.tz = chrono_tz::UTC;
             sess.state.lock_timeout = None;
+            sess.state.statement_timeout = None;
             done("RESET")
         }
         K::VarSetMulti => {
@@ -2397,6 +2406,7 @@ fn explain(sess: &mut Session, stmt: &pb::ExplainStmt) -> Result<QueryResult> {
         rows: lines.into_iter().map(|l| vec![Value::Text(l)]).collect(),
         tag: "EXPLAIN".into(),
         rows_affected: 0,
+        notices: Vec::new(),
     })
 }
 
@@ -2443,6 +2453,7 @@ pub(crate) fn run_utility(sess: &mut Session, stmt: &N, _params: &[Value]) -> Re
                 rows: vec![vec![Value::Text(value)]],
                 tag: "SHOW".into(),
                 rows_affected: 0,
+                notices: Vec::new(),
             })
         }
         N::ExplainStmt(s) => explain(sess, s),
@@ -2561,19 +2572,57 @@ pub(crate) fn run_utility(sess: &mut Session, stmt: &N, _params: &[Value]) -> Re
             sess.shared.store.engine().checkpoint()?;
             done("CHECKPOINT")
         }
-        // Accepted for compatibility with dumps and migration tools;
-        // squad has no roles, extensions or comments.
-        N::CreateExtensionStmt(_) => done("CREATE EXTENSION"),
-        N::CommentStmt(_) => done("COMMENT"),
-        N::GrantStmt(s) => done(if s.is_grant { "GRANT" } else { "REVOKE" }),
-        N::GrantRoleStmt(s) => done(if s.is_grant { "GRANT ROLE" } else { "REVOKE ROLE" }),
-        N::AlterOwnerStmt(_) => done("ALTER TABLE"),
-        N::AlterDefaultPrivilegesStmt(_) => done("ALTER DEFAULT PRIVILEGES"),
-        N::CreateRoleStmt(_) => done("CREATE ROLE"),
-        N::AlterRoleStmt(_) | N::AlterRoleSetStmt(_) => done("ALTER ROLE"),
-        N::DropRoleStmt(_) => done("DROP ROLE"),
-        N::LockStmt(_) => done("LOCK TABLE"),
-        N::ConstraintsSetStmt(_) => done("SET CONSTRAINTS"),
+        // Accepted for compatibility with dumps and migration tools, with
+        // a notice saying that they did nothing (docs/compatibility.md,
+        // "Accepted without effect"): squad has no roles, privileges,
+        // owners, extensions or comments.
+        N::CreateExtensionStmt(s) => no_effect(
+            sess,
+            "CREATE EXTENSION",
+            Notice::info(format!("squad has no extensions; CREATE EXTENSION \"{}\" has no effect", s.extname))
+                .with_hint("Functions squad provides, such as gen_random_uuid(), are built in."),
+        ),
+        N::CommentStmt(_) => {
+            no_effect(sess, "COMMENT", Notice::info("squad does not store comments; COMMENT has no effect"))
+        }
+        N::GrantStmt(s) => {
+            let tag = if s.is_grant { "GRANT" } else { "REVOKE" };
+            check_grant_objects(sess, s)?;
+            no_effect(sess, tag, privileges_notice(tag))
+        }
+        N::GrantRoleStmt(s) => {
+            let tag = if s.is_grant { "GRANT ROLE" } else { "REVOKE ROLE" };
+            no_effect(sess, tag, roles_notice(tag))
+        }
+        N::AlterOwnerStmt(_) => {
+            no_effect(sess, "ALTER TABLE", Notice::info("squad has no object owners; ALTER ... OWNER TO has no effect"))
+        }
+        N::AlterDefaultPrivilegesStmt(_) => {
+            no_effect(sess, "ALTER DEFAULT PRIVILEGES", privileges_notice("ALTER DEFAULT PRIVILEGES"))
+        }
+        N::CreateRoleStmt(s) => {
+            let tag = match pb::RoleStmtType::try_from(s.stmt_type) {
+                Ok(pb::RoleStmtType::RolestmtUser) => "CREATE USER",
+                Ok(pb::RoleStmtType::RolestmtGroup) => "CREATE GROUP",
+                _ => "CREATE ROLE",
+            };
+            no_effect(sess, tag, roles_notice(tag))
+        }
+        N::AlterRoleStmt(_) | N::AlterRoleSetStmt(_) => no_effect(sess, "ALTER ROLE", roles_notice("ALTER ROLE")),
+        N::DropRoleStmt(_) => no_effect(sess, "DROP ROLE", roles_notice("DROP ROLE")),
+        N::LockStmt(s) => lock_tables(sess, s),
+        N::ConstraintsSetStmt(s) => {
+            if s.deferred {
+                // DEFERRABLE is accepted, but every constraint is checked
+                // at the end of its statement.
+                sess.notice(Notice::warning(
+                    "squad checks every constraint immediately; SET CONSTRAINTS ... DEFERRED has no effect",
+                ));
+            }
+            done("SET CONSTRAINTS")
+        }
+        // Indexes never need rebuilding, and rows are kept in primary key
+        // order; neither statement could change a query result.
         N::ReindexStmt(_) => done("REINDEX"),
         N::ClusterStmt(_) => done("CLUSTER"),
         N::CreateFunctionStmt(_) | N::DoStmt(_) | N::CallStmt(_) => {
@@ -2590,6 +2639,110 @@ pub(crate) fn run_utility(sess: &mut Session, stmt: &N, _params: &[Value]) -> Re
         }
         other => Err(feature(&format!("statement {}", crate::bind::node_kind(other)))),
     }
+}
+
+fn no_effect(sess: &mut Session, tag: &'static str, notice: Notice) -> Result<QueryResult> {
+    sess.notice(notice);
+    done(tag)
+}
+
+fn privileges_notice(tag: &str) -> Notice {
+    Notice::warning(format!("squad has no privileges; {tag} has no effect"))
+        .with_hint("Every client that can connect has full access; control access through authentication.")
+}
+
+fn roles_notice(tag: &str) -> Notice {
+    Notice::warning(format!("squad has no roles; {tag} has no effect"))
+        .with_hint("Logins are configured on the server, not in SQL.")
+}
+
+/// GRANT and REVOKE on tables still fail for tables that do not exist.
+fn check_grant_objects(sess: &mut Session, s: &pb::GrantStmt) -> Result<()> {
+    if s.targtype != pb::GrantTargetType::AclTargetObject as i32 || s.objtype != pb::ObjectType::ObjectTable as i32 {
+        return Ok(());
+    }
+    let catalog = sess.catalog();
+    let path = sess.state.search_path.clone();
+    for o in &s.objects {
+        if let N::RangeVar(rv) = node(o)? {
+            let (schema, name) = range_var_name(rv);
+            if catalog.table(schema, name, &path).is_none() && catalog.view(schema, name, &path).is_none() {
+                return Err(undefined_table(name));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `LOCK TABLE`. squad has two table locks: the shared one every writer
+/// holds and the exclusive one DDL holds; readers take none. The
+/// PostgreSQL modes that map exactly onto this are implemented:
+///
+/// - ACCESS SHARE conflicts only with ACCESS EXCLUSIVE, which squad's DDL
+///   does not need against readers: like a SELECT, it takes no lock.
+/// - ROW SHARE and ROW EXCLUSIVE conflict with EXCLUSIVE and with DDL:
+///   the shared lock.
+/// - EXCLUSIVE lets only readers through: the exclusive lock.
+///
+/// SHARE UPDATE EXCLUSIVE, SHARE and SHARE ROW EXCLUSIVE need conflicts
+/// the two locks cannot express, and ACCESS EXCLUSIVE would have to block
+/// readers, which never wait in squad. They fail with 0A000.
+fn lock_tables(sess: &mut Session, s: &pb::LockStmt) -> Result<QueryResult> {
+    use squad_kv::LockMode;
+    if !sess.txn.as_ref().is_some_and(|t| t.explicit) {
+        return Err(Error::new(
+            sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+            "LOCK TABLE can only be used in transaction blocks",
+        ));
+    }
+    // Mode numbers from PostgreSQL's lockdefs.h.
+    let (name, mode) = match s.mode {
+        1 => ("ACCESS SHARE", None),
+        2 => ("ROW SHARE", Some(LockMode::Shared)),
+        3 => ("ROW EXCLUSIVE", Some(LockMode::Shared)),
+        7 => ("EXCLUSIVE", Some(LockMode::Exclusive)),
+        4 => return Err(lock_mode_unsupported("SHARE UPDATE EXCLUSIVE")),
+        5 => return Err(lock_mode_unsupported("SHARE")),
+        6 => return Err(lock_mode_unsupported("SHARE ROW EXCLUSIVE")),
+        _ => return Err(lock_mode_unsupported("ACCESS EXCLUSIVE")),
+    };
+    let path = sess.state.search_path.clone();
+    let catalog = sess.catalog();
+    let mut tables = Vec::new();
+    for r in &s.relations {
+        let N::RangeVar(rv) = node(r)? else { continue };
+        tables.push(find_table(&catalog, rv, &path)?);
+    }
+    let wait = if s.nowait { WaitPolicy::NoWait } else { WaitPolicy::Wait(sess.state.lock_timeout) };
+    // As in PostgreSQL, modes above ROW EXCLUSIVE are allowed in read-only
+    // transactions but not on a replica.
+    if mode == Some(LockMode::Exclusive) && sess.shared.in_recovery() {
+        return Err(Error::new(
+            sqlstate::READ_ONLY_SQL_TRANSACTION,
+            format!("cannot execute LOCK TABLE IN {name} MODE on a read replica"),
+        ));
+    }
+    let t = sess.start_statement()?;
+    if let Some(mode) = mode {
+        for table in &tables {
+            Session::lock_table(&mut t.txn, table.id, mode, wait).map_err(|e| {
+                if e.code() == sqlstate::LOCK_NOT_AVAILABLE && s.nowait {
+                    Error::new(
+                        sqlstate::LOCK_NOT_AVAILABLE,
+                        format!("could not obtain lock on relation \"{}\"", table.name),
+                    )
+                } else {
+                    e
+                }
+            })?;
+        }
+    }
+    done("LOCK TABLE")
+}
+
+fn lock_mode_unsupported(mode: &str) -> Error {
+    Error::new(sqlstate::FEATURE_NOT_SUPPORTED, format!("LOCK TABLE IN {mode} MODE is not supported"))
+        .with_hint("squad supports the modes ACCESS SHARE, ROW SHARE, ROW EXCLUSIVE and EXCLUSIVE.")
 }
 
 #[allow(dead_code)]

@@ -18,6 +18,45 @@ fn skip(tool: &str) -> bool {
 }
 
 #[test]
+fn psql_over_tls_and_notices() {
+    if skip("psql") {
+        return;
+    }
+    let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string(), "localhost".to_string()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root.crt");
+    std::fs::write(&root, ck.cert.pem()).unwrap();
+    let tls =
+        squad_server::TlsConfig::from_pem(ck.cert.pem().as_bytes(), ck.key_pair.serialize_pem().as_bytes()).unwrap();
+    let (server, addr) = start(ServerConfig { tls: Some(tls), require_tls: true, ..Default::default() });
+    let run = |mode: &str, sql: &str| {
+        let out = Command::new("psql")
+            .args(["-h", "127.0.0.1", "-p", &addr.port().to_string(), "-U", "squad", "-d", "squad", "-X", "-A", "-t"])
+            .args(["-c", sql])
+            .env("PGSSLMODE", mode)
+            .env("PGSSLROOTCERT", &root)
+            .env("PGCONNECT_TIMEOUT", "10")
+            .output()
+            .expect("run psql");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (ok, out, err) = run("verify-full", "\\conninfo");
+    assert!(ok, "{err}");
+    assert!(out.contains("SSL connection (protocol: TLSv1.3"), "{out}");
+    let (ok, _, err) = run("disable", "SELECT 1");
+    assert!(!ok && err.contains("no encryption"), "{err}");
+    // psql prints the notice of a statement without effect.
+    let (ok, _, err) = run("require", "CREATE TABLE t (a int); GRANT SELECT ON t TO PUBLIC");
+    assert!(ok, "{err}");
+    assert!(err.contains("WARNING:  squad has no privileges; GRANT has no effect"), "{err}");
+    server.shutdown();
+}
+
+#[test]
 fn psql_queries() {
     if skip("psql") {
         return;
@@ -187,8 +226,7 @@ fn pgbench_runs() {
     let mut total = 0;
     for mode in ["simple", "prepared"] {
         let out = pgbench(&["-c", "4", "-j", "2", "-t", "200", "-n", "-M", mode]);
-        assert!(out.contains("number of failed transactions: 0 "), "{out}");
-        assert!(out.contains("number of transactions actually processed: 800/800"), "{out}");
+        check_pgbench_summary(&out, 800);
         total += 800;
         eprintln!("pgbench -M {mode}: {}", out.lines().find(|l| l.starts_with("tps")).unwrap_or_default());
     }
@@ -198,6 +236,40 @@ fn pgbench_runs() {
     assert_eq!(count(&mut c, "SELECT sum(bbalance) FROM pgbench_branches"), delta);
     assert_eq!(count(&mut c, "SELECT sum(tbalance) FROM pgbench_tellers"), delta);
     let out = pgbench(&["-c", "4", "-j", "2", "-t", "500", "-n", "-S", "-M", "prepared"]);
-    assert!(out.contains("number of failed transactions: 0 "), "{out}");
+    check_pgbench_summary(&out, 2000);
     server.shutdown();
+}
+
+/// Checks the summary pgbench prints after a run. Only lines every
+/// supported pgbench version prints are required: "number of failed
+/// transactions" exists only since pgbench 15, so it is checked when
+/// present.
+fn check_pgbench_summary(out: &str, expected: u64) {
+    let value =
+        |prefix: &str| out.lines().find_map(|l| l.trim().strip_prefix(prefix)).map(|rest| rest.trim().to_string());
+    let processed = value("number of transactions actually processed:")
+        .unwrap_or_else(|| panic!("no transaction count in pgbench output:\n{out}"));
+    let (done, planned) = processed.split_once('/').unwrap_or((processed.as_str(), ""));
+    assert_eq!(done.trim().parse::<u64>().ok(), Some(expected), "{out}");
+    assert_eq!(planned.trim().parse::<u64>().ok(), Some(expected), "{out}");
+    if let Some(failed) = value("number of failed transactions:") {
+        let n = failed.split_whitespace().next().unwrap_or_default();
+        assert_eq!(n, "0", "failed transactions:\n{out}");
+    }
+}
+
+#[test]
+fn pgbench_summary_parsing_accepts_old_and_new_formats() {
+    // pgbench 14 prints no line about failed transactions.
+    let v14 = "transaction type: <builtin: TPC-B (sort of)>\nscaling factor: 1\nquery mode: simple\n\
+        number of clients: 4\nnumber of threads: 2\nnumber of transactions per client: 200\n\
+        number of transactions actually processed: 800/800\nlatency average = 1.0 ms\n\
+        tps = 4000.0 (without initial connection time)\n";
+    check_pgbench_summary(v14, 800);
+    let v16 = "number of transactions actually processed: 800/800\n\
+        number of failed transactions: 0 (0.000%)\nlatency average = 1.0 ms\n";
+    check_pgbench_summary(v16, 800);
+    let failed = "number of transactions actually processed: 790/800\n\
+        number of failed transactions: 10 (1.250%)\n";
+    assert!(std::panic::catch_unwind(|| check_pgbench_summary(failed, 800)).is_err());
 }

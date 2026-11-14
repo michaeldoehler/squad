@@ -111,3 +111,52 @@ versions may change the API and the on-disk format.
   reference tables, single-shard routing by distribution key,
   scatter-gather queries with merged aggregates, and transactions bound
   to one shard.
+
+### Added (server hardening)
+
+- Statement cancellation: `Connection::cancel_handle()` / `CancelHandle`
+  and `Session::cancel_handle()`; the executor stops with SQLSTATE
+  `57014`. `SET statement_timeout` is honoured (also `57014`).
+- Notices: `QueryResult::notices` (`squad::Notice`, `squad::Severity`);
+  the server sends them as NoticeResponse, `squad shell` prints them.
+- Server TLS (rustls, ring provider): `--tls-cert`, `--tls-key`,
+  `--require-tls`; `ServerConfig::tls`, `TlsConfig`, `require_tls`.
+- Server cancel requests: real BackendKeyData with a random secret per
+  connection.
+- Server limits: `--max-connections` (`53300` beyond it),
+  `--authentication-timeout` (default 60 s), `--idle-timeout` (`57P05`
+  / `25P03`), at most 10,000 bytes per message before login and
+  `--max-message-size` after it.
+- Server logins from `SQUAD_PASSWORD` / `SQUAD_PASSWORD_FILE` /
+  `SQUAD_USER` and `--users-file` (passwords or PostgreSQL SCRAM
+  verifiers); `Auth::Verifiers`; `squad hash-password`.
+- `squad ping`, a health check for scripts and containers.
+- `--remote-file`, `--replica-of-file` and `AWS_*_FILE` variables, so
+  that object store credentials can come from secret files.
+- A multi-stage `Dockerfile` (Debian slim, non-root user, `/data`
+  volume, health check with `squad ping`) and `.dockerignore`.
+- `squad serve` shuts down cleanly on SIGTERM and SIGINT.
+
+### Changed (server hardening)
+
+- `GRANT`, `REVOKE`, `CREATE/ALTER/DROP ROLE`, `ALTER DEFAULT
+  PRIVILEGES`, `ENABLE ROW LEVEL SECURITY` and `SET CONSTRAINTS …
+  DEFERRED` are still accepted without effect but now send a WARNING;
+  `CREATE EXTENSION`, `COMMENT ON` and `ALTER … OWNER TO` send a NOTICE.
+  `GRANT`/`REVOKE` on a missing table fail with `42P01`.
+- `LOCK TABLE` takes real table locks in the modes `ACCESS SHARE`, `ROW
+  SHARE`, `ROW EXCLUSIVE` and `EXCLUSIVE`, requires a transaction block
+  (`25P01`) and fails with `0A000` in the other modes, including the
+  default `ACCESS EXCLUSIVE`; it used to succeed without effect.
+- `QueryResult` has a new public field `notices`.
+- The server no longer trusts every client on addresses other than
+  loopback: `squad serve` refuses to start and `Server::bind` /
+  `Serve::serve` fail with `PermissionDenied` unless passwords are
+  configured or trust is requested (`--trust`,
+  `ServerConfig::trust_remote`).
+- `--password` on the command line prints a warning; `--user` without
+  `--password` takes the password from `SQUAD_PASSWORD`.
+- `ServerConfig` no longer derives `Default` but implements it with the
+  new limits; its `Debug` output and that of `Auth` omit passwords.
+- Errors opening an object store no longer echo the URL, which may carry
+  credentials.
