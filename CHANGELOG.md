@@ -141,7 +141,9 @@ preparing it for production use.
   happens outside the commit lock.
 - **Log format 2** (segment magic `SQWAL002`): each record carries the
   highest durable log position at the time it was written. Directories
-  with log segments of the earlier format are refused with an error.
+  whose log still holds records of the earlier format are refused with an
+  error; opening them once with the earlier version checkpoints the log,
+  and the empty segment it leaves is replaced on the next open.
 - The S3 client classifies errors (transient: connection errors,
   timeouts, 5xx, 429, 408, `RequestTimeout`; other 4xx are not
   retried), retries with exponential backoff and full jitter, has

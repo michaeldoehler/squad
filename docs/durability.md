@@ -99,9 +99,10 @@ that keeps committing, every record is soon followed by records that
 vouch for it.
 
 The log format changed for this (segment magic `SQWAL002`). A directory
-whose log still holds segments of the earlier development format is
+whose log still holds records of the earlier development format is
 refused with an error; open it once with the version that wrote it, so
-that it checkpoints and empties the log.
+that it checkpoints and empties the log. The empty segment of the
+earlier format that this leaves behind is replaced on the next open.
 
 Because uncommitted transactions never write to the log or the data
 file, there is nothing to undo. Recovery time is proportional to the log
