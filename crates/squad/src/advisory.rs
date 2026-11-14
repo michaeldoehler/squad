@@ -115,7 +115,7 @@ impl AdvisoryLocks {
                     }
                     self.released.wait_for(&mut table, POLL);
                     // Interrupts are checked without the table locked.
-                    let result = parking_lot::MutexGuard::unlocked(&mut table, || interrupted());
+                    let result = parking_lot::MutexGuard::unlocked(&mut table, interrupted);
                     result?;
                 }
             }
