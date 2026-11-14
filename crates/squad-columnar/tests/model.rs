@@ -35,6 +35,7 @@ const S: usize = 3;
 const B: usize = 4;
 const T: usize = 5;
 const U: usize = 6;
+const J: usize = 7;
 const DAY: i64 = 86_400_000_000;
 
 fn schema() -> Arc<Schema> {
@@ -46,7 +47,66 @@ fn schema() -> Arc<Schema> {
         Field::new("b", ColumnType::Bool, true),
         Field::new("t", ColumnType::Int64, false),
         Field::new("u", ColumnType::Utf8, true),
+        Field::new("j", ColumnType::Json, true),
     ]))
+}
+
+const JSON_KEYS: [&str; 5] = ["a", "plan", "k\"q", "ü", "b"];
+
+/// JSON text in the normalized form squad writes for `jsonb`: keys
+/// ordered by length then bytes, ", " and ": " as separators.
+fn json_text(v: &serde_json::Value) -> String {
+    use serde_json::Value as V;
+    match v {
+        V::Array(items) => format!("[{}]", items.iter().map(json_text).collect::<Vec<_>>().join(", ")),
+        V::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.as_bytes().cmp(b.as_bytes())));
+            let fields: Vec<String> =
+                keys.iter().map(|k| format!("{}: {}", serde_json::to_string(k).unwrap(), json_text(&m[*k]))).collect();
+            format!("{{{}}}", fields.join(", "))
+        }
+        other => serde_json::to_string(other).unwrap(),
+    }
+}
+
+fn random_json(rng: &mut Rng) -> String {
+    use serde_json::json;
+    let value = |rng: &mut Rng| match rng.below(10) {
+        0 => json!(1),
+        1 => json!(-2.5),
+        2 => json!(true),
+        3 => json!(null),
+        4 => json!("x"),
+        5 => json!("a\"b\\c\n"),
+        6 => json!("pro"),
+        7 => json!({"k": [1, "}"], "z": {}}),
+        8 => json!([1, "2"]),
+        _ => json!(""),
+    };
+    match rng.below(12) {
+        0 => "[1, 2]".into(),
+        1 => "\"str\"".into(),
+        _ => {
+            let mut m = serde_json::Map::new();
+            for k in JSON_KEYS {
+                if rng.chance(60) {
+                    m.insert(k.to_string(), value(rng));
+                }
+            }
+            json_text(&serde_json::Value::Object(m))
+        }
+    }
+}
+
+/// `doc ->> key` computed through a JSON parser.
+fn json_field_ref(doc: &Datum, key: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(doc.as_str()?).unwrap();
+    match v.as_object()?.get(key)? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        other => Some(json_text(other)),
+    }
 }
 
 fn random_row(rng: &mut Rng, n: usize) -> Vec<Datum> {
@@ -81,6 +141,10 @@ fn random_row(rng: &mut Rng, n: usize) -> Vec<Datum> {
         null(rng, Datum::Bool(b)),
         Datum::Int(t),
         null(rng, Datum::text(u)),
+        {
+            let doc = random_json(rng);
+            null(rng, Datum::text(doc))
+        },
     ]
 }
 
@@ -260,6 +324,12 @@ fn eval_ref(p: &Predicate, row: &[Datum]) -> Option<bool> {
             ps.iter().fold(Some(false), |acc, p| and3(acc.map(|b| !b), eval_ref(p, row).map(|b| !b)).map(|b| !b))
         }
         Predicate::Not(p) => eval_ref(p, row).map(|b| !b),
+        Predicate::JsonIn { column, key, values } => {
+            json_field_ref(&row[*column], key).map(|t| values.iter().any(|v| v == t.as_bytes()))
+        }
+        Predicate::JsonIsNull { column, key, negated } => {
+            Some(json_field_ref(&row[*column], key).is_none() != *negated)
+        }
     }
 }
 
@@ -284,6 +354,19 @@ fn random_predicate(rng: &mut Rng, rows: &[Vec<Datum>], depth: u32) -> Predicate
                 .to_string(),
             case_insensitive: rng.chance(30),
         },
+        6 if rng.chance(40) => {
+            let key = JSON_KEYS[rng.below(5) as usize].to_string();
+            if rng.chance(60) {
+                let pool =
+                    ["1", "-2.5", "true", "x", "a\"b\\c\n", "pro", "", "[1, \"2\"]", "{\"k\": [1, \"}\"], \"z\": {}}"];
+                let values = (0..rng.below(3) + 1)
+                    .map(|_| pool[rng.below(pool.len() as u64) as usize].as_bytes().to_vec())
+                    .collect();
+                Predicate::JsonIn { column: J, key, values }
+            } else {
+                Predicate::JsonIsNull { column: J, key, negated: rng.chance(50) }
+            }
+        }
         6 => {
             if rng.chance(70) {
                 Predicate::BoolColumn(B)
@@ -307,7 +390,7 @@ fn scans_match_the_reference() {
         for q in 0..25 {
             let predicate = random_predicate(&mut rng, &rows, 2);
             let projection: Vec<usize> =
-                [vec![I, S], vec![U], vec![T, F, D, B], vec![S, I, U, T]][rng.below(4) as usize].clone();
+                [vec![I, S], vec![U, J], vec![T, F, D, B], vec![S, I, U, T]][rng.below(4) as usize].clone();
             let request =
                 ScanRequest { projection: projection.clone(), predicate: Some(predicate.clone()), limit: None };
             let got: Vec<Vec<Datum>> = scan(&source, &request).unwrap().flat_map(|b| b.unwrap().to_rows()).collect();
@@ -342,6 +425,7 @@ fn key_ref(key: &GroupKey, row: &[Datum]) -> Datum {
             Datum::Int(t) => Datum::Int(bucket_ref(*t, *unit, *utc_offset_micros, *epoch_unix_micros)),
             _ => Datum::Null,
         },
+        GroupKey::JsonField { column, key } => json_field_ref(&row[*column], key).map_or(Datum::Null, Datum::text),
     }
 }
 
@@ -444,7 +528,8 @@ fn aggregates_match_the_reference() {
                 TimeUnit::Quarter,
                 TimeUnit::Year,
             ];
-            let pick_key = |rng: &mut Rng| match rng.below(8) {
+            let pick_key = |rng: &mut Rng| match rng.below(9) {
+                8 => GroupKey::JsonField { column: J, key: JSON_KEYS[rng.below(5) as usize].to_string() },
                 0 => GroupKey::Column(S),
                 1 => GroupKey::Column(I),
                 2 => GroupKey::Column(B),
@@ -804,4 +889,154 @@ fn corruption_is_detected_and_never_panics() {
         }
     }
     assert!(detected > 2900, "only {detected} of 3000 corruptions were detected");
+}
+
+#[test]
+fn json_blooms_skip_row_groups_without_the_field() {
+    let schema = Arc::new(Schema::new(vec![Field::new("p", ColumnType::Json, true)]));
+    let rows: Vec<Vec<Datum>> = (0..20_000)
+        .map(|i| {
+            let doc = if i / 1000 == 7 {
+                format!("{{\"plan\": \"rare\", \"n\": {i}}}")
+            } else {
+                format!("{{\"plan\": \"pro\", \"n\": {i}}}")
+            };
+            vec![Datum::text(doc)]
+        })
+        .collect();
+    let mut w = SegmentWriter::new(schema.clone(), WriterOptions { row_group_rows: 1000, ..Default::default() });
+    w.write_batch(&Batch::from_rows(schema.clone(), &rows).unwrap()).unwrap();
+    let seg = Segment::open(Arc::new(w.finish().unwrap())).unwrap();
+    // Only the row group holding "rare" passes its bloom filter.
+    let bloom_hits = (0..seg.num_row_groups())
+        .filter(|g| seg.bloom(*g, 0).unwrap().unwrap().may_contain_hash(json_pair_hash(b"plan", b"rare")))
+        .count();
+    assert!(bloom_hits <= 2, "{bloom_hits} row groups may hold the pair");
+    assert!(seg.bloom(3, 0).unwrap().unwrap().may_contain_hash(json_key_hash(b"n")));
+    let mut source = TableSource::new(schema);
+    source.segments.push(Arc::new(seg));
+    let count = |p: Predicate| {
+        aggregate(
+            &source,
+            &AggregateRequest { predicate: Some(p), aggregates: vec![Aggregate::CountStar], ..Default::default() },
+        )
+        .unwrap()
+        .row(0)[0]
+            .clone()
+    };
+    let rare = Predicate::JsonIn { column: 0, key: "plan".into(), values: vec![b"rare".to_vec()] };
+    assert_eq!(count(rare), Datum::Int(1000));
+    assert_eq!(count(Predicate::JsonIsNull { column: 0, key: "missing".into(), negated: true }), Datum::Int(0));
+    assert_eq!(count(Predicate::JsonIsNull { column: 0, key: "n".into(), negated: false }), Datum::Int(0));
+}
+
+#[test]
+fn projected_segments_read_missing_columns_as_constants() {
+    let mut rng = Rng(555);
+    let schema = schema();
+    let rows: Vec<_> = (0..2500).map(|k| random_row(&mut rng, k)).collect();
+    let mut w = SegmentWriter::new(schema.clone(), WriterOptions { row_group_rows: 500, ..Default::default() });
+    w.write_batch(&Batch::from_rows(schema.clone(), &rows).unwrap()).unwrap();
+    let seg = Segment::open(Arc::new(w.finish().unwrap())).unwrap();
+    // New layout: u, a constant 7, i, a NULL text column.
+    let target = Arc::new(Schema::new(vec![
+        Field::new("u", ColumnType::Utf8, true),
+        Field::new("added", ColumnType::Int64, true),
+        Field::new("i", ColumnType::Int64, true),
+        Field::new("gone", ColumnType::Utf8, true),
+    ]));
+    let projected = seg
+        .project(
+            target.clone(),
+            &[
+                ProjectedColumn::Stored(U),
+                ProjectedColumn::Constant(Datum::Int(7)),
+                ProjectedColumn::Stored(I),
+                ProjectedColumn::Constant(Datum::Null),
+            ],
+        )
+        .unwrap();
+    let want: Vec<Vec<Datum>> =
+        rows.iter().map(|r| vec![r[U].clone(), Datum::Int(7), r[I].clone(), Datum::Null]).collect();
+    assert_rows(projected.read_all().unwrap().to_rows(), want.clone(), "projection");
+    let mut source = TableSource::new(target);
+    source.segments.push(Arc::new(projected));
+    for (p, keep) in [
+        (Predicate::Cmp { column: 1, op: CmpOp::Eq, value: Datum::Int(7) }, true),
+        (Predicate::Cmp { column: 1, op: CmpOp::Gt, value: Datum::Int(7) }, false),
+        (Predicate::IsNull { column: 3, negated: false }, true),
+        (Predicate::IsNull { column: 3, negated: true }, false),
+    ] {
+        let request = ScanRequest { projection: vec![0, 1, 2, 3], predicate: Some(p.clone()), limit: None };
+        let got: Vec<Vec<Datum>> = scan(&source, &request).unwrap().flat_map(|b| b.unwrap().to_rows()).collect();
+        assert_rows(got, if keep { want.clone() } else { Vec::new() }, &format!("{p:?}"));
+    }
+    // Types must fit.
+    let bad = Arc::new(Schema::new(vec![Field::new("u", ColumnType::Int64, true)]));
+    assert!(seg.project(bad, &[ProjectedColumn::Stored(U)]).is_err());
+}
+
+#[test]
+fn streaming_merge_matches_sorting_everything() {
+    for seed in 1..12u64 {
+        let mut rng = Rng(seed * 31);
+        let schema = schema();
+        let mut segments = Vec::new();
+        let mut all = Vec::new();
+        let sort_key = [vec![T], vec![S, I], vec![]][rng.below(3) as usize].clone();
+        for k in 0..rng.below(5) + 1 {
+            let n = [0, 1, 90, 700][rng.below(4) as usize];
+            let rows: Vec<_> = (0..n).map(|i| random_row(&mut rng, i * 5 + k as usize)).collect();
+            let mut w = SegmentWriter::new(
+                schema.clone(),
+                WriterOptions {
+                    row_group_rows: [7, 64, 1000][rng.below(3) as usize],
+                    sort_key: sort_key.clone(),
+                    compress: true,
+                },
+            );
+            w.write_batch(&Batch::from_rows(schema.clone(), &rows).unwrap()).unwrap();
+            segments.push(Arc::new(Segment::open(Arc::new(w.finish().unwrap())).unwrap()));
+            all.extend(rows);
+        }
+        let options = WriterOptions {
+            row_group_rows: [5, 100, 65_536][rng.below(3) as usize],
+            sort_key: sort_key.clone(),
+            compress: true,
+        };
+        let merged = Segment::open(Arc::new(merge(&segments, options).unwrap())).unwrap();
+        let got = merged.read_all().unwrap().to_rows();
+        if !sort_key.is_empty() {
+            let key = |r: &Vec<Datum>| sort_key.iter().map(|c| r[*c].clone()).collect::<Vec<_>>();
+            assert!(
+                got.windows(2).all(|w| key(&w[0])
+                    .iter()
+                    .zip(key(&w[1]).iter())
+                    .map(|(a, b)| cmp_datum(a, b))
+                    .find(|o| o.is_ne())
+                    .is_none_or(|o| o.is_lt())),
+                "seed {seed}: merged segment is sorted"
+            );
+        }
+        assert_rows(got, all, &format!("seed {seed}"));
+    }
+}
+
+#[test]
+fn batches_round_trip_through_their_encoding() {
+    let mut rng = Rng(808);
+    let schema = schema();
+    for n in [0, 1, 37, 3000] {
+        let rows: Vec<_> = (0..n).map(|k| random_row(&mut rng, k)).collect();
+        let batch = Batch::from_rows(schema.clone(), &rows).unwrap();
+        let bytes = encode_batch(&batch);
+        let back = decode_batch(&bytes).unwrap();
+        assert_eq!(back.schema.columns, schema.columns);
+        assert_rows(back.to_rows(), rows, "batch encoding");
+        let mut damaged = bytes.clone();
+        if damaged.len() > 12 {
+            damaged.truncate(damaged.len() - 3);
+            assert!(decode_batch(&damaged).is_err());
+        }
+    }
 }

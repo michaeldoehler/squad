@@ -22,11 +22,48 @@ pub enum ColumnType {
     Bytes,
     /// UTF-8 text. Stored and compared like [`ColumnType::Bytes`].
     Utf8,
+    /// JSON documents as UTF-8 text, stored like [`ColumnType::Utf8`].
+    /// The bloom filter of a chunk covers the top-level keys and
+    /// key/value pairs of the documents instead of whole values, so that
+    /// filters on a field (`doc ->> 'key' = 'value'`) can skip row groups.
+    Json,
 }
 
 impl ColumnType {
+    /// Tag and scale byte of the type in stored metadata.
+    pub(crate) fn tag(&self) -> (u8, u8) {
+        match self {
+            ColumnType::Bool => (0, 0),
+            ColumnType::Int64 => (1, 0),
+            ColumnType::Float64 => (2, 0),
+            ColumnType::Decimal { scale } => (3, *scale),
+            ColumnType::Bytes => (4, 0),
+            ColumnType::Utf8 => (5, 0),
+            ColumnType::Json => (6, 0),
+        }
+    }
+
+    pub(crate) fn from_tag(tag: u8, scale: u8) -> Option<ColumnType> {
+        Some(match tag {
+            0 => ColumnType::Bool,
+            1 => ColumnType::Int64,
+            2 => ColumnType::Float64,
+            3 => ColumnType::Decimal { scale },
+            4 => ColumnType::Bytes,
+            5 => ColumnType::Utf8,
+            6 => ColumnType::Json,
+            _ => return None,
+        })
+    }
+
+    /// True if values of `self` can be read as values of `other`: equal
+    /// types, and text read as JSON.
+    pub fn reads_as(&self, other: &ColumnType) -> bool {
+        self == other || matches!((self, other), (ColumnType::Utf8, ColumnType::Json))
+    }
+
     pub fn is_bytes(&self) -> bool {
-        matches!(self, ColumnType::Bytes | ColumnType::Utf8)
+        matches!(self, ColumnType::Bytes | ColumnType::Utf8 | ColumnType::Json)
     }
 }
 
@@ -280,6 +317,36 @@ impl Column {
         }
     }
 
+    /// A column of `rows` copies of `value`.
+    pub fn constant(ty: ColumnType, value: &Datum, rows: usize) -> Result<Column> {
+        if value.is_null() {
+            let data = match ty {
+                ColumnType::Bool => ColumnData::Bool(vec![false; rows]),
+                ColumnType::Int64 => ColumnData::Int64(vec![0; rows]),
+                ColumnType::Float64 => ColumnData::Float64(vec![0.0; rows]),
+                ColumnType::Decimal { .. } => ColumnData::Decimal(vec![0; rows]),
+                ColumnType::Bytes | ColumnType::Utf8 | ColumnType::Json => {
+                    ColumnData::Bytes(BytesColumn::Plain(BytesData { offsets: vec![0; rows + 1], data: Vec::new() }))
+                }
+            };
+            return Ok(Column::new(data, Some(vec![false; rows])));
+        }
+        let data = match (ty, value) {
+            (ColumnType::Bool, Datum::Bool(b)) => ColumnData::Bool(vec![*b; rows]),
+            (ColumnType::Int64, Datum::Int(i)) => ColumnData::Int64(vec![*i; rows]),
+            (ColumnType::Float64, Datum::Float(f)) => ColumnData::Float64(vec![*f; rows]),
+            (ColumnType::Float64, Datum::Int(i)) => ColumnData::Float64(vec![*i as f64; rows]),
+            (ColumnType::Decimal { .. }, Datum::Decimal(d)) => ColumnData::Decimal(vec![*d; rows]),
+            (ColumnType::Bytes | ColumnType::Utf8 | ColumnType::Json, Datum::Bytes(b)) => {
+                let mut dict = BytesData::new();
+                dict.push(b);
+                ColumnData::Bytes(BytesColumn::Dict { codes: vec![0; rows], dict: Arc::new(dict) })
+            }
+            (ty, v) => return Err(Error::Type(format!("value {v:?} does not fit a column of type {ty:?}"))),
+        };
+        Ok(Column::new(data, None))
+    }
+
     /// Builds a column of type `ty` from values.
     pub fn from_datums<'a>(ty: ColumnType, values: impl IntoIterator<Item = &'a Datum>) -> Result<Column> {
         let mut b = ColumnBuilder::new(ty);
@@ -361,7 +428,9 @@ impl ColumnBuilder {
             ColumnType::Int64 => ColumnData::Int64(Vec::new()),
             ColumnType::Float64 => ColumnData::Float64(Vec::new()),
             ColumnType::Decimal { .. } => ColumnData::Decimal(Vec::new()),
-            ColumnType::Bytes | ColumnType::Utf8 => ColumnData::Bytes(BytesColumn::Plain(BytesData::new())),
+            ColumnType::Bytes | ColumnType::Utf8 | ColumnType::Json => {
+                ColumnData::Bytes(BytesColumn::Plain(BytesData::new()))
+            }
         };
         ColumnBuilder { ty, data, validity: Vec::new(), has_null: false }
     }

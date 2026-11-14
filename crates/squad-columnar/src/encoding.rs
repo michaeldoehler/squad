@@ -303,10 +303,86 @@ pub(crate) fn decode_column(payload: &[u8], ty: ColumnType, rows: usize) -> Resu
             1 => ColumnData::Decimal(decode_ints(&mut cur, rows)?.into_iter().map(i128::from).collect()),
             _ => return Err(corrupt("unknown decimal encoding")),
         },
-        ColumnType::Bytes | ColumnType::Utf8 => ColumnData::Bytes(decode_bytes(&mut cur, rows)?),
+        ColumnType::Bytes | ColumnType::Utf8 | ColumnType::Json => ColumnData::Bytes(decode_bytes(&mut cur, rows)?),
     };
     if cur.remaining() != 0 {
         return Err(corrupt("trailing bytes in column chunk"));
     }
     Ok(Column { data, validity })
+}
+
+const BATCH_MAGIC: &[u8; 4] = b"SQB1";
+
+/// Serializes a batch: its schema and every column in the chunk encoding,
+/// LZ4-compressed when that saves at least a tenth. Used for rows that
+/// are stored outside segments (a table's delta).
+pub fn encode_batch(batch: &crate::Batch) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.put_u32(batch.schema.len() as u32);
+    body.put_u32(batch.num_rows() as u32);
+    for (f, c) in batch.schema.columns.iter().zip(&batch.columns) {
+        body.put_bytes(f.name.as_bytes());
+        let (tag, scale) = f.ty.tag();
+        body.put_u8(tag);
+        body.put_u8(scale);
+        body.put_u8(f.nullable as u8);
+        body.put_bytes(&encode_column(c));
+    }
+    let mut out = Vec::with_capacity(body.len() / 2 + 16);
+    out.extend_from_slice(BATCH_MAGIC);
+    let compressed = lz4_flex::block::compress(&body);
+    if compressed.len() * 10 <= body.len() * 9 {
+        out.put_u8(1);
+        out.put_u32(body.len() as u32);
+        out.extend_from_slice(&compressed);
+    } else {
+        out.put_u8(0);
+        out.extend_from_slice(&body);
+    }
+    out
+}
+
+/// Reads a batch written by [`encode_batch`].
+pub fn decode_batch(bytes: &[u8]) -> Result<crate::Batch> {
+    if bytes.len() < 5 || &bytes[..4] != BATCH_MAGIC {
+        return Err(corrupt("not an encoded batch"));
+    }
+    let raw;
+    let body: &[u8] = match bytes[4] {
+        0 => &bytes[5..],
+        1 => {
+            let mut cur = Cur::new(&bytes[5..]);
+            let len = cur.u32()? as usize;
+            let data = cur.rest();
+            if len > data.len().saturating_mul(255).saturating_add(64) {
+                return Err(corrupt("implausible batch size"));
+            }
+            raw = lz4_flex::block::decompress(data, len).map_err(|_| corrupt("batch does not decompress"))?;
+            &raw
+        }
+        _ => return Err(corrupt("unknown batch compression")),
+    };
+    let mut cur = Cur::new(body);
+    let ncols = cur.u32()? as usize;
+    let rows = cur.u32()? as usize;
+    if ncols > body.len() {
+        return Err(corrupt("column count exceeds the batch"));
+    }
+    let mut fields = Vec::with_capacity(ncols);
+    let mut columns = Vec::with_capacity(ncols);
+    for _ in 0..ncols {
+        let name = cur.string()?;
+        let (tag, scale, nullable) = (cur.u8()?, cur.u8()?, cur.u8()?);
+        let ty = ColumnType::from_tag(tag, scale).ok_or_else(|| corrupt("unknown column type in batch"))?;
+        let col = decode_column(cur.bytes()?, ty, rows)?;
+        if col.len() != rows {
+            return Err(corrupt("batch column has the wrong length"));
+        }
+        fields.push(crate::Field { name, ty, nullable: nullable != 0 });
+        columns.push(col);
+    }
+    if cur.remaining() != 0 {
+        return Err(corrupt("trailing bytes in batch"));
+    }
+    crate::Batch::new(Arc::new(crate::Schema::new(fields)), columns)
 }

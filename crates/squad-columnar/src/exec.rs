@@ -77,6 +77,30 @@ impl TableSource {
                     }
                     let mut required = Vec::new();
                     p.required_values(&mut required);
+                    // A JSON column's bloom filter holds fields, not values.
+                    required.retain(|(c, _)| self.schema.columns[*c].ty != crate::ColumnType::Json);
+                    let mut json = Vec::new();
+                    p.required_json(&mut json);
+                    json.retain(|(c, _)| self.schema.columns[*c].ty == crate::ColumnType::Json);
+                    // Fetch the bloom filters to consult together.
+                    let bloom_ranges: Vec<(u64, u64)> = json
+                        .iter()
+                        .map(|(c, _)| *c)
+                        .chain(required.iter().map(|(c, _)| *c))
+                        .flat_map(|c| seg.bloom_range(g, c))
+                        .collect();
+                    if bloom_ranges.len() > 1 {
+                        seg.source().prefetch(&bloom_ranges);
+                    }
+                    for (c, hashes) in json {
+                        if meta.columns[c].has_bloom() {
+                            if let Some(bloom) = seg.bloom(g, c)? {
+                                if !hashes.iter().any(|h| bloom.may_contain_hash(*h)) {
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                    }
                     for (c, values) in required {
                         if meta.columns[c].has_bloom() {
                             if let Some(bloom) = seg.bloom(g, c)? {
@@ -86,6 +110,13 @@ impl TableSource {
                             }
                         }
                     }
+                }
+                // Then the column chunks, in one go where the source can.
+                let mut wanted: Vec<usize> = pred_cols.clone();
+                wanted.extend(columns.iter().copied().filter(|c| !pred_cols.contains(c)));
+                let ranges = seg.chunk_ranges(g, &wanted, false);
+                if ranges.len() > 1 {
+                    seg.source().prefetch(&ranges);
                 }
                 for &c in &pred_cols {
                     cols[c] = Some(seg.read_column(g, c)?);

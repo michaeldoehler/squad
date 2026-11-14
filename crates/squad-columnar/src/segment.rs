@@ -22,7 +22,8 @@ use std::io;
 use std::sync::Arc;
 
 use crate::encoding::{decode_column, encode_column};
-use crate::types::{cmp_datum, cmp_f64, Batch, Column, ColumnData, ColumnType, Datum, Field, Schema};
+use crate::json;
+use crate::types::{cmp_datum, cmp_f64, Batch, Column, ColumnBuilder, ColumnData, ColumnType, Datum, Field, Schema};
 use crate::util::{corrupt, hash_bytes, hash_u64, Cur, FastSet, Put};
 use crate::{Error, Result};
 
@@ -42,6 +43,9 @@ pub trait ChunkSource: Send + Sync {
     }
     /// Returns exactly `len` bytes starting at `offset`.
     fn read(&self, offset: u64, len: u64) -> io::Result<Vec<u8>>;
+    /// Announces ranges (offset, length) that are about to be read, so
+    /// that a remote source can fetch them together. Optional.
+    fn prefetch(&self, _ranges: &[(u64, u64)]) {}
 }
 
 impl ChunkSource for Vec<u8> {
@@ -171,8 +175,10 @@ fn upper_bound(v: &[u8]) -> Datum {
     Datum::Null
 }
 
-/// Statistics and, for integer and byte columns, a bloom filter.
-pub(crate) fn compute_stats(col: &Column) -> (ColumnStats, Option<Bloom>) {
+/// Statistics and, for integer and byte columns, a bloom filter. For
+/// JSON columns the bloom filter holds the documents' top-level keys and
+/// key/value pairs (see [`crate::json`]).
+pub(crate) fn compute_stats(col: &Column, ty: ColumnType) -> (ColumnStats, Option<Bloom>) {
     let rows = col.len();
     let valid = |i: usize| !col.is_null(i);
     let mut stats = ColumnStats {
@@ -272,9 +278,25 @@ pub(crate) fn compute_stats(col: &Column) -> (ColumnStats, Option<Bloom>) {
             if let (Some(lo), Some(hi)) = (min, max) {
                 stats.min = Datum::Bytes(lo[..lo.len().min(BOUND_LEN)].to_vec());
                 stats.max = upper_bound(hi);
-                let mut f = Bloom::with_capacity(set.len());
-                set.iter().for_each(|h| f.insert(*h));
-                bloom = Some(f);
+                if ty == ColumnType::Json {
+                    let mut entries: FastSet<u64> = FastSet::default();
+                    let docs: FastSet<&[u8]> = (0..rows).filter(|i| valid(*i)).map(|i| b.get(i)).collect();
+                    for doc in docs {
+                        json::for_each_field(doc, |k, v| {
+                            entries.insert(json::json_key_hash(k));
+                            if let Some(v) = v {
+                                entries.insert(json::json_pair_hash(k, v));
+                            }
+                        });
+                    }
+                    let mut f = Bloom::with_capacity(entries.len());
+                    entries.iter().for_each(|h| f.insert(*h));
+                    bloom = Some(f);
+                } else {
+                    let mut f = Bloom::with_capacity(set.len());
+                    set.iter().for_each(|h| f.insert(*h));
+                    bloom = Some(f);
+                }
             }
             stats.distinct = set.len() as u64;
         }
@@ -392,76 +414,190 @@ impl SegmentWriter {
             }
         }
 
+        let mut body = SegmentBody::new(schema, options);
+        let group_rows = body.options.row_group_rows.max(1);
+        let groups = rows.div_ceil(group_rows);
+        for g in 0..groups {
+            let (start, end) = (g * group_rows, ((g + 1) * group_rows).min(rows));
+            if groups == 1 {
+                body.write_group(&all.columns)?;
+            } else {
+                let indices: Vec<u32> = (start as u32..end as u32).collect();
+                let part: Vec<Column> = all.columns.iter().map(|c| c.take(&indices)).collect();
+                body.write_group(&part)?;
+            }
+        }
+        body.finish()
+    }
+}
+
+/// The part of a segment written so far: chunks, and the directory
+/// entries of the row groups they belong to.
+struct SegmentBody {
+    schema: Arc<Schema>,
+    options: WriterOptions,
+    out: Vec<u8>,
+    groups: Vec<u8>,
+    ngroups: u32,
+    rows: u64,
+}
+
+impl SegmentBody {
+    fn new(schema: Arc<Schema>, options: WriterOptions) -> SegmentBody {
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
-        let mut footer = Vec::new();
+        SegmentBody { schema, options, out, groups: Vec::new(), ngroups: 0, rows: 0 }
+    }
+
+    /// Writes one row group.
+    fn write_group(&mut self, columns: &[Column]) -> Result<()> {
+        let n = columns.first().map_or(0, Column::len);
+        if n == 0 {
+            return Ok(());
+        }
+        if self.rows + n as u64 > u32::MAX as u64 {
+            return Err(Error::Invalid("a segment holds at most 2^32 - 1 rows".into()));
+        }
+        let (out, footer) = (&mut self.out, &mut self.groups);
+        footer.put_u32(n as u32);
+        for (col, field) in columns.iter().zip(&self.schema.columns) {
+            let (stats, bloom) = compute_stats(col, field.ty);
+            let raw = encode_column(col);
+            let (comp, data) = match self.options.compress.then(|| lz4_flex::block::compress(&raw)) {
+                Some(c) if c.len() * 10 <= raw.len() * 9 => (1u8, c),
+                _ => (0u8, raw.clone()),
+            };
+            let mut chunk = Vec::with_capacity(data.len() + 5);
+            chunk.put_u8(comp);
+            chunk.put_u32(raw.len() as u32);
+            chunk.extend_from_slice(&data);
+            footer.put_u64(out.len() as u64);
+            footer.put_u32(chunk.len() as u32 + 4);
+            out.put_u32(crc32c::crc32c(&chunk));
+            out.extend_from_slice(&chunk);
+            match bloom {
+                Some(b) => {
+                    let mut chunk = vec![b.hashes];
+                    chunk.extend_from_slice(&b.bits);
+                    footer.put_u64(out.len() as u64);
+                    footer.put_u32(chunk.len() as u32 + 4);
+                    out.put_u32(crc32c::crc32c(&chunk));
+                    out.extend_from_slice(&chunk);
+                }
+                None => {
+                    footer.put_u64(0);
+                    footer.put_u32(0);
+                }
+            }
+            footer.put_datum(&stats.min);
+            footer.put_datum(&stats.max);
+            footer.put_u64(stats.null_count);
+            footer.put_u64(stats.distinct);
+        }
+        self.ngroups += 1;
+        self.rows += n as u64;
+        Ok(())
+    }
+
+    /// Bytes written so far.
+    fn len(&self) -> usize {
+        self.out.len() + self.groups.len()
+    }
+
+    fn finish(self) -> Result<Vec<u8>> {
+        let SegmentBody { schema, options, mut out, groups, ngroups, rows } = self;
+        let mut footer = Vec::with_capacity(groups.len() + 64 * schema.len());
         footer.put_u32(VERSION);
         footer.put_u32(schema.len() as u32);
         for f in &schema.columns {
             footer.put_bytes(f.name.as_bytes());
-            let (tag, scale) = match f.ty {
-                ColumnType::Bool => (0, 0),
-                ColumnType::Int64 => (1, 0),
-                ColumnType::Float64 => (2, 0),
-                ColumnType::Decimal { scale } => (3, scale),
-                ColumnType::Bytes => (4, 0),
-                ColumnType::Utf8 => (5, 0),
-            };
+            let (tag, scale) = f.ty.tag();
             footer.put_u8(tag);
             footer.put_u8(scale);
             footer.put_u8(f.nullable as u8);
         }
         footer.put_u32(options.sort_key.len() as u32);
         options.sort_key.iter().for_each(|c| footer.put_u32(*c as u32));
-        footer.put_u64(rows as u64);
-        let group_rows = options.row_group_rows.max(1);
-        let groups = rows.div_ceil(group_rows);
-        footer.put_u32(groups as u32);
-        for g in 0..groups {
-            let (start, end) = (g * group_rows, ((g + 1) * group_rows).min(rows));
-            let indices: Vec<u32> = (start as u32..end as u32).collect();
-            footer.put_u32((end - start) as u32);
-            for col in &all.columns {
-                let part = if groups == 1 { col.clone() } else { col.take(&indices) };
-                let (stats, bloom) = compute_stats(&part);
-                let raw = encode_column(&part);
-                let (comp, data) = match options.compress.then(|| lz4_flex::block::compress(&raw)) {
-                    Some(c) if c.len() * 10 <= raw.len() * 9 => (1u8, c),
-                    _ => (0u8, raw.clone()),
-                };
-                let mut chunk = Vec::with_capacity(data.len() + 5);
-                chunk.put_u8(comp);
-                chunk.put_u32(raw.len() as u32);
-                chunk.extend_from_slice(&data);
-                footer.put_u64(out.len() as u64);
-                footer.put_u32(chunk.len() as u32 + 4);
-                out.put_u32(crc32c::crc32c(&chunk));
-                out.extend_from_slice(&chunk);
-                match bloom {
-                    Some(b) => {
-                        let mut chunk = vec![b.hashes];
-                        chunk.extend_from_slice(&b.bits);
-                        footer.put_u64(out.len() as u64);
-                        footer.put_u32(chunk.len() as u32 + 4);
-                        out.put_u32(crc32c::crc32c(&chunk));
-                        out.extend_from_slice(&chunk);
-                    }
-                    None => {
-                        footer.put_u64(0);
-                        footer.put_u32(0);
-                    }
-                }
-                footer.put_datum(&stats.min);
-                footer.put_datum(&stats.max);
-                footer.put_u64(stats.null_count);
-                footer.put_u64(stats.distinct);
-            }
-        }
+        footer.put_u64(rows);
+        footer.put_u32(ngroups);
+        footer.extend_from_slice(&groups);
         out.extend_from_slice(&footer);
         out.put_u32(footer.len() as u32);
         out.put_u32(crc32c::crc32c(&footer));
         out.extend_from_slice(MAGIC);
         Ok(out)
+    }
+}
+
+/// Writes a segment from batches that arrive already in their final
+/// order, holding at most one row group of decoded values at a time.
+/// `options.sort_key` is recorded in the footer but not applied.
+pub struct SegmentStreamWriter {
+    body: SegmentBody,
+    pending: Vec<Column>,
+}
+
+impl SegmentStreamWriter {
+    pub fn new(schema: Arc<Schema>, options: WriterOptions) -> Result<SegmentStreamWriter> {
+        if options.sort_key.iter().any(|c| *c >= schema.len()) {
+            return Err(Error::Invalid("sort key names a column that does not exist".into()));
+        }
+        let pending = schema.columns.iter().map(|f| ColumnBuilder::new(f.ty).finish()).collect();
+        Ok(SegmentStreamWriter { body: SegmentBody::new(schema, options), pending })
+    }
+
+    /// Appends rows; full row groups are encoded right away.
+    pub fn write_batch(&mut self, batch: &Batch) -> Result<()> {
+        let schema = &self.body.schema;
+        if batch.columns.len() != schema.len()
+            || batch.schema.columns.iter().zip(&schema.columns).any(|(a, b)| a.ty != b.ty)
+        {
+            return Err(Error::Type("batch schema does not match the segment schema".into()));
+        }
+        let group = self.body.options.row_group_rows.max(1);
+        let mut start = 0;
+        let n = batch.num_rows();
+        while start < n {
+            let have = self.pending.first().map_or(0, Column::len);
+            let take = (group - have).min(n - start);
+            if have == 0 && take == group && start == 0 && n == group {
+                // A whole row group in one piece.
+                self.body.write_group(&batch.columns)?;
+                return Ok(());
+            }
+            let indices: Vec<u32> = (start as u32..(start + take) as u32).collect();
+            for (p, c) in self.pending.iter_mut().zip(&batch.columns) {
+                p.append(&c.take(&indices));
+            }
+            start += take;
+            if have + take == group {
+                self.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        let empty: Vec<Column> = self.body.schema.columns.iter().map(|f| ColumnBuilder::new(f.ty).finish()).collect();
+        let full = std::mem::replace(&mut self.pending, empty);
+        self.body.write_group(&full)
+    }
+
+    /// Rows written so far.
+    pub fn num_rows(&self) -> u64 {
+        self.body.rows + self.pending.first().map_or(0, Column::len) as u64
+    }
+
+    /// Encoded bytes so far (excluding a partial row group).
+    pub fn num_bytes(&self) -> usize {
+        self.body.len()
+    }
+
+    pub fn finish(mut self) -> Result<Vec<u8>> {
+        if self.pending.first().is_some_and(|c| !c.is_empty()) {
+            self.flush()?;
+        }
+        self.body.finish()
     }
 }
 
@@ -473,6 +609,9 @@ pub struct ChunkMeta {
     bloom_offset: u64,
     bloom_len: u32,
     pub stats: ColumnStats,
+    /// Set for a column the segment does not store (see
+    /// [`Segment::project`]): every row holds this value.
+    constant: Option<Datum>,
 }
 
 impl ChunkMeta {
@@ -489,6 +628,15 @@ impl ChunkMeta {
 pub struct RowGroupMeta {
     pub rows: u32,
     pub columns: Vec<ChunkMeta>,
+}
+
+/// Where a column of a [`Segment::project`]ed segment comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProjectedColumn {
+    /// The segment's own column at this position.
+    Stored(usize),
+    /// Not stored: every row has this value.
+    Constant(Datum),
 }
 
 /// An open segment: metadata in memory, data fetched on demand.
@@ -557,15 +705,7 @@ impl Segment {
         for _ in 0..ncols {
             let name = cur.string()?;
             let (tag, scale, nullable) = (cur.u8()?, cur.u8()?, cur.u8()?);
-            let ty = match tag {
-                0 => ColumnType::Bool,
-                1 => ColumnType::Int64,
-                2 => ColumnType::Float64,
-                3 => ColumnType::Decimal { scale },
-                4 => ColumnType::Bytes,
-                5 => ColumnType::Utf8,
-                _ => return Err(corrupt("unknown column type")),
-            };
+            let ty = ColumnType::from_tag(tag, scale).ok_or_else(|| corrupt("unknown column type"))?;
             columns.push(Field { name, ty, nullable: nullable != 0 });
         }
         let nsort = cur.u32()? as usize;
@@ -615,6 +755,7 @@ impl Segment {
                     bloom_offset,
                     bloom_len,
                     stats: ColumnStats { min, max, rows: group_rows as u64, null_count, distinct },
+                    constant: None,
                 });
             }
             groups.push(RowGroupMeta { rows: group_rows, columns: chunks });
@@ -674,6 +815,9 @@ impl Segment {
     pub fn read_column(&self, row_group: usize, column: usize) -> Result<Column> {
         let group = &self.groups[row_group];
         let meta = &group.columns[column];
+        if let Some(value) = &meta.constant {
+            return Column::constant(self.schema.columns[column].ty, value, group.rows as usize);
+        }
         let bytes = self.read_chunk(meta.offset, meta.len)?;
         let mut cur = Cur::new(&bytes[4..]);
         let comp = cur.u8()?;
@@ -722,6 +866,105 @@ impl Segment {
         let schema = Schema::new(columns.iter().map(|&c| self.schema.columns[c].clone()).collect());
         let cols = columns.iter().map(|&c| self.read_column(row_group, c)).collect::<Result<Vec<_>>>()?;
         Batch::new(Arc::new(schema), cols)
+    }
+
+    /// The same rows with the columns of `schema`: column `i` is stored
+    /// column `columns[i]` or, where that is a constant, that value in
+    /// every row. Nothing is read; data is still fetched on demand from
+    /// the same source. Used to read segments written before columns
+    /// were added to, dropped from or reordered in a table.
+    pub fn project(&self, schema: Arc<Schema>, columns: &[ProjectedColumn]) -> Result<Segment> {
+        if columns.len() != schema.len() {
+            return Err(Error::Invalid("projection does not match its schema".into()));
+        }
+        for (spec, field) in columns.iter().zip(&schema.columns) {
+            if let ProjectedColumn::Stored(c) = spec {
+                let stored = self.schema.columns.get(*c).ok_or_else(|| Error::Invalid(format!("no column {c}")))?;
+                if !stored.ty.reads_as(&field.ty) {
+                    return Err(Error::Type(format!(
+                        "segment column {} of type {:?} cannot be read as {:?}",
+                        stored.name, stored.ty, field.ty
+                    )));
+                }
+            }
+        }
+        let constant_stats = |value: &Datum, rows: u64| ColumnStats {
+            min: value.clone(),
+            max: value.clone(),
+            rows,
+            null_count: if value.is_null() { rows } else { 0 },
+            distinct: u64::from(!value.is_null() && rows > 0),
+        };
+        let groups = self
+            .groups
+            .iter()
+            .map(|g| RowGroupMeta {
+                rows: g.rows,
+                columns: columns
+                    .iter()
+                    .zip(&schema.columns)
+                    .map(|(spec, field)| match spec {
+                        ProjectedColumn::Stored(c) => {
+                            let mut meta = g.columns[*c].clone();
+                            // A text bloom filter is not a JSON one.
+                            if self.schema.columns[*c].ty != field.ty {
+                                meta.bloom_len = 0;
+                            }
+                            meta
+                        }
+                        ProjectedColumn::Constant(v) => ChunkMeta {
+                            offset: 0,
+                            len: 0,
+                            bloom_offset: 0,
+                            bloom_len: 0,
+                            stats: constant_stats(v, g.rows as u64),
+                            constant: Some(v.clone()),
+                        },
+                    })
+                    .collect(),
+            })
+            .collect();
+        let stats = columns
+            .iter()
+            .map(|spec| match spec {
+                ProjectedColumn::Stored(c) => self.stats[*c].clone(),
+                ProjectedColumn::Constant(v) => constant_stats(v, self.rows),
+            })
+            .collect();
+        let sort_key = self
+            .sort_key
+            .iter()
+            .map_while(|k| columns.iter().position(|spec| *spec == ProjectedColumn::Stored(*k)))
+            .collect();
+        Ok(Segment { source: self.source.clone(), schema, sort_key, rows: self.rows, groups, stats })
+    }
+
+    /// Byte ranges (offset, length) of the stored chunks of the given
+    /// columns in a row group, and of their bloom filters if `blooms`.
+    pub fn chunk_ranges(&self, row_group: usize, columns: &[usize], blooms: bool) -> Vec<(u64, u64)> {
+        let group = &self.groups[row_group];
+        let mut out = Vec::new();
+        for &c in columns {
+            let m = &group.columns[c];
+            if m.constant.is_none() {
+                out.push((m.offset, m.len as u64));
+                if blooms && m.bloom_len > 0 {
+                    out.push((m.bloom_offset, m.bloom_len as u64));
+                }
+            }
+        }
+        out
+    }
+
+    /// Byte range of the bloom filter of a column chunk, if it has one.
+    pub fn bloom_range(&self, row_group: usize, column: usize) -> Option<(u64, u64)> {
+        let m = &self.groups[row_group].columns[column];
+        (m.bloom_len > 0).then_some((m.bloom_offset, m.bloom_len as u64))
+    }
+
+    /// The byte source the segment reads from.
+    pub fn source(&self) -> &Arc<dyn ChunkSource> {
+        &self.source
     }
 
     /// Reads the whole segment.
