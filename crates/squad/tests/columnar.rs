@@ -851,3 +851,78 @@ fn vacuum_removes_orphaned_segment_objects_after_the_grace_period() {
     assert_eq!(segment_objects(dir.path()), live);
     assert_eq!(conn.query_one("SELECT count(*), sum(n) FROM e", &[]).unwrap().get::<i64>(1), 500500);
 }
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let target = to.join(e.file_name());
+        if e.path().is_dir() {
+            copy_dir(&e.path(), &target);
+        } else {
+            std::fs::copy(e.path(), target).unwrap();
+        }
+    }
+}
+
+/// A database written by squad 0.1.0 before delta blocks, column ids and
+/// JSON columns (`tests/data/columnar-v0.1`, made by inserting rows 1–370
+/// with two compactions in between: two segments with a `SQMANI01`
+/// manifest and 20 delta rows stored one per key) is read, changed and
+/// compacted by this version.
+#[test]
+fn databases_of_the_previous_format_are_read_and_upgraded() {
+    let dir = tempfile::tempdir().unwrap();
+    copy_dir(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/columnar-v0.1"), dir.path());
+    let db = Database::open(dir.path(), Config { columnar: manual(), ..Config::default() }).unwrap();
+    let conn = db.connect();
+    fn expect(conn: &Connection, stage: &str, n: i64) {
+        let fast = conn
+            .query_one(
+                "SELECT count(*), sum(n)::int8, count(DISTINCT props ->> 's') FROM ev WHERE props ->> 'k' IS NOT NULL",
+                &[],
+            )
+            .unwrap();
+        let slow =
+            conn.query_one("SELECT count(*), sum(n + 0)::int8 FROM ev WHERE props::text LIKE '%k%'", &[]).unwrap();
+        let by_field: i64 = conn.query_one("SELECT count(*) FROM ev WHERE props ->> 's' = 'v1'", &[]).unwrap().get(0);
+        assert_eq!(fast.get::<i64>(0), n, "{stage}");
+        assert_eq!(fast.get::<i64>(1), n * (n + 1) / 2, "{stage}");
+        assert_eq!(fast.get::<i64>(2), 2, "{stage}");
+        assert_eq!((slow.get::<i64>(0), slow.get::<i64>(1)), (n, n * (n + 1) / 2), "{stage}");
+        assert_eq!(by_field, n / 2, "{stage}");
+    }
+    expect(&conn, "as written by 0.1.0", 370);
+    // New rows go to blocks next to the old delta rows.
+    conn.execute(
+        "INSERT INTO ev SELECT timestamp '2024-01-01' + g * interval '1 minute', g % 3, 'e' || (g % 4), g,
+                jsonb_build_object('k', g % 5, 's', 'v' || (g % 2)) FROM generate_series(371, 400) g",
+        &[],
+    )
+    .unwrap();
+    expect(&conn, "with new rows", 400);
+    // Deletes reach old delta rows, segments and blocks.
+    assert_eq!(conn.execute("DELETE FROM ev WHERE n > 395 OR n = 360 OR n = 10", &[]).unwrap(), 7);
+    conn.execute(
+        "INSERT INTO ev SELECT timestamp '2024-01-01' + g * interval '1 minute', g % 3, 'e' || (g % 4), g,
+                jsonb_build_object('k', g % 5, 's', 'v' || (g % 2)) FROM unnest(ARRAY[10, 360]) g",
+        &[],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO ev SELECT timestamp '2024-01-01' + g * interval '1 minute', g % 3, 'e' || (g % 4), g,
+                jsonb_build_object('k', g % 5, 's', 'v' || (g % 2)) FROM generate_series(396, 400) g",
+        &[],
+    )
+    .unwrap();
+    // A schema change converts the old delta rows first.
+    conn.batch_execute("ALTER TABLE ev ADD COLUMN extra int DEFAULT 1").unwrap();
+    expect(&conn, "after ADD COLUMN", 400);
+    assert_eq!(conn.query_one("SELECT sum(extra)::int8 FROM ev", &[]).unwrap().get::<i64>(0), 400);
+    conn.batch_execute("VACUUM ev").unwrap();
+    expect(&conn, "compacted", 400);
+    drop(conn);
+    drop(db);
+    let db = Database::open(dir.path(), Config { columnar: manual(), ..Config::default() }).unwrap();
+    let conn = db.connect();
+    expect(&conn, "reopened", 400);
+}
