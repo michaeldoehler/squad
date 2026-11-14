@@ -1,11 +1,12 @@
 //! Columnar tables must answer every query exactly like an ordinary table
 //! holding the same rows, whatever the split between delta and segments.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use squad::{sqlstate, Config, Connection, Database, FnCtx};
+use squad::object::ObjectStore as _;
+use squad::{sqlstate, ColumnarConfig, Config, Connection, Database, FnCtx, Value};
 
 const COLUMNS: &str = "ts timestamp NOT NULL, project int NOT NULL, name text NOT NULL, user_id bigint, \
                        duration int, score double precision, revenue numeric(10,2), ok boolean, \
@@ -74,6 +75,8 @@ const QUERIES: &[&str] = &[
     // Shapes the column engine cannot run: they take the row path.
     "SELECT name, sum(duration + 1), count(*) FILTER (WHERE ok) FROM {t} GROUP BY name ORDER BY name",
     "SELECT props ->> 's' AS s, count(*) FROM {t} GROUP BY 1 ORDER BY 1",
+    "SELECT props ->> 'k' AS k, count(*), sum(duration) FROM {t} WHERE props ->> 's' IN ('v0', 'v2') GROUP BY 1 ORDER BY 1",
+    "SELECT count(*) FROM {t} WHERE props ->> 'k' = '2' OR props ->> 'nope' IS NOT NULL",
     "SELECT count(*) FROM {t} WHERE props @> '{\"k\": 2}' AND tags[1] = 't1'",
     "SELECT upper(name), string_agg(DISTINCT project::text, ',' ORDER BY project::text) FROM {t} GROUP BY 1 ORDER BY 1",
     "SELECT ts, project, name, user_id, duration, score, revenue, ok, day, id, props, tags FROM {t} WHERE user_id = 5 AND project = 1 ORDER BY ts",
@@ -187,7 +190,11 @@ fn restrictions_are_reported() {
     conn.batch_execute("CREATE TABLE c (id int NOT NULL CHECK (id > 0), v text DEFAULT 'd') USING columnar").unwrap();
     unsupported("UPDATE c SET v = 'x'");
     unsupported("CREATE INDEX ON c (id)");
-    unsupported("ALTER TABLE c ADD COLUMN z int");
+    unsupported("ALTER TABLE c ALTER COLUMN v TYPE int");
+    unsupported("ALTER TABLE c ADD COLUMN z serial");
+    unsupported("ALTER TABLE c ADD COLUMN z float8 DEFAULT random()");
+    unsupported("ALTER TABLE c ADD CONSTRAINT k CHECK (id < 100)");
+    unsupported("SELECT * FROM c FOR UPDATE");
     unsupported("DELETE FROM c RETURNING id");
     // Row constraints still apply on insert.
     assert_eq!(conn.batch_execute("INSERT INTO c (id) VALUES (0)").unwrap_err().code(), sqlstate::CHECK_VIOLATION);
@@ -292,9 +299,555 @@ fn large_inserts_compact_automatically() {
     let db = Database::open_in_memory().unwrap();
     let conn = db.connect();
     conn.batch_execute("CREATE TABLE e (n int) USING columnar").unwrap();
-    conn.execute("INSERT INTO e SELECT g FROM generate_series(1, 150000) g", &[]).unwrap();
-    // The delta was moved into a segment by the inserting session.
+    // Batches below the bulk-insert size go to the delta; the background
+    // compactor moves them into segments.
+    for b in 0..5 {
+        conn.execute("INSERT INTO e SELECT g FROM generate_series($1 * 30000 + 1, ($1 + 1) * 30000) g", &[&(b as i64)])
+            .unwrap();
+    }
+    assert!(db.wait_for_compaction(std::time::Duration::from_secs(60)));
     let plan = rows(&conn, "EXPLAIN ANALYZE SELECT count(*) FROM e");
     assert!(plan[0][0].starts_with("Columnar"), "{plan:?}");
     assert_eq!(conn.query_one("SELECT count(*), sum(n) FROM e", &[]).unwrap().get::<i64>(1), 150000 * 150001 / 2);
+}
+
+/// Settings for tests that decide themselves when compaction runs.
+fn manual() -> ColumnarConfig {
+    ColumnarConfig { background_compaction: false, ..ColumnarConfig::default() }
+}
+
+fn segment_objects(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    fn go(d: &std::path::Path, out: &mut Vec<String>) {
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            if e.path().is_dir() {
+                go(&e.path(), out);
+            } else {
+                out.push(e.path().to_string_lossy().into_owned());
+            }
+        }
+    }
+    go(&dir.join("objects/columnar"), &mut out);
+    out.sort();
+    out
+}
+
+const ALTERED_QUERIES: &[&str] = &[
+    "SELECT count(*), count(extra), sum(extra), min(extra), max(extra), count(note), count(DISTINCT note) FROM {t}",
+    "SELECT event, extra, count(*), sum(user_id) FROM {t} GROUP BY event, extra ORDER BY 1, 2",
+    "SELECT count(*) FROM {t} WHERE extra = 5",
+    "SELECT count(*) FROM {t} WHERE extra IS NULL OR note IS NULL",
+    "SELECT count(*) FROM {t} WHERE note = 'n3' AND extra > 5",
+    "SELECT note, count(*) FROM {t} GROUP BY note ORDER BY note NULLS FIRST",
+    "SELECT event, project, extra, note, ts FROM {t} WHERE user_id = 17 ORDER BY ts, event",
+    "SELECT date_trunc('day', ts), sum(extra) FROM {t} GROUP BY 1 ORDER BY 1",
+    "SELECT count(*) FROM {t} WHERE event LIKE 'c%' AND extra + 0 = 5",
+];
+
+fn compare_altered(conn: &Connection, stage: &str) {
+    for q in ALTERED_QUERIES {
+        let expected = rows(conn, &q.replace("{t}", "plain"));
+        let actual = rows(conn, &q.replace("{t}", "col"));
+        assert_eq!(actual, expected, "{stage}: {q}");
+    }
+}
+
+#[test]
+fn alter_table_adds_drops_and_renames_columns_without_rewriting_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path(), Config { columnar: manual(), ..Config::default() }).unwrap();
+    let conn = db.connect();
+    setup(&conn);
+    load(&conn, 1, 3000);
+    conn.batch_execute("VACUUM col").unwrap();
+    load(&conn, 3001, 3500);
+    let before = segment_objects(dir.path());
+    assert_eq!(before.len(), 1);
+
+    for sql in [
+        "ALTER TABLE {t} ADD COLUMN extra int DEFAULT 5",
+        "ALTER TABLE {t} ADD COLUMN note text",
+        "ALTER TABLE {t} DROP COLUMN duration",
+        "ALTER TABLE {t} RENAME COLUMN name TO event",
+        "ALTER TABLE {t} DROP COLUMN tags",
+        "ALTER TABLE {t} ALTER COLUMN extra SET DEFAULT 6",
+    ] {
+        for t in ["plain", "col"] {
+            conn.batch_execute(&sql.replace("{t}", t)).unwrap();
+        }
+    }
+    // No segment was rewritten.
+    assert_eq!(segment_objects(dir.path()), before);
+    compare_altered(&conn, "after ALTER");
+    // Adding a NOT NULL column without default fails on a non-empty table.
+    for t in ["plain", "col"] {
+        let err = conn.batch_execute(&format!("ALTER TABLE {t} ADD COLUMN must int NOT NULL")).unwrap_err();
+        assert_eq!(err.code(), sqlstate::NOT_NULL_VIOLATION, "{t}");
+    }
+    // Rows written after the change have the new columns.
+    for t in ["plain", "col"] {
+        conn.execute(
+            &format!(
+                "INSERT INTO {t} (ts, project, event, user_id, note)
+                 SELECT timestamp '2024-03-01' + g * interval '1 minute', g % 5, 'click', g % 40, 'n' || (g % 7)
+                 FROM generate_series(1, 400) g"
+            ),
+            &[],
+        )
+        .unwrap();
+        conn.execute(&format!("INSERT INTO {t} (ts, project, event, extra) VALUES ('2024-03-02', 1, 'buy', 9)"), &[])
+            .unwrap();
+    }
+    compare_altered(&conn, "delta after ALTER");
+    // Segments of different column layouts are merged into one.
+    conn.batch_execute("VACUUM col").unwrap();
+    compare_altered(&conn, "compacted after ALTER");
+    for _ in 0..8 {
+        for t in ["plain", "col"] {
+            conn.execute(
+                &format!("INSERT INTO {t} (ts, project, event, extra, note) VALUES (now(), 2, 'view', 1, 'n1')"),
+                &[],
+            )
+            .unwrap();
+        }
+        conn.batch_execute("VACUUM col").unwrap();
+    }
+    compare_altered(&conn, "merged");
+    // Dropping and re-adding a column of the same name does not bring old
+    // values back.
+    for t in ["plain", "col"] {
+        conn.batch_execute(&format!("ALTER TABLE {t} DROP COLUMN note; ALTER TABLE {t} ADD COLUMN note text")).unwrap();
+    }
+    compare_altered(&conn, "re-added");
+    drop(conn);
+    drop(db);
+    let db = Database::open(dir.path(), Config { columnar: manual(), ..Config::default() }).unwrap();
+    compare_altered(&db.connect(), "after reopen");
+}
+
+/// Queries on a `jsonb` column whose filters and groupings the column
+/// engine runs.
+const JSON_QUERIES: &[&str] = &[
+    "SELECT count(*) FROM {t} WHERE props ->> 's' = 'v1'",
+    "SELECT count(*) FROM {t} WHERE 'v2' = props ->> 's' AND project = 3",
+    "SELECT count(*) FROM {t} WHERE props ->> 'k' IN ('1', '3')",
+    "SELECT count(*) FROM {t} WHERE props ->> 'k' NOT IN ('1', '3')",
+    "SELECT count(*) FROM {t} WHERE props ->> 'k' <> '2'",
+    "SELECT count(*) FROM {t} WHERE props ->> 'missing' IS NULL",
+    "SELECT count(*) FROM {t} WHERE props ->> 'n' IS NOT NULL",
+    "SELECT count(*) FROM {t} WHERE props ->> 'n' IS NULL AND props ->> 's' = 'v0'",
+    "SELECT count(*) FROM {t} WHERE props ->> 'o' = '{\"x\": [1, \"a\"]}'",
+    "SELECT count(*) FROM {t} WHERE props ->> 'q' = 'say \"hi\"'",
+    "SELECT props ->> 's', count(*), sum(duration) FROM {t} GROUP BY 1 ORDER BY 1 NULLS FIRST",
+    "SELECT props ->> 'k', props ->> 's', count(*) FROM {t} WHERE props ->> 'n' IS NULL GROUP BY 1, 2 ORDER BY 1, 2",
+    "SELECT project, props ->> 'missing', count(*) FROM {t} GROUP BY 1, 2 ORDER BY 1, 2",
+    "SELECT ts, props FROM {t} WHERE props ->> 's' = 'v1' AND user_id = 7 ORDER BY ts",
+    "SELECT count(*) FROM {t} WHERE props ->> 's' = $1",
+];
+
+#[test]
+fn jsonb_filters_and_groupings_match_the_row_engine() {
+    let db = Database::open_in_memory_with(manual()).unwrap();
+    let conn = db.connect();
+    setup(&conn);
+    for t in ["plain", "col"] {
+        conn.execute(
+            &format!(
+                "INSERT INTO {t} (ts, project, name, user_id, duration, props)
+                 SELECT timestamp '2024-01-01' + g * interval '1 minute', g % 5, 'e', g % 50, g % 100,
+                        CASE WHEN g % 13 = 0 THEN NULL
+                             WHEN g % 17 = 0 THEN '[1, 2]'::jsonb
+                             WHEN g % 19 = 0 THEN '\"scalar\"'::jsonb
+                             ELSE jsonb_build_object('k', g % 4, 's', 'v' || (g % 3),
+                                                     'n', CASE WHEN g % 5 = 0 THEN NULL ELSE g END,
+                                                     'o', CASE WHEN g % 7 = 0 THEN '{{\"x\": [1, \"a\"]}}'::jsonb END,
+                                                     'q', CASE WHEN g % 11 = 0 THEN 'say \"hi\"' END)
+                        END
+                 FROM generate_series(1, 6000) g"
+            ),
+            &[],
+        )
+        .unwrap();
+    }
+    let check = |stage: &str| {
+        for q in JSON_QUERIES {
+            let run = |t: &str| -> Vec<Vec<String>> {
+                let sql = q.replace("{t}", t);
+                let result = if sql.contains("$1") { conn.query(&sql, &[&"v2"]) } else { conn.query(&sql, &[]) };
+                let ctx = FnCtx::default();
+                result
+                    .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                    .iter()
+                    .map(|r| r.values().iter().map(|v| squad::value::format_value(v, &ctx)).collect())
+                    .collect()
+            };
+            assert_eq!(run("col"), run("plain"), "{stage}: {q}");
+        }
+    };
+    check("delta");
+    conn.batch_execute("VACUUM col").unwrap();
+    check("segments");
+    let plan = rows(&conn, "EXPLAIN SELECT props ->> 's', count(*) FROM col WHERE props ->> 'k' = '1' GROUP BY 1");
+    assert!(plan[0][0].starts_with("Columnar"), "{plan:?}");
+}
+
+/// An object store that counts what is read from segment objects.
+struct Counting {
+    inner: squad::object::MemoryStore,
+    gets: AtomicU64,
+    ranges: AtomicU64,
+    bytes: AtomicU64,
+    keys: std::sync::Mutex<std::collections::BTreeSet<String>>,
+}
+
+impl Counting {
+    fn new() -> Arc<Counting> {
+        Arc::new(Counting {
+            inner: squad::object::MemoryStore::new(),
+            gets: AtomicU64::new(0),
+            ranges: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            keys: Default::default(),
+        })
+    }
+    fn reset(&self) -> (u64, u64, u64, usize) {
+        let keys = std::mem::take(&mut *self.keys.lock().unwrap()).len();
+        (
+            self.gets.swap(0, Ordering::SeqCst),
+            self.ranges.swap(0, Ordering::SeqCst),
+            self.bytes.swap(0, Ordering::SeqCst),
+            keys,
+        )
+    }
+    fn segment_bytes(&self) -> u64 {
+        self.inner.list("columnar/").unwrap().iter().map(|m| m.size).sum()
+    }
+}
+
+impl squad::object::ObjectStore for Counting {
+    fn put(&self, key: &str, data: &[u8]) -> squad::object::Result<()> {
+        self.inner.put(key, data)
+    }
+    fn get(&self, key: &str) -> squad::object::Result<Option<Vec<u8>>> {
+        if key.starts_with("columnar/") {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get(key)
+    }
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> squad::object::Result<Vec<u8>> {
+        if key.starts_with("columnar/") {
+            self.ranges.fetch_add(1, Ordering::SeqCst);
+            self.bytes.fetch_add(len, Ordering::SeqCst);
+            self.keys.lock().unwrap().insert(key.to_string());
+        }
+        self.inner.get_range(key, offset, len)
+    }
+    fn head(&self, key: &str) -> squad::object::Result<Option<squad::object::ObjectMeta>> {
+        self.inner.head(key)
+    }
+    fn list(&self, prefix: &str) -> squad::object::Result<Vec<squad::object::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &str) -> squad::object::Result<()> {
+        self.inner.delete(key)
+    }
+}
+
+#[test]
+fn segments_are_read_in_ranges_and_pruned_by_manifest_statistics() {
+    let store = Counting::new();
+    let engine: Arc<dyn squad_storage::Engine> = Arc::new(squad_storage::MemEngine::new());
+    let open = || Database::with_engine_and_objects(engine.clone(), store.clone(), manual()).unwrap();
+    {
+        let db = open();
+        let conn = db.connect();
+        conn.batch_execute(&format!("CREATE TABLE col ({COLUMNS}) USING columnar WITH (order_by = 'project, ts')"))
+            .unwrap();
+        // Four segments, one per month.
+        for month in 1..=4 {
+            conn.execute(
+                "INSERT INTO col (ts, project, name, user_id, duration, props)
+                 SELECT make_timestamp(2024, $1, 1, 0, 0, 0) + g * interval '1 second', g % 5, 'e' || (g % 9), g, g % 1000,
+                        jsonb_build_object('k', g % 4)
+                 FROM generate_series(1, 20000) g",
+                &[&month],
+            )
+            .unwrap();
+            conn.batch_execute("VACUUM col").unwrap();
+        }
+    }
+    let total = store.segment_bytes();
+    store.reset();
+
+    // A fresh database handle has an empty cache.
+    let db = open();
+    let conn = db.connect();
+    let n: i64 =
+        conn.query_one("SELECT count(*) FROM col WHERE ts >= '2024-03-01' AND ts < '2024-03-02'", &[]).unwrap().get(0);
+    assert_eq!(n, 20000);
+    let (gets, ranges, bytes, keys) = store.reset();
+    assert_eq!(gets, 0, "segments are never fetched whole");
+    assert_eq!(keys, 1, "the manifest rules out three of four segments before any read");
+    assert!(ranges > 0 && bytes * 4 < total, "{bytes} of {total} bytes read");
+
+    // One narrow column of all segments: much less than everything.
+    let sum: i64 = conn.query_one("SELECT sum(duration) FROM col", &[]).unwrap().get(0);
+    assert!(sum > 0);
+    let (_, _, bytes, keys) = store.reset();
+    assert_eq!(keys, 4);
+    assert!(bytes * 3 < total, "a one-column aggregate read {bytes} of {total} bytes");
+    // Cached now.
+    conn.query_one("SELECT sum(duration) FROM col", &[]).unwrap();
+    assert_eq!(store.reset().1, 0, "a repeated query reads from the cache");
+
+    // Concurrent cold readers fetch every range once.
+    drop(conn);
+    drop(db);
+    let db = open();
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let conn = db.connect();
+            thread::spawn(move || {
+                conn.query_one("SELECT sum(duration) FROM col WHERE project = 2", &[]).unwrap().get::<i64>(0)
+            })
+        })
+        .collect();
+    let sums: Vec<i64> = readers.into_iter().map(|r| r.join().unwrap()).collect();
+    assert!(sums.windows(2).all(|w| w[0] == w[1]));
+    let (_, concurrent, _, _) = store.reset();
+    drop(db);
+    let db = open();
+    db.connect().query_one("SELECT sum(duration) FROM col WHERE project = 2", &[]).unwrap();
+    let (_, single, _, _) = store.reset();
+    assert!(concurrent <= single, "four concurrent cold readers made {concurrent} requests, one reader {single}");
+    let (hits, misses) = db.columnar_cache_stats();
+    assert!(misses > 0 && hits + misses > 0);
+}
+
+#[test]
+fn background_compaction_runs_alongside_inserts_deletes_and_queries() {
+    let config = ColumnarConfig {
+        compact_rows: 700,
+        compact_blocks: 6,
+        compact_age: std::time::Duration::from_millis(20),
+        ..ColumnarConfig::default()
+    };
+    let db = Database::open_in_memory_with(config).unwrap();
+    db.connect()
+        .batch_execute(
+            "CREATE TABLE e (batch int NOT NULL, n int NOT NULL, p jsonb) USING columnar WITH (order_by = 'batch')",
+        )
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    // Every batch inserts 100 rows whose `n` sum to 4950, atomically, by
+    // SQL or by the append API.
+    let writers: Vec<_> = (0..3)
+        .map(|w| {
+            let conn = db.connect();
+            thread::spawn(move || {
+                for b in 0..60 {
+                    let batch = w * 1000 + b;
+                    if b % 2 == 0 {
+                        conn.execute(
+                            "INSERT INTO e SELECT $1, g, jsonb_build_object('w', $1 % 7) FROM generate_series(0, 99) g",
+                            &[&batch],
+                        )
+                        .unwrap();
+                    } else {
+                        let rows: Vec<Vec<Value>> = (0..100)
+                            .map(|g| {
+                                vec![
+                                    Value::Int4(batch),
+                                    Value::Int4(g),
+                                    Value::Text(format!("{{\"w\": {}}}", batch % 7)),
+                                ]
+                            })
+                            .collect();
+                        assert_eq!(conn.append("e", &rows).unwrap(), 100);
+                    }
+                }
+            })
+        })
+        .collect();
+    // Deletes remove whole batches.
+    let deleter = {
+        let conn = db.connect();
+        thread::spawn(move || {
+            for b in (0..60).step_by(9) {
+                // Wait until the batch is there, then delete it.
+                while conn.execute("DELETE FROM e WHERE batch = $1", &[&b]).unwrap() == 0 {
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        })
+    };
+    let reader = {
+        let (conn, stop) = (db.connect(), stop.clone());
+        thread::spawn(move || {
+            let mut checks = 0;
+            while !stop.load(Ordering::Relaxed) {
+                // Both the column engine and the row path see whole batches
+                // only, each row exactly once.
+                let fast = conn.query_one("SELECT count(*), sum(n), count(DISTINCT batch) FROM e", &[]).unwrap();
+                let (count, sum, batches): (i64, Option<i64>, i64) = (fast.get(0), fast.get(1), fast.get(2));
+                assert_eq!(count, batches * 100, "a row was lost or duplicated");
+                assert_eq!(sum.unwrap_or(0), batches * 4950);
+                let slow = conn.query_one("SELECT count(*), sum(n + 0) FROM e WHERE p ->> 'w' <> 'x'", &[]).unwrap();
+                assert_eq!(slow.get::<i64>(0) % 100, 0);
+                checks += 1;
+            }
+            checks
+        })
+    };
+    writers.into_iter().for_each(|w| w.join().unwrap());
+    deleter.join().unwrap();
+    assert!(db.wait_for_compaction(std::time::Duration::from_secs(60)));
+    stop.store(true, Ordering::Relaxed);
+    assert!(reader.join().unwrap() > 0);
+    let conn = db.connect();
+    let deleted: i64 = conn.query_one("SELECT count(*) FROM generate_series(0, 59, 9) g", &[]).unwrap().get(0);
+    let row = conn.query_one("SELECT count(*), sum(n), count(DISTINCT batch) FROM e", &[]).unwrap();
+    let batches = 180 - deleted;
+    assert_eq!((row.get::<i64>(0), row.get::<i64>(1), row.get::<i64>(2)), (batches * 100, batches * 4950, batches));
+}
+
+#[test]
+fn closing_the_database_during_compaction_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = || Config {
+        columnar: ColumnarConfig { compact_rows: 1000, compact_blocks: 2, ..ColumnarConfig::default() },
+        ..Config::default()
+    };
+    let mut total = 0i64;
+    for round in 0..4i64 {
+        let db = Database::open(dir.path(), config()).unwrap();
+        let conn = db.connect();
+        if round == 0 {
+            conn.batch_execute("CREATE TABLE e (n bigint) USING columnar").unwrap();
+        }
+        for b in 0..20i64 {
+            let rows: Vec<Vec<Value>> = (0..500).map(|i| vec![Value::Int8(round * 100_000 + b * 1000 + i)]).collect();
+            conn.append("e", &rows).unwrap();
+            total += 500;
+        }
+        // Dropped while compactions are due or running; reopening right
+        // away must work and show every row once.
+    }
+    let db = Database::open(dir.path(), config()).unwrap();
+    let conn = db.connect();
+    let row = conn.query_one("SELECT count(*), count(DISTINCT n) FROM e", &[]).unwrap();
+    assert_eq!((row.get::<i64>(0), row.get::<i64>(1)), (total, total));
+    assert!(db.wait_for_compaction(std::time::Duration::from_secs(60)));
+    assert_eq!(conn.query_one("SELECT count(*) FROM e", &[]).unwrap().get::<i64>(0), total);
+    assert!(!segment_objects(dir.path()).is_empty(), "the delta was compacted into segments");
+}
+
+#[test]
+fn append_inserts_like_insert() {
+    let db = Database::open_in_memory_with(manual()).unwrap();
+    let conn = db.connect();
+    conn.batch_execute(
+        "CREATE TABLE r (ts timestamptz NOT NULL, n int CHECK (n >= 0), s varchar(4), p jsonb, d numeric(6,2));
+         CREATE TABLE c (ts timestamptz NOT NULL, n int CHECK (n >= 0), s varchar(4), p jsonb, d numeric(6,2)) USING columnar;
+         CREATE SCHEMA other; CREATE TABLE other.c (x int) USING columnar;",
+    )
+    .unwrap();
+    let rows = vec![
+        vec![
+            Value::Text("2024-01-01 10:00:00+00".into()),
+            Value::Int8(5),
+            Value::Text("abc".into()),
+            Value::Text("{\"a\": 1}".into()),
+            Value::Text("1.255".into()),
+        ],
+        vec![Value::TimestampTz(0), Value::Null, Value::Null, Value::Null, Value::Int4(3)],
+    ];
+    for t in ["r", "c"] {
+        assert_eq!(conn.append(t, &rows).unwrap(), 2);
+    }
+    assert_eq!(rows_of(&conn, "SELECT * FROM c ORDER BY ts"), rows_of(&conn, "SELECT * FROM r ORDER BY ts"));
+    for t in ["r", "c"] {
+        let err = |values: Vec<Value>| conn.append(t, &[values]).unwrap_err().code().to_string();
+        assert_eq!(
+            err(vec![Value::Null, Value::Int4(1), Value::Null, Value::Null, Value::Null]),
+            sqlstate::NOT_NULL_VIOLATION
+        );
+        assert_eq!(
+            err(vec![Value::TimestampTz(0), Value::Int4(-1), Value::Null, Value::Null, Value::Null]),
+            sqlstate::CHECK_VIOLATION
+        );
+        assert_eq!(
+            err(vec![Value::TimestampTz(0), Value::Int4(1), Value::text("toolong"), Value::Null, Value::Null]),
+            "22001"
+        );
+        assert_eq!(err(vec![Value::TimestampTz(0)]), "08P01");
+        assert_eq!(err(vec![Value::TimestampTz(0), Value::text("x"), Value::Null, Value::Null, Value::Null]), "22P02");
+    }
+    assert_eq!(conn.append("nosuch", &[]).unwrap_err().code(), sqlstate::UNDEFINED_TABLE);
+    conn.append("other.c", &[vec![Value::Int4(1)]]).unwrap();
+    // Inside a transaction it is part of it.
+    conn.batch_execute("BEGIN").unwrap();
+    conn.append("c", &rows).unwrap();
+    conn.batch_execute("ROLLBACK").unwrap();
+    assert_eq!(conn.query_one("SELECT count(*) FROM c", &[]).unwrap().get::<i64>(0), 2);
+    assert_eq!(conn.query_one("SELECT count(*) FROM other.c", &[]).unwrap().get::<i64>(0), 1);
+}
+
+fn rows_of(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+    rows(conn, sql)
+}
+
+#[test]
+fn vacuum_removes_orphaned_segment_objects_after_the_grace_period() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = |grace: u64| {
+        let columnar = ColumnarConfig { orphan_grace: std::time::Duration::from_secs(grace), ..manual() };
+        Database::open(dir.path(), Config { columnar, ..Config::default() }).unwrap()
+    };
+    let db = open(3600);
+    let conn = db.connect();
+    conn.batch_execute("CREATE TABLE e (n int) USING columnar; CREATE TABLE gone (n int) USING columnar").unwrap();
+    conn.execute("INSERT INTO e SELECT g FROM generate_series(1, 1000) g", &[]).unwrap();
+    conn.batch_execute("VACUUM e").unwrap();
+    let live = segment_objects(dir.path());
+    assert_eq!(live.len(), 1);
+    // A bulk insert that rolls back deletes the segment it wrote.
+    conn.batch_execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO e SELECT g FROM generate_series(1, 60000) g", &[]).unwrap();
+    assert_eq!(segment_objects(dir.path()).len(), 2);
+    conn.batch_execute("ROLLBACK").unwrap();
+    assert_eq!(segment_objects(dir.path()), live);
+    // Leftovers of crashes: an id of an older version (no time), a recent
+    // one, and one of a table that no longer exists.
+    let e_dir = std::path::Path::new(&live[0]).parent().unwrap().to_path_buf();
+    let old = e_dir.join("0123456789abcdef0123456789abcdef.seg");
+    let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let recent = e_dir.join(format!("{millis:x}-00000000000000ff.seg"));
+    std::fs::write(&old, b"x").unwrap();
+    std::fs::write(&recent, b"x").unwrap();
+    conn.execute("INSERT INTO gone SELECT g FROM generate_series(1, 10) g", &[]).unwrap();
+    conn.batch_execute("VACUUM gone").unwrap();
+    let with_gone = segment_objects(dir.path());
+    let gone_obj = with_gone.iter().find(|p| !p.starts_with(e_dir.to_str().unwrap())).unwrap().clone();
+    // Simulate a crash between DROP TABLE and the deletion of its objects.
+    let saved = std::fs::read(&gone_obj).unwrap();
+    conn.batch_execute("DROP TABLE gone").unwrap();
+    std::fs::create_dir_all(std::path::Path::new(&gone_obj).parent().unwrap()).unwrap();
+    std::fs::write(&gone_obj, &saved).unwrap();
+
+    conn.batch_execute("VACUUM").unwrap();
+    let left = segment_objects(dir.path());
+    assert!(left.contains(&live[0]), "a referenced segment is kept");
+    assert!(left.contains(&recent.to_string_lossy().into_owned()), "a recent object is kept during the grace period");
+    assert!(!left.contains(&old.to_string_lossy().into_owned()), "an old orphan is removed");
+    assert!(left.contains(&gone_obj), "a recent object of a dropped table is kept during the grace period");
+    drop(conn);
+    drop(db);
+    let db = open(0);
+    let conn = db.connect();
+    conn.batch_execute("VACUUM e").unwrap();
+    assert!(segment_objects(dir.path()).contains(&gone_obj), "VACUUM of one table looks at that table only");
+    conn.batch_execute("VACUUM").unwrap();
+    assert_eq!(segment_objects(dir.path()), live);
+    assert_eq!(conn.query_one("SELECT count(*), sum(n) FROM e", &[]).unwrap().get::<i64>(1), 500500);
 }

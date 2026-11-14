@@ -145,7 +145,7 @@ fn key_text(v: &Value, c: &FnCtx, pos: usize) -> Result<String> {
     Ok(super::cast::to_text(v, c))
 }
 fn check_pairs(a: &[Value]) -> Result<()> {
-    if a.len() % 2 != 0 {
+    if !a.len().is_multiple_of(2) {
         return Err(invalid("argument list must have even number of elements")
             .with_hint("The arguments of json_build_object() must consist of alternating keys and values."));
     }

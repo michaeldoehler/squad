@@ -105,7 +105,7 @@ fn hex_val(b: u8) -> Option<u8> {
 
 pub fn decode_hex(s: &str) -> Result<Vec<u8>> {
     let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(Error::new(sqlstate::INVALID_PARAMETER_VALUE, "invalid hexadecimal data: odd number of digits"));
     }
     bytes

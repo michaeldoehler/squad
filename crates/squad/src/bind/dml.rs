@@ -68,6 +68,10 @@ impl<'a> Binder<'a> {
     pub(crate) fn default_expr(&mut self, table: &Table, col: usize) -> Result<Expr> {
         let column = &table.columns[col];
         if column.hidden {
+            // Rows of columnar tables have no row id.
+            if table.columnar.is_some() {
+                return Ok(Expr::Const(Value::Null));
+            }
             return Ok(Expr::Session(SessionFn::RowId(table.id), vec![]));
         }
         match &column.default {

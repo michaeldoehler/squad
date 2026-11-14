@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 squad.workspace = true
+squad-server = { path = "../squad-server" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 postgres = "0.19"
 tempfile = "3"

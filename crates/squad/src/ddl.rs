@@ -772,7 +772,13 @@ fn create_table(sess: &mut Session, stmt: &pb::CreateStmt) -> Result<QueryResult
                         )?);
                     }
                 }
-                table.columnar = Some(crate::catalog::Columnar { order_by });
+                let n = table.columns.iter().filter(|c| !c.hidden).count() as u32;
+                table.columnar = Some(crate::catalog::Columnar {
+                    order_by,
+                    column_ids: (0..n).collect(),
+                    next_column_id: n,
+                    missing: vec![None; n as usize],
+                });
             }
             other => return Err(feature(&format!("table access method \"{other}\""))),
         }
@@ -1144,6 +1150,120 @@ fn eval_per_row(
     sess.with_cx(|cx| rows.iter().map(|r| expr.eval(r, cx)).collect())
 }
 
+/// `ADD COLUMN` and `DROP COLUMN` on a columnar table change only the
+/// catalog: segments and delta blocks name their columns by stable ids,
+/// so a dropped column is no longer read and an added one reads as its
+/// value at the time it was added (NULL or a constant default) wherever
+/// it is not stored.
+fn alter_columnar(
+    sess: &mut Session,
+    table: &Arc<Table>,
+    kind: pb::AlterTableType,
+    cmd: &pb::AlterTableCmd,
+    path: &[String],
+) -> Result<()> {
+    use pb::AlterTableType as A;
+    // Delta rows of the old one-row-per-key format are positional; store
+    // them by column id first.
+    sess.with_cx(|cx| crate::columnar::convert_legacy_delta(table, cx))?;
+    let mut columnar = table.columnar.clone().ok_or_else(|| Error::internal("not a columnar table"))?;
+    let ids = crate::columnar::column_ids(table);
+    if columnar.column_ids.is_empty() {
+        columnar.next_column_id = ids.len() as u32;
+    }
+    columnar.missing.resize(ids.len(), None);
+    columnar.column_ids = ids;
+    match kind {
+        A::AtAddColumn => {
+            let Some(N::ColumnDef(def)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
+                return Err(Error::internal("ADD COLUMN without definition"));
+            };
+            if table.columns.iter().any(|c| c.name == def.colname) {
+                if cmd.missing_ok {
+                    return Ok(());
+                }
+                return Err(Error::new(
+                    sqlstate::DUPLICATE_COLUMN,
+                    format!("column \"{}\" of relation \"{}\" already exists", def.colname, table.name),
+                ));
+            }
+            let catalog = sess.catalog();
+            let spec = column_spec(&catalog, path, &table.schema, &table.name, def, &[])?;
+            if spec.primary.is_some()
+                || !spec.unique.is_empty()
+                || !spec.references.is_empty()
+                || !spec.checks.is_empty()
+                || spec.sequence.is_some()
+                || spec.column.identity_always
+            {
+                return Err(feature("constraints, identity or serial on a column added to a columnar table"));
+            }
+            // The value existing rows get: the default, evaluated once.
+            let missing = match &spec.column.default {
+                None => Value::Null,
+                Some(sql) => {
+                    let mut binder = Binder::new(&catalog, path, Vec::new());
+                    let typed = binder.bind_expr(&crate::bind::parse_expr(sql)?, &Scope::default())?;
+                    let expr = binder.coerce_assign(typed, &spec.column)?;
+                    if expr.is_volatile() {
+                        return Err(feature("ADD COLUMN with a volatile default on a columnar table"));
+                    }
+                    sess.with_cx(|cx| expr.eval(&[], cx))?
+                }
+            };
+            if spec.column.not_null && missing.is_null() && sess.with_cx(|cx| crate::columnar::has_rows(table, cx))? {
+                return Err(Error::new(
+                    sqlstate::NOT_NULL_VIOLATION,
+                    format!("column \"{}\" of relation \"{}\" contains null values", spec.column.name, table.name),
+                ));
+            }
+            sess.alter_catalog(|catalog, _, _, _| {
+                let mut t = (**table).clone();
+                t.columns.push(spec.column.clone());
+                validate_default(catalog, path, &t, t.columns.len() - 1)?;
+                columnar.column_ids.push(columnar.next_column_id);
+                columnar.next_column_id += 1;
+                columnar.missing.push(crate::columnar::catalog_text(&missing));
+                t.columnar = Some(columnar);
+                put_table(catalog, t);
+                Ok(())
+            })
+        }
+        A::AtDropColumn => {
+            let Some(idx) = table.columns.iter().position(|c| c.name == cmd.name && !c.hidden) else {
+                if cmd.missing_ok {
+                    return Ok(());
+                }
+                return Err(undefined_column(table, &cmd.name));
+            };
+            let stored_idx = table.columns[..idx].iter().filter(|c| !c.hidden).count();
+            sess.alter_catalog(|catalog, _, _, _| {
+                let mut t = (**table).clone();
+                let shift = |c: usize| if c > idx { c - 1 } else { c };
+                t.columns.remove(idx);
+                t.pk = t.pk.iter().map(|&c| shift(c)).collect();
+                // Segments written later are no longer sorted by it.
+                columnar.order_by = columnar.order_by.iter().filter(|&&c| c != idx).map(|&c| shift(c)).collect();
+                columnar.column_ids.remove(stored_idx);
+                columnar.missing.remove(stored_idx);
+                t.columnar = Some(columnar);
+                let probe = t.clone();
+                t.checks.retain(|c| validate_check(catalog, path, &probe, &c.expr).is_ok());
+                let mut resets = Vec::new();
+                drop_owned_sequences(catalog, t.id, Some(&cmd.name), &mut resets);
+                put_table(catalog, t);
+                Ok(resets)
+            })
+            .map(|resets| {
+                if let Some(t) = &mut sess.txn {
+                    t.reset_counters.extend(resets);
+                }
+            })
+        }
+        _ => Err(feature("this ALTER TABLE action on columnar tables")),
+    }
+}
+
 fn alter_table(sess: &mut Session, stmt: &pb::AlterTableStmt) -> Result<QueryResult> {
     let rv = stmt.relation.as_ref().ok_or_else(|| Error::internal("ALTER TABLE without name"))?;
     use pb::ObjectType as O;
@@ -1185,7 +1305,28 @@ fn alter_table_cmd(sess: &mut Session, rv: &pb::RangeVar, cmd: &pb::AlterTableCm
         Ok(table)
     })?;
     if table.columnar.is_some() {
-        return Err(feature("ALTER TABLE on columnar tables"));
+        match kind {
+            A::AtAddColumn | A::AtDropColumn => return alter_columnar(sess, &table, kind, cmd, path),
+            // Metadata only: defaults apply to future inserts.
+            A::AtColumnDefault | A::AtDropNotNull => {}
+            A::AtChangeOwner
+            | A::AtSetRelOptions
+            | A::AtResetRelOptions
+            | A::AtClusterOn
+            | A::AtSetLogged
+            | A::AtSetUnLogged
+            | A::AtEnableRowSecurity
+            | A::AtDisableRowSecurity
+            | A::AtSetStatistics
+            | A::AtSetStorage
+            | A::AtReplicaIdentity
+            | A::AtValidateConstraint
+            | A::AtEnableTrig
+            | A::AtDisableTrig
+            | A::AtEnableTrigAll
+            | A::AtDisableTrigAll => {}
+            _ => return Err(feature("this ALTER TABLE action on columnar tables")),
+        }
     }
     let column = |name: &str| {
         table.columns.iter().position(|c| c.name == name && !c.hidden).ok_or_else(|| undefined_column(&table, name))
@@ -2545,14 +2686,22 @@ pub(crate) fn run_utility(sess: &mut Session, stmt: &N, _params: &[Value]) -> Re
                     .map(|t| t.id)
                     .collect();
                 let compacted = !ids.is_empty();
-                for id in ids {
+                for &id in &ids {
                     sess.compact_table(id)?;
                 }
-                // Compaction deletes the delta rows it moved; without this
-                // their tombstones would slow every scan of the delta
+                // Compaction deletes the delta blocks it moved; without
+                // this their tombstones would slow every scan of the delta
                 // until the next VACUUM.
                 if compacted {
                     sess.shared.store.gc()?;
+                }
+                // Segment objects no manifest names: left by crashes,
+                // failed commits and dropped tables.
+                let shared = sess.shared.clone();
+                if wanted.is_empty() {
+                    crate::columnar::remove_orphans(&shared, None)?;
+                } else if !ids.is_empty() {
+                    crate::columnar::remove_orphans(&shared, Some(&ids))?;
                 }
             }
             done(if s.is_vacuumcmd { "VACUUM" } else { "ANALYZE" })

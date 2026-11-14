@@ -11,8 +11,9 @@ use squad_storage::{
 };
 
 use crate::bind::OutputColumn;
+use crate::columnar::ColumnarConfig;
 use crate::convert::{FromSql, ToSql};
-use crate::session::{Prepared, QueryResult, Session, Shared};
+use crate::session::{CloseGuard, Prepared, QueryResult, Session, Shared};
 use crate::types::{Type, Value};
 use crate::{sqlstate, Error, Result};
 
@@ -29,11 +30,19 @@ pub struct Config {
     /// directory or an S3-compatible bucket), from which it is restored
     /// when the local directory is empty. `None`: local storage only.
     pub remote: Option<RemoteConfig>,
+    /// Cache size and compaction settings of columnar tables.
+    pub columnar: ColumnarConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { sync_mode: SyncMode::Sync, cache_size: 128 << 20, checkpoint_wal_bytes: 64 << 20, remote: None }
+        Config {
+            sync_mode: SyncMode::Sync,
+            cache_size: 128 << 20,
+            checkpoint_wal_bytes: 64 << 20,
+            remote: None,
+            columnar: ColumnarConfig::default(),
+        }
     }
 }
 
@@ -41,6 +50,8 @@ impl Default for Config {
 /// it is closed when the last handle and connection are dropped.
 #[derive(Clone)]
 pub struct Database {
+    /// Stops background work when the last handle and session are gone.
+    _guard: Arc<CloseGuard>,
     shared: Arc<Shared>,
 }
 
@@ -56,20 +67,30 @@ impl Database {
         };
         // Segments of columnar tables live in the remote store if there
         // is one, otherwise in a directory next to the row store.
-        let (db, objects): (Database, Arc<dyn ObjectStore>) = match config.remote {
+        let (shared, objects): (Arc<Shared>, Arc<dyn ObjectStore>) = match config.remote {
             Some(remote) => {
                 let objects = remote.store.clone();
-                (Database::with_engine(Arc::new(TieredEngine::open(path.as_ref(), options, remote)?))?, objects)
+                (Database::open_shared(Arc::new(TieredEngine::open(path.as_ref(), options, remote)?))?, objects)
             }
             None => {
-                let db = Database::with_engine(Arc::new(DiskEngine::open(path.as_ref(), options)?))?;
+                let shared = Database::open_shared(Arc::new(DiskEngine::open(path.as_ref(), options)?))?;
                 let local = squad_object::LocalStore::new(path.as_ref().join("objects"))
                     .map_err(|e| Error::new(sqlstate::IO_ERROR, e.to_string()))?;
-                (db, Arc::new(local))
+                (shared, Arc::new(local))
             }
         };
-        db.shared.set_objects(objects);
-        Ok(db)
+        shared.set_objects(objects);
+        Ok(Database::start(shared, config.columnar))
+    }
+
+    fn open_shared(engine: Arc<dyn Engine>) -> Result<Arc<Shared>> {
+        Shared::open(Store::new(engine)?, "squad")
+    }
+
+    /// Wraps an opened database and starts its background work.
+    fn start(shared: Arc<Shared>, columnar: ColumnarConfig) -> Database {
+        let guard = shared.start(columnar);
+        Database { _guard: guard, shared }
     }
 
     /// Downloads the database kept in `store` into the empty or missing
@@ -92,7 +113,8 @@ impl Database {
     /// `25006`. See [`promote`](Database::promote) for turning it into
     /// the writer.
     pub fn open_replica(path: impl AsRef<Path>, config: crate::ReplicaConfig) -> Result<Database> {
-        Ok(Database { shared: crate::replica::open(path.as_ref(), config)? })
+        let columnar = config.columnar.clone();
+        Ok(Database::start(crate::replica::open(path.as_ref(), config)?, columnar))
     }
 
     /// Where this replica stands relative to its writer. `None` for a
@@ -127,10 +149,50 @@ impl Database {
         Database::with_engine(Arc::new(MemEngine::new()))
     }
 
+    /// Like [`open_in_memory`](Database::open_in_memory), with the given
+    /// settings of columnar tables (the other settings of [`Config`] do
+    /// not apply to memory).
+    pub fn open_in_memory_with(columnar: ColumnarConfig) -> Result<Database> {
+        Database::with_engine_config(Arc::new(MemEngine::new()), columnar)
+    }
+
     /// Opens a database on a caller-supplied storage engine.
     pub fn with_engine(engine: Arc<dyn Engine>) -> Result<Database> {
-        let store = Store::new(engine)?;
-        Ok(Database { shared: Shared::open(store, "squad")? })
+        Database::with_engine_config(engine, ColumnarConfig::default())
+    }
+
+    /// Like [`with_engine`](Database::with_engine), with the given
+    /// settings of columnar tables.
+    pub fn with_engine_config(engine: Arc<dyn Engine>, columnar: ColumnarConfig) -> Result<Database> {
+        Ok(Database::start(Database::open_shared(engine)?, columnar))
+    }
+
+    /// Opens a database on a caller-supplied storage engine whose
+    /// columnar tables keep their segments in `objects`.
+    pub fn with_engine_and_objects(
+        engine: Arc<dyn Engine>,
+        objects: Arc<dyn ObjectStore>,
+        columnar: ColumnarConfig,
+    ) -> Result<Database> {
+        let shared = Database::open_shared(engine)?;
+        shared.set_objects(objects);
+        Ok(Database::start(shared, columnar))
+    }
+
+    /// Waits until the background compaction of columnar tables has
+    /// caught up: no table's delta is due for compaction and none is being
+    /// compacted. Returns false if that did not happen within `timeout`.
+    /// Rows are readable before compaction too; this is for tests,
+    /// benchmarks and orderly shutdowns.
+    pub fn wait_for_compaction(&self, timeout: std::time::Duration) -> bool {
+        let columnar = &self.shared.columnar;
+        columnar.compactor.wait_idle(&columnar.config(), timeout)
+    }
+
+    /// Hits and misses of the cache of segment data of columnar tables
+    /// since the database was opened.
+    pub fn columnar_cache_stats(&self) -> (u64, u64) {
+        self.shared.columnar.cache_counters()
     }
 
     /// Opens a new connection (session). Connections are independent:
@@ -209,6 +271,23 @@ impl Connection {
     /// Runs a query that returns at most one row.
     pub fn query_opt(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Option<Row>> {
         at_most_one(self.query(sql, params)?)
+    }
+
+    /// Inserts rows into a table without going through SQL text: every
+    /// row holds one value per visible column of `table`, in table order,
+    /// converted as for an `INSERT … VALUES` with parameters (so text is
+    /// accepted for any type). Defaults, `NOT NULL` and `CHECK` apply.
+    /// Returns the number of rows inserted. `table` is a table name,
+    /// optionally schema-qualified (`"analytics.events"`); it is not
+    /// parsed as SQL.
+    ///
+    /// The rows are inserted by one statement, in the connection's open
+    /// transaction or in a transaction of their own. Into a columnar
+    /// table this is the fastest way to insert: the rows are stored as
+    /// one delta block per call (up to 65,536 rows) without being parsed,
+    /// planned or stored row by row.
+    pub fn append(&self, table: &str, rows: &[Vec<Value>]) -> Result<u64> {
+        self.inner.lock().append(table, rows)
     }
 
     /// Runs one or more statements separated by semicolons, without

@@ -103,6 +103,21 @@ pub struct Table {
 pub struct Columnar {
     /// Columns segments are sorted by; statistics prune best on them.
     pub order_by: Vec<usize>,
+    /// Stable id of every stored (not hidden) column, in table order.
+    /// Segments and delta blocks name their columns by these ids, so
+    /// columns can be added, dropped and renamed without rewriting them.
+    /// Empty for tables created before ids were recorded: their ids are
+    /// the column positions.
+    #[serde(default)]
+    pub column_ids: Vec<u32>,
+    /// Id the next added column gets.
+    #[serde(default)]
+    pub next_column_id: u32,
+    /// Per stored column, aligned with `column_ids`: the value, as text,
+    /// that rows written before the column was added have (its default
+    /// at that time); `None` for NULL.
+    #[serde(default)]
+    pub missing: Vec<Option<String>>,
 }
 
 impl Table {
