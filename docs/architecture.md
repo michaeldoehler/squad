@@ -214,8 +214,11 @@ replicas. Details are in [sharding](sharding.md).
 
 The server is a thin adapter: one thread per connection reads protocol
 messages and calls the session. It implements the simple and extended
-query protocols with text and binary formats, portals, `COPY`, and trust,
-cleartext or SCRAM-SHA-256 authentication. See [server](server.md).
+query protocols with text and binary formats, portals, `COPY`, notices,
+trust, cleartext or SCRAM-SHA-256 authentication, TLS (rustls) and cancel
+requests, which set the session's cancel flag that the executor polls.
+Connection count, login time, idle time and message sizes are bounded.
+See [server](server.md).
 
 ## What squad deliberately does differently from PostgreSQL
 

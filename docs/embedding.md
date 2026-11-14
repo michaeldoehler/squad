@@ -237,8 +237,10 @@ let server = db.serve("127.0.0.1:5432")?;
 // the embedded API.
 ```
 
-See [server](server.md) for authentication, Unix sockets and tool
-compatibility.
+`serve` trusts every client, so it only accepts loopback addresses; to
+listen on other interfaces, configure passwords (and TLS) through
+`squad_server::Server`. See [server](server.md) for authentication, TLS,
+limits, Unix sockets and tool compatibility.
 
 ## Maintenance
 

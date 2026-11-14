@@ -506,3 +506,29 @@ fn remote_url_from_a_file() {
     // The access key was found; the secret key is still missing.
     assert!(!ok && err.contains("no S3 secret key"), "{err}");
 }
+
+#[cfg(unix)]
+#[test]
+fn sigterm_shuts_the_server_down_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let (mut child, addr) = serve(&[data.to_str().unwrap()]);
+    let mut c = Client::connect(addr);
+    c.rows("CREATE TABLE t (a int); INSERT INTO t VALUES (1), (2)");
+    let status = Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    assert!(status.success());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let exit = loop {
+        if let Some(exit) = child.try_wait().unwrap() {
+            break exit;
+        }
+        assert!(std::time::Instant::now() < deadline, "the server ignored SIGTERM");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(exit.success(), "{exit:?}");
+    // The open connection was closed, and the directory is consistent
+    // and unlocked.
+    assert!(c.try_recv().is_none());
+    let (ok, out, err) = output(squad().args(["verify", data.to_str().unwrap()]));
+    assert!(ok && out.contains("no problems found"), "{out}{err}");
+}

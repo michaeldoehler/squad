@@ -2,7 +2,7 @@
 //! a database directory.
 
 use std::collections::HashMap;
-use std::io::BufRead;
+use std::io::{BufRead, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -366,6 +366,29 @@ fn serve(args: &Args) -> Result<(), String> {
     if let Some(path) = server.unix_socket_path() {
         eprintln!("listening on Unix socket {}", path.display());
     }
+    run_until_signal(server)
+}
+
+/// Serves until SIGTERM or SIGINT, then closes the connections and the
+/// database cleanly. Without a handler, a server running as PID 1 in a
+/// container would ignore SIGTERM and be killed after the grace period.
+#[cfg(unix)]
+fn run_until_signal(server: Server) -> Result<(), String> {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    let mut signals =
+        signal_hook::iterator::Signals::new([SIGTERM, SIGINT]).map_err(|e| format!("cannot handle signals: {e}"))?;
+    let handle = server.spawn();
+    if let Some(signal) = signals.forever().next() {
+        let name = if signal == SIGTERM { "SIGTERM" } else { "SIGINT" };
+        // Not eprintln!: stderr may be closed by now.
+        let _ = writeln!(std::io::stderr(), "received {name}, shutting down");
+    }
+    handle.shutdown();
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn run_until_signal(server: Server) -> Result<(), String> {
     server.run().map_err(|e| e.to_string())
 }
 

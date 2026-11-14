@@ -65,6 +65,9 @@ squad ping --host 127.0.0.1 --port 5432   # health check, exit code 0 or 1
 echo 'secret' | squad hash-password       # SCRAM verifier for a users file
 ```
 
+`squad serve` stops on SIGTERM or SIGINT (Ctrl-C): it closes the client
+connections and the database cleanly and exits with status 0.
+
 `backup` and `verify` open the directory themselves, so the database must
 not be open elsewhere; a running application calls `Database::backup`
 instead.
@@ -162,6 +165,27 @@ accepts connections, 1 otherwise:
 Options: `--host` (a directory means a Unix socket), `--port`, `--user`
 (default `SQUAD_USER` or `squad`), `--database`, `--timeout` (default
 `5s`). `ping` does not use TLS.
+
+## Container image
+
+The `Dockerfile` at the repository root builds a small image (Debian
+slim, the stripped `squad` binary, user `squad` with uid 10001):
+
+```sh
+docker build -t squad .
+docker run -d --name squad -p 5432:5432 -v squad-data:/data \
+    -e SQUAD_PASSWORD=secret squad
+```
+
+It runs `squad serve /data --listen 0.0.0.0:5432`. Because that address
+is not loopback, the container exits with an error unless a password is
+configured (`SQUAD_PASSWORD`, `SQUAD_PASSWORD_FILE` with a Docker or
+Kubernetes secret, or `--users-file`) or `--trust` is passed. Arguments
+after the image name replace the command, e.g. `serve /data --listen
+0.0.0.0:5432 --remote-file /run/secrets/remote_url`. The health check
+runs `squad ping` every 10 seconds; with `SQUAD_PASSWORD(_FILE)` set it
+logs in and runs `SELECT 1`. `/data` is a volume and must be writable
+by uid 10001.
 
 ## Embedding the server
 

@@ -79,6 +79,9 @@ versions may change the API and the on-disk format.
 - `squad ping`, a health check for scripts and containers.
 - `--remote-file`, `--replica-of-file` and `AWS_*_FILE` variables, so
   that object store credentials can come from secret files.
+- A multi-stage `Dockerfile` (Debian slim, non-root user, `/data`
+  volume, health check with `squad ping`) and `.dockerignore`.
+- `squad serve` shuts down cleanly on SIGTERM and SIGINT.
 
 ### Changed (server hardening)
 
