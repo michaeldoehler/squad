@@ -106,7 +106,10 @@ directory (or copy it into place).
 A backup made this way contains the row store. Segments of columnar
 tables are separate files under `objects/`; copy that directory as well
 (segments are immutable, so a plain file copy taken after the backup is
-consistent with it or newer).
+consistent with it or newer). Segments that a merge or `DELETE` replaces
+after the backup may be deleted before they are copied, though; to be
+sure, copy `objects/` while no columnar table is changed, for example
+with `ColumnarConfig::background_compaction` off and no deletes running.
 
 For a continuously maintained copy in an object store, including S3, and
 restore on another machine, see [cloud storage](cloud-storage.md).
