@@ -18,12 +18,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-# Limit parallel jobs with --build-arg CARGO_BUILD_JOBS=2 on small machines.
-ARG CARGO_BUILD_JOBS
+# Limit parallel jobs with --build-arg JOBS=2 on small machines.
+ARG JOBS
 ENV CARGO_PROFILE_RELEASE_DEBUG=0
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p squad-server --bin squad \
+    cargo build --release --locked -p squad-server --bin squad ${JOBS:+--jobs "$JOBS"} \
     && cp target/release/squad /usr/local/bin/squad \
     && strip /usr/local/bin/squad
 
