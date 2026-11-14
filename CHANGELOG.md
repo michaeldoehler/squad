@@ -64,7 +64,7 @@ versions may change the API and the on-disk format.
   and `Session::cancel_handle()`; the executor stops with SQLSTATE
   `57014`. `SET statement_timeout` is honoured (also `57014`).
 - Notices: `QueryResult::notices` (`squad::Notice`, `squad::Severity`);
-  the server sends them as NoticeResponse.
+  the server sends them as NoticeResponse, `squad shell` prints them.
 - Server TLS (rustls, ring provider): `--tls-cert`, `--tls-key`,
   `--require-tls`; `ServerConfig::tls`, `TlsConfig`, `require_tls`.
 - Server cancel requests: real BackendKeyData with a random secret per

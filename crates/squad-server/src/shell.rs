@@ -8,6 +8,10 @@ use squad::{Database, FnCtx, QueryResult, Session};
 /// Renders a result as an aligned table, like psql's default format.
 pub fn render(result: &QueryResult, ctx: &FnCtx) -> String {
     let mut out = String::new();
+    for n in &result.notices {
+        // psql's layout: two spaces after the severity.
+        out.push_str(&format!("{}:  {}\n", n.severity.as_str(), n.message));
+    }
     if !result.columns.is_empty() {
         let cells: Vec<Vec<String>> = result
             .rows
@@ -275,11 +279,12 @@ mod tests {
     #[test]
     fn shell_session() {
         let db = Database::open_in_memory().unwrap();
-        let script = "CREATE TABLE t (id int PRIMARY KEY,\n name text);\nINSERT INTO t VALUES (1, 'a'), (2, NULL);\nSELECT * FROM t ORDER BY id;\n\\dt\n\\d t\nSELECT nope;\n\\q\nSELECT 1;\n";
+        let script = "CREATE TABLE t (id int PRIMARY KEY,\n name text);\nINSERT INTO t VALUES (1, 'a'), (2, NULL);\nSELECT * FROM t ORDER BY id;\nGRANT SELECT ON t TO PUBLIC;\n\\dt\n\\d t\nSELECT nope;\n\\q\nSELECT 1;\n";
         let mut out = Vec::new();
         run(&db, script.as_bytes(), &mut out).unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("CREATE TABLE\nINSERT 0 2\n id | name\n----+------\n 1  | a\n 2  |\n(2 rows)\n"), "{out}");
+        assert!(out.contains("WARNING:  squad has no privileges; GRANT has no effect\nGRANT\n"), "{out}");
         assert!(out.contains(" public | t    | table"), "{out}");
         assert!(out.contains("\"t_pkey\" PRIMARY KEY, btree (id)"), "{out}");
         assert!(out.contains("42703"), "{out}");
