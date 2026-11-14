@@ -53,6 +53,22 @@ fn open_s3(_: &str) -> Result<Arc<dyn ObjectStore>> {
 
 #[cfg(feature = "s3")]
 fn open_s3(rest: &str) -> Result<Arc<dyn ObjectStore>> {
+    Ok(Arc::new(crate::S3Store::new(s3_config(rest)?)?))
+}
+
+#[cfg(feature = "s3")]
+impl crate::S3Config {
+    /// The configuration an `s3://bucket/prefix?…` URL describes, as
+    /// accepted by [`open_url`]. Useful to adjust an [`S3Store`](crate::S3Store)
+    /// further before creating it.
+    pub fn from_url(url: &str) -> Result<crate::S3Config> {
+        let rest = url.strip_prefix("s3://").ok_or_else(|| Error::Invalid(format!("{url:?} is not an s3:// URL")))?;
+        s3_config(rest)
+    }
+}
+
+#[cfg(feature = "s3")]
+fn s3_config(rest: &str) -> Result<crate::S3Config> {
     let (location, query) = rest.split_once('?').unwrap_or((rest, ""));
     let (bucket, prefix) = location.split_once('/').unwrap_or((location, ""));
     let mut params: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -77,7 +93,7 @@ fn open_s3(rest: &str) -> Result<Arc<dyn ObjectStore>> {
     if let Some(unknown) = params.keys().next() {
         return Err(Error::Invalid(format!("unknown S3 URL parameter {unknown:?}")));
     }
-    let config = crate::S3Config {
+    Ok(crate::S3Config {
         endpoint,
         region,
         bucket: percent_decode(bucket),
@@ -85,6 +101,5 @@ fn open_s3(rest: &str) -> Result<Arc<dyn ObjectStore>> {
         secret_key,
         prefix: percent_decode(prefix.trim_matches('/')),
         path_style,
-    };
-    Ok(Arc::new(crate::S3Store::new(config)?))
+    })
 }

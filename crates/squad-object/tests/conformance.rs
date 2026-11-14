@@ -2,10 +2,18 @@
 
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use squad_object::emulator::S3Emulator;
-use squad_object::{open_url, CachedStore, Error, LocalStore, MemoryStore, ObjectStore, S3Store};
+use squad_object::{open_url, CachedStore, Error, LocalStore, MemoryStore, ObjectStore, S3Config, S3Store};
 
 fn conformance(store: &dyn ObjectStore) {
+    conformance_with(store, true)
+}
+
+/// The suite. `conditional` says whether the store is expected to
+/// enforce `put_if_absent`; some S3-compatible services do not.
+fn conformance_with(store: &dyn ObjectStore, conditional: bool) {
     // Missing objects.
     assert_eq!(store.get("nope").unwrap(), None);
     assert_eq!(store.head("nope").unwrap(), None);
@@ -56,8 +64,10 @@ fn conformance(store: &dyn ObjectStore) {
 
     // Conditional creation.
     assert!(store.put_if_absent("lock/1", b"mine").unwrap());
-    assert!(!store.put_if_absent("lock/1", b"yours").unwrap());
-    assert_eq!(store.get("lock/1").unwrap().as_deref(), Some(&b"mine"[..]));
+    if conditional {
+        assert!(!store.put_if_absent("lock/1", b"yours").unwrap());
+        assert_eq!(store.get("lock/1").unwrap().as_deref(), Some(&b"mine"[..]));
+    }
 
     // Keys with characters that need escaping in URLs and XML.
     let odd = "odd/sp ace+plus&amp=eq/ü~é<x>";
@@ -208,4 +218,105 @@ fn urls() {
     assert!(open_url("ftp://x").is_err());
     assert!(open_url("nonsense").is_err());
     assert!(open_url("s3://bucket?bogus=1&access_key=a&secret_key=b").is_err());
+}
+
+fn big(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect()
+}
+
+#[test]
+fn s3_multipart_uploads() {
+    let emulator = S3Emulator::start();
+    let store = S3Store::new(emulator.config("mp")).unwrap().with_multipart(6 << 20, 5 << 20);
+    let data = big(13 << 20);
+    store.put("large", &data).unwrap();
+    assert_eq!(emulator.completed_multipart_uploads(), 1);
+    assert_eq!(store.stats().multipart_uploads, 1);
+    assert_eq!(store.get("large").unwrap().as_deref(), Some(&data[..]));
+    assert_eq!(store.head("large").unwrap().unwrap().size, data.len() as u64);
+    // Below the threshold: one PUT.
+    store.put("small", &data[..6 << 20]).unwrap();
+    assert_eq!(emulator.completed_multipart_uploads(), 1);
+    // Transient failures in the middle of an upload are retried.
+    emulator.fail_next(2);
+    store.put("large2", &data).unwrap();
+    assert_eq!(store.get("large2").unwrap().as_deref(), Some(&data[..]));
+    // A lost confirmation of the completion is retried and recognised.
+    emulator.drop_after_completions(1);
+    store.put("large3", &data).unwrap();
+    assert_eq!(store.get("large3").unwrap().as_deref(), Some(&data[..]));
+    assert_eq!(emulator.open_multipart_uploads(), 0);
+    assert_eq!(emulator.rejected(), 0);
+}
+
+#[test]
+fn s3_permanent_errors_are_not_retried() {
+    let emulator = S3Emulator::start();
+    let mut config = emulator.config("");
+    config.secret_key.push('x');
+    let store = S3Store::new(config).unwrap();
+    assert!(matches!(store.get("k"), Err(Error::Remote { status: 403, .. })));
+    assert_eq!(store.stats(), squad_object::S3Stats { requests: 1, retries: 0, multipart_uploads: 0 });
+
+    // A port nobody listens on: connection errors are transient.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = closed.local_addr().unwrap();
+    drop(closed);
+    let config = S3Config { endpoint: Some(format!("http://{addr}")), ..emulator.config("") };
+    let store = S3Store::new(config)
+        .unwrap()
+        .with_retries(3)
+        .with_backoff(Duration::from_millis(1), Duration::from_millis(2))
+        .with_timeouts(Duration::from_millis(500), Duration::from_millis(500));
+    assert!(matches!(store.get("k"), Err(Error::Transport(_))));
+    assert_eq!(store.stats().retries, 2);
+}
+
+/// The URL of the real S3 service to test against, with a key prefix of
+/// its own, or `None` (and a visible note) if none is configured.
+fn real_s3(what: &str) -> Option<String> {
+    let Ok(url) = std::env::var("SQUAD_TEST_S3_URL") else {
+        eprintln!("skipped {what}: SQUAD_TEST_S3_URL not set");
+        return None;
+    };
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let prefix = format!("squad-object-tests/{what}-{}-{nanos:x}", std::process::id());
+    let (location, query) = url.split_once('?').unwrap_or((&url, ""));
+    let joined = format!("{}/{prefix}", location.trim_end_matches('/'));
+    Some(if query.is_empty() { joined } else { format!("{joined}?{query}") })
+}
+
+/// Removes everything a test left under its prefix.
+fn clean(store: &dyn ObjectStore) {
+    for meta in store.list("").unwrap() {
+        store.delete(&meta.key).unwrap();
+    }
+}
+
+#[test]
+fn real_s3_conformance() {
+    let Some(url) = real_s3("conformance") else { return };
+    let store = S3Store::new(S3Config::from_url(&url).unwrap()).unwrap();
+    // Whether the service enforces conditional puts decides what the
+    // suite may expect; squad's fencing does not depend on it.
+    let conditional = {
+        let first = store.put_if_absent("probe", b"1").unwrap();
+        let second = store.put_if_absent("probe", b"2").unwrap();
+        store.delete("probe").unwrap();
+        assert!(first);
+        !second
+    };
+    eprintln!("real S3: conditional writes enforced: {conditional}");
+    conformance_with(&store, conditional);
+    clean(&store);
+
+    // Multipart upload with the smallest parts S3 accepts.
+    let store = S3Store::new(S3Config::from_url(&url).unwrap()).unwrap().with_multipart(5 << 20, 5 << 20);
+    let data = big(11 << 20);
+    store.put("multipart/object", &data).unwrap();
+    assert_eq!(store.stats().multipart_uploads, 1);
+    assert_eq!(store.get("multipart/object").unwrap().as_deref(), Some(&data[..]));
+    assert_eq!(store.get_range("multipart/object", (5 << 20) - 3, 6).unwrap(), &data[(5 << 20) - 3..(5 << 20) + 3]);
+    clean(&store);
+    assert!(store.list("").unwrap().is_empty());
 }

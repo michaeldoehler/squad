@@ -1,7 +1,10 @@
 //! Client for Amazon S3 and compatible object stores.
 
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 use std::io::Read;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::sigv4::{self, Signable};
 use crate::{check_key, Error, ObjectMeta, ObjectStore, Result};
@@ -35,12 +38,25 @@ impl std::fmt::Debug for S3Config {
     }
 }
 
+/// Smallest part S3 accepts in a multipart upload, except for the last.
+const MIN_PART: usize = 5 << 20;
+
 /// [`ObjectStore`] on an S3-compatible service.
 ///
-/// Requests are signed with AWS Signature Version 4. Requests that fail
-/// with a connection error, a 5xx status or 429 are retried with
-/// exponential backoff. Objects are written with a single `PUT`, which
-/// S3 limits to 5 GiB; squad writes objects of a few megabytes.
+/// Requests are signed with AWS Signature Version 4 and sent through one
+/// HTTP agent per store, which keeps connections open for reuse.
+///
+/// Failures are classified. Connection errors, timeouts, 5xx responses,
+/// 429 and S3's `RequestTimeout` are transient: the request is retried
+/// up to [`with_retries`](S3Store::with_retries) times in total, after
+/// a random delay below an exponentially growing bound (full jitter, base
+/// 50 ms, at most 5 s). Every other 4xx response is permanent and
+/// returned at once as [`Error::Remote`]; exhausted retries end in
+/// [`Error::Transport`].
+///
+/// Objects larger than the multipart threshold (default 16 MiB) are
+/// uploaded in parts (default 8 MiB each); a failed multipart upload is
+/// aborted so that its parts do not linger.
 pub struct S3Store {
     config: S3Config,
     agent: ureq::Agent,
@@ -51,12 +67,69 @@ pub struct S3Store {
     /// Path prefix in front of the object key (`/bucket` in path style).
     root: String,
     retries: u32,
+    backoff_base: Duration,
+    backoff_cap: Duration,
+    multipart_threshold: usize,
+    part_size: usize,
+    stats: Stats,
+}
+
+#[derive(Default)]
+struct Stats {
+    requests: AtomicU64,
+    retries: AtomicU64,
+    multipart_uploads: AtomicU64,
+}
+
+/// Counters of an [`S3Store`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct S3Stats {
+    /// HTTP requests sent, including retries.
+    pub requests: u64,
+    /// Requests that were repeated after a transient failure.
+    pub retries: u64,
+    /// Objects uploaded with a multipart upload.
+    pub multipart_uploads: u64,
 }
 
 struct Response {
     status: u16,
     body: Vec<u8>,
     content_length: Option<u64>,
+    etag: Option<String>,
+}
+
+/// Why one attempt failed.
+enum Failure {
+    /// Worth another attempt.
+    Transient(String),
+    /// Will not get better by retrying.
+    Permanent(Error),
+}
+
+/// True for HTTP statuses that a retry may cure.
+fn transient_status(status: u16, body: &[u8]) -> bool {
+    status >= 500 || status == 429 || status == 408 || (status == 400 && error_code(body) == Some("RequestTimeout"))
+}
+
+/// 64 random bits for backoff jitter.
+fn jitter() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut h = RandomState::new().build_hasher();
+    h.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    h.write_u128(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    h.finish()
+}
+
+/// Delay before retry number `attempt` (1-based): uniformly random below
+/// `min(cap, base * 2^(attempt-1))`.
+pub(crate) fn backoff_delay(attempt: u32, base: Duration, cap: Duration, random: u64) -> Duration {
+    let bound = base.saturating_mul(1u32 << (attempt.saturating_sub(1)).min(20)).min(cap);
+    let nanos = bound.as_nanos() as u64;
+    if nanos == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_nanos(random % nanos)
 }
 
 impl S3Store {
@@ -69,6 +142,9 @@ impl S3Store {
         let (scheme, authority) = endpoint
             .split_once("://")
             .ok_or_else(|| Error::Invalid(format!("S3 endpoint {endpoint:?} lacks a scheme")))?;
+        if !matches!(scheme, "http" | "https") {
+            return Err(Error::Invalid(format!("S3 endpoint {endpoint:?} must use http or https")));
+        }
         if authority.is_empty() || authority.contains('/') {
             return Err(Error::Invalid(format!("S3 endpoint {endpoint:?} must be scheme://host[:port]")));
         }
@@ -77,18 +153,67 @@ impl S3Store {
         } else {
             (format!("{}.{authority}", config.bucket), String::new())
         };
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(60))
-            .timeout_write(Duration::from_secs(60))
-            .build();
-        Ok(S3Store { base: format!("{scheme}://{host}"), host, root, agent, retries: 5, config })
+        let mut store = S3Store {
+            base: format!("{scheme}://{host}"),
+            host,
+            root,
+            agent: ureq::AgentBuilder::new().build(),
+            retries: 5,
+            backoff_base: Duration::from_millis(50),
+            backoff_cap: Duration::from_secs(5),
+            multipart_threshold: 16 << 20,
+            part_size: 8 << 20,
+            stats: Stats::default(),
+            config,
+        };
+        store = store.with_timeouts(Duration::from_secs(10), Duration::from_secs(60));
+        Ok(store)
     }
 
     /// Number of attempts per request before giving up (default 5).
     pub fn with_retries(mut self, attempts: u32) -> S3Store {
         self.retries = attempts.max(1);
         self
+    }
+
+    /// Bounds of the random delay between attempts: the first retry waits
+    /// below `base`, each further one below twice as long, never above
+    /// `cap` (defaults 50 ms and 5 s).
+    pub fn with_backoff(mut self, base: Duration, cap: Duration) -> S3Store {
+        self.backoff_base = base;
+        self.backoff_cap = cap.max(base);
+        self
+    }
+
+    /// Time allowed to establish a connection, and to wait for any single
+    /// read or write on it (defaults 10 s and 60 s). Replaces the HTTP
+    /// agent, and with it the pool of open connections.
+    pub fn with_timeouts(mut self, connect: Duration, io: Duration) -> S3Store {
+        self.agent = ureq::AgentBuilder::new()
+            .timeout_connect(connect)
+            .timeout_read(io)
+            .timeout_write(io)
+            .max_idle_connections_per_host(16)
+            .build();
+        self
+    }
+
+    /// Objects larger than `threshold` bytes are uploaded in parts of
+    /// `part_size` bytes (defaults 16 MiB and 8 MiB). S3 requires parts of
+    /// at least 5 MiB, so smaller values are raised to that.
+    pub fn with_multipart(mut self, threshold: usize, part_size: usize) -> S3Store {
+        self.part_size = part_size.max(MIN_PART);
+        self.multipart_threshold = threshold.max(self.part_size);
+        self
+    }
+
+    /// Request counters since the store was created.
+    pub fn stats(&self) -> S3Stats {
+        S3Stats {
+            requests: self.stats.requests.load(Ordering::Relaxed),
+            retries: self.stats.retries.load(Ordering::Relaxed),
+            multipart_uploads: self.stats.multipart_uploads.load(Ordering::Relaxed),
+        }
     }
 
     fn full_key(&self, key: &str) -> String {
@@ -99,7 +224,7 @@ impl S3Store {
         }
     }
 
-    /// One signed request, without retries. `Ok` for any HTTP status.
+    /// One signed request, without retries.
     fn send(
         &self,
         method: &str,
@@ -107,7 +232,8 @@ impl S3Store {
         query: &[(String, String)],
         extra: &[(&str, String)],
         body: Option<&[u8]>,
-    ) -> std::result::Result<Response, String> {
+    ) -> std::result::Result<Response, Failure> {
+        self.stats.requests.fetch_add(1, Ordering::Relaxed);
         let payload_hash = sigv4::sha256_hex(body.unwrap_or_default());
         let date = sigv4::amz_date(SystemTime::now());
         let mut headers = vec![
@@ -141,20 +267,33 @@ impl S3Store {
         let resp = match result {
             Ok(r) => r,
             Err(ureq::Error::Status(_, r)) => r,
-            Err(ureq::Error::Transport(t)) => return Err(t.to_string()),
+            Err(ureq::Error::Transport(t)) => {
+                return Err(match t.kind() {
+                    ureq::ErrorKind::InvalidUrl
+                    | ureq::ErrorKind::UnknownScheme
+                    | ureq::ErrorKind::InvalidProxyUrl
+                    | ureq::ErrorKind::ProxyUnauthorized => Failure::Permanent(Error::Invalid(t.to_string())),
+                    // Name resolution, connecting, timeouts, broken
+                    // connections, malformed responses.
+                    _ => Failure::Transient(t.to_string()),
+                });
+            }
         };
         let status = resp.status();
         let content_length = resp.header("content-length").and_then(|v| v.parse().ok());
+        let etag = resp.header("etag").map(str::to_string);
         let mut out = Vec::new();
         if method != "HEAD" {
-            resp.into_reader().read_to_end(&mut out).map_err(|e| format!("reading response: {e}"))?;
+            resp.into_reader()
+                .read_to_end(&mut out)
+                .map_err(|e| Failure::Transient(format!("reading the response: {e}")))?;
         }
-        Ok(Response { status, body: out, content_length })
+        Ok(Response { status, body: out, content_length, etag })
     }
 
-    /// A request with retries. Returns the response for every status
-    /// below 500 except 429; the second value is the number of attempts
-    /// that preceded the successful one.
+    /// A request with retries of transient failures. Returns the response
+    /// for every status that is not transient; the second value is the
+    /// number of attempts that preceded the one answered.
     fn request(
         &self,
         method: &str,
@@ -166,14 +305,16 @@ impl S3Store {
         let mut last = String::new();
         for attempt in 0..self.retries {
             if attempt > 0 {
-                std::thread::sleep(Duration::from_millis(25u64 << attempt.min(6)));
+                self.stats.retries.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(backoff_delay(attempt, self.backoff_base, self.backoff_cap, jitter()));
             }
             match self.send(method, path, query, extra, body) {
-                Ok(r) if r.status >= 500 || r.status == 429 => {
+                Ok(r) if transient_status(r.status, &r.body) => {
                     last = format!("status {}: {}", r.status, error_message(&r.body));
                 }
                 Ok(r) => return Ok((r, attempt)),
-                Err(e) => last = e,
+                Err(Failure::Transient(e)) => last = e,
+                Err(Failure::Permanent(e)) => return Err(e),
             }
         }
         Err(Error::Transport(format!("{method} {path} failed after {} attempts: {last}", self.retries)))
@@ -187,12 +328,73 @@ impl S3Store {
     fn failed(r: &Response) -> Error {
         Error::Remote { status: r.status, message: error_message(&r.body) }
     }
+
+    /// Uploads `data` in parts: create, upload each part, complete. Any
+    /// failure aborts the upload.
+    fn put_multipart(&self, key: &str, data: &[u8]) -> Result<()> {
+        let path = self.object_path(key)?;
+        let (r, _) = self.request("POST", &path, &[("uploads".to_string(), String::new())], &[], Some(b""))?;
+        if r.status != 200 {
+            return Err(Self::failed(&r));
+        }
+        let text = String::from_utf8_lossy(&r.body);
+        let upload_id = element(&text, "UploadId").map(xml_unescape).ok_or_else(|| Error::Remote {
+            status: r.status,
+            message: "CreateMultipartUpload answered without an UploadId".into(),
+        })?;
+        let result = self.upload_parts(&path, &upload_id, data);
+        if result.is_err() {
+            let query = [("uploadId".to_string(), upload_id.clone())];
+            let _ = self.request("DELETE", &path, &query, &[], None);
+        }
+        result?;
+        self.stats.multipart_uploads.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn upload_parts(&self, path: &str, upload_id: &str, data: &[u8]) -> Result<()> {
+        let mut etags = Vec::new();
+        for (i, part) in data.chunks(self.part_size).enumerate() {
+            let number = i + 1;
+            let query =
+                [("partNumber".to_string(), number.to_string()), ("uploadId".to_string(), upload_id.to_string())];
+            let (r, _) = self.request("PUT", path, &query, &[], Some(part))?;
+            if !(200..300).contains(&r.status) {
+                return Err(Self::failed(&r));
+            }
+            let etag = r.etag.ok_or_else(|| Error::Remote {
+                status: r.status,
+                message: format!("part {number} was accepted without an ETag"),
+            })?;
+            etags.push((number, etag));
+        }
+        let mut xml = String::from("<CompleteMultipartUpload>");
+        for (number, etag) in &etags {
+            xml.push_str(&format!("<Part><PartNumber>{number}</PartNumber><ETag>{}</ETag></Part>", xml_escape(etag)));
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+        let query = [("uploadId".to_string(), upload_id.to_string())];
+        let (r, earlier) = self.request("POST", path, &query, &[], Some(xml.as_bytes()))?;
+        match r.status {
+            // S3 may report a failure in the body of a 200 response.
+            200 if !String::from_utf8_lossy(&r.body).contains("<Error>") => Ok(()),
+            200 => Err(Error::Remote { status: 200, message: error_message(&r.body) }),
+            // A retry after a lost confirmation finds the upload finished.
+            404 if earlier > 0 => Ok(()),
+            _ => Err(Self::failed(&r)),
+        }
+    }
 }
 
 /// Text of the `<Message>` element of an S3 error document, if any.
 fn error_message(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     element(&text, "Message").map(xml_unescape).unwrap_or_else(|| text.chars().take(200).collect())
+}
+
+/// The `<Code>` of an S3 error document, if any.
+fn error_code(body: &[u8]) -> Option<&str> {
+    std::str::from_utf8(body).ok().and_then(|t| element(t, "Code"))
 }
 
 /// Content of the first `<name>…</name>` in `xml`.
@@ -205,6 +407,10 @@ fn element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
 
 fn xml_unescape(s: &str) -> String {
     s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 impl S3Store {
@@ -253,6 +459,9 @@ impl S3Store {
 
 impl ObjectStore for S3Store {
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        if data.len() > self.multipart_threshold {
+            return self.put_multipart(key, data);
+        }
         let (r, _) = self.request("PUT", &self.object_path(key)?, &[], &[], Some(data))?;
         match r.status {
             200..=299 => Ok(()),
@@ -302,6 +511,7 @@ impl ObjectStore for S3Store {
             // A server that ignores the header sends the whole object.
             200 => crate::range_of(key, &r.body, offset, len),
             206 | 416 => Err(Error::Invalid(format!("range {offset}+{len} lies beyond the end of object {key:?}"))),
+            404 => Err(crate::missing(key)),
             _ => Err(Self::failed(&r)),
         }
     }
@@ -329,5 +539,36 @@ impl ObjectStore for S3Store {
             200..=299 | 404 => Ok(()),
             _ => Err(Self::failed(&r)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_is_bounded_and_grows() {
+        let (base, cap) = (Duration::from_millis(50), Duration::from_secs(5));
+        for attempt in 1..30 {
+            let bound = base.saturating_mul(1 << (attempt - 1).min(20)).min(cap);
+            for r in [0, 1, 12345, u64::MAX / 3, u64::MAX] {
+                assert!(backoff_delay(attempt, base, cap, r) < bound.max(Duration::from_nanos(1)));
+            }
+        }
+        // Full jitter: the whole range down to zero is used.
+        assert_eq!(backoff_delay(3, base, cap, 0), Duration::ZERO);
+        assert!(backoff_delay(3, base, cap, 199_999_999) > Duration::from_millis(199));
+        assert_eq!(backoff_delay(1, Duration::ZERO, Duration::ZERO, 7), Duration::ZERO);
+    }
+
+    #[test]
+    fn statuses_are_classified() {
+        for status in [500, 502, 503, 504, 429, 408] {
+            assert!(transient_status(status, b""), "{status}");
+        }
+        for status in [400, 401, 403, 404, 409, 412, 416] {
+            assert!(!transient_status(status, b"<Error><Code>AccessDenied</Code></Error>"), "{status}");
+        }
+        assert!(transient_status(400, b"<Error><Code>RequestTimeout</Code></Error>"));
     }
 }

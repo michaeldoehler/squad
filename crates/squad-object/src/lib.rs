@@ -31,7 +31,7 @@ pub use cache::CachedStore;
 pub use local::LocalStore;
 pub use memory::{Fault, MemoryStore};
 #[cfg(feature = "s3")]
-pub use s3::{S3Config, S3Store};
+pub use s3::{S3Config, S3Stats, S3Store};
 pub use url::open_url;
 
 use std::io;
