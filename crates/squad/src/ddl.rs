@@ -2594,11 +2594,9 @@ pub(crate) fn run_utility(sess: &mut Session, stmt: &N, _params: &[Value]) -> Re
             let tag = if s.is_grant { "GRANT ROLE" } else { "REVOKE ROLE" };
             no_effect(sess, tag, roles_notice(tag))
         }
-        N::AlterOwnerStmt(_) => no_effect(
-            sess,
-            "ALTER TABLE",
-            Notice::info("squad has no object owners; ALTER ... OWNER TO has no effect"),
-        ),
+        N::AlterOwnerStmt(_) => {
+            no_effect(sess, "ALTER TABLE", Notice::info("squad has no object owners; ALTER ... OWNER TO has no effect"))
+        }
         N::AlterDefaultPrivilegesStmt(_) => {
             no_effect(sess, "ALTER DEFAULT PRIVILEGES", privileges_notice("ALTER DEFAULT PRIVILEGES"))
         }

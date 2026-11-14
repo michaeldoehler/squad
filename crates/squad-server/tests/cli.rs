@@ -9,7 +9,11 @@ use std::process::{Child, Command, Stdio};
 use common::Client;
 
 fn squad() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_squad"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_squad"));
+    for var in ["SQUAD_PASSWORD", "SQUAD_PASSWORD_FILE", "SQUAD_USER"] {
+        cmd.env_remove(var);
+    }
+    cmd
 }
 
 fn output(cmd: &mut Command) -> (bool, String, String) {
@@ -23,22 +27,49 @@ fn output(cmd: &mut Command) -> (bool, String, String) {
 
 /// Starts `squad serve` on a free port and returns the process and the
 /// address it reports.
-fn serve(args: &[&str]) -> (Child, SocketAddr) {
-    let mut child = squad()
-        .arg("serve")
-        .args(args)
-        .args(["--listen", "127.0.0.1:0"])
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn");
+fn serve(args: &[&str]) -> (Running, SocketAddr) {
+    let (child, addr, _) = serve_with(squad(), args);
+    (child, addr)
+}
+
+/// Like [`serve`] with a prepared command (environment); also returns what
+/// the server printed before listening.
+fn serve_with(mut cmd: Command, args: &[&str]) -> (Running, SocketAddr, String) {
+    let mut child =
+        cmd.arg("serve").args(args).args(["--listen", "127.0.0.1:0"]).stderr(Stdio::piped()).spawn().expect("spawn");
     let mut line = String::new();
+    let mut printed = String::new();
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     while !line.contains("listening on") {
         line.clear();
-        assert!(stderr.read_line(&mut line).unwrap() > 0, "the server exited without listening");
+        assert!(stderr.read_line(&mut line).unwrap() > 0, "the server exited without listening: {printed}");
+        printed.push_str(&line);
     }
     let addr = line.trim().rsplit(' ').next().unwrap().parse().unwrap_or_else(|_| panic!("unexpected output: {line}"));
-    (child, addr)
+    (Running(child), addr, printed)
+}
+
+/// A server process that is killed when the test ends, also on panic.
+struct Running(Child);
+
+impl std::ops::Deref for Running {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Running {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 #[test]
@@ -55,7 +86,7 @@ fn version_help_and_usage_errors() {
     let (ok, _, err) = output(squad().args(["serve"]));
     assert!(!ok && err.contains("missing database directory"));
     let (ok, _, err) = output(squad().args(["serve", "--memory", "--user", "a"]));
-    assert!(!ok && err.contains("requires a value") || err.contains("needs a --password"), "{err}");
+    assert!(!ok && err.contains("--user needs a password"), "{err}");
     let (ok, _, err) = output(squad().args(["serve", "--memory", "--sync", "sometimes"]));
     assert!(!ok && err.contains("invalid --sync mode"), "{err}");
 }
@@ -264,4 +295,214 @@ fn replica_served_over_the_wire_and_promoted() {
     let (ok, _, err) =
         output(squad().args(["serve", &path("x"), "--replica-of", &format!("file://{}", path("nothing"))]));
     assert!(!ok && err.contains("cannot open replica"), "{err}");
+}
+
+fn ping(args: &[&str]) -> (bool, String, String) {
+    output(squad().arg("ping").args(args))
+}
+
+fn port(addr: SocketAddr) -> String {
+    addr.port().to_string()
+}
+
+fn stop(child: Running) {
+    drop(child);
+}
+
+/// Pings until the server answers or 10 seconds have passed.
+fn ping_until_ready(addr: SocketAddr) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (ok, _, err) = ping(&["--port", &port(addr)]);
+        if ok {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "{err}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn ping_reports_whether_a_server_accepts_connections() {
+    let (child, addr) = serve(&["--memory"]);
+    let (ok, out, err) = ping(&["--host", "127.0.0.1", "--port", &port(addr)]);
+    assert!(ok, "{err}");
+    assert_eq!(out.trim(), format!("127.0.0.1:{} - accepting connections", addr.port()));
+    stop(child);
+    // Nothing listens there any more.
+    let (ok, _, err) = ping(&["--port", &port(addr), "--timeout", "2s"]);
+    assert!(!ok && err.contains("cannot connect"), "{err}");
+    // Something that is not a PostgreSQL server.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let not_pg = listener.local_addr().unwrap();
+    let t = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let _ = s.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+    });
+    let (ok, _, _) = ping(&["--port", &port(not_pg), "--timeout", "2s"]);
+    assert!(!ok);
+    t.join().unwrap();
+}
+
+#[test]
+fn ping_logs_in_with_squad_password() {
+    let mut cmd = squad();
+    cmd.env("SQUAD_PASSWORD", "s3cret");
+    let (child, addr, _) = serve_with(cmd, &["--memory"]);
+    // Without the password the server is still reported as up.
+    let (ok, out, _) = ping(&["--port", &port(addr)]);
+    assert!(ok && out.contains("accepting connections (the server asks for a password)"), "{out}");
+    let (ok, out, err) = output(squad().args(["ping", "--port", &port(addr)]).env("SQUAD_PASSWORD", "s3cret"));
+    assert!(ok, "{err}");
+    assert!(out.trim().ends_with("accepting connections"), "{out}");
+    let (ok, out, _) = output(squad().args(["ping", "--port", &port(addr)]).env("SQUAD_PASSWORD", "wrong"));
+    assert!(ok && out.contains("login failed"), "{out}");
+    stop(child);
+}
+
+#[test]
+fn trust_needs_loopback_or_explicit_flag() {
+    let (ok, _, err) = output(squad().args(["serve", "--memory", "--listen", "0.0.0.0:0"]));
+    assert!(!ok && err.contains("refusing to trust every client"), "{err}");
+    // With --trust the server starts.
+    let mut child = Running(
+        squad().args(["serve", "--memory", "--trust", "--listen", "0.0.0.0:0"]).stderr(Stdio::piped()).spawn().unwrap(),
+    );
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    stderr.read_line(&mut line).unwrap();
+    assert!(line.contains("listening on 0.0.0.0:"), "{line}");
+    stop(child);
+    let (ok, _, err) = output(squad().args(["serve", "--memory", "--trust"]).env("SQUAD_PASSWORD", "x"));
+    assert!(!ok && err.contains("--trust cannot be combined with passwords"), "{err}");
+}
+
+#[test]
+fn passwords_from_the_environment_files_and_the_command_line() {
+    let dir = tempfile::tempdir().unwrap();
+    // On the command line: works, with a warning.
+    let (child, addr, printed) = serve_with(squad(), &["--memory", "--user", "app", "--password", "pw"]);
+    assert!(printed.contains("warning: --password is visible"), "{printed}");
+    let (ok, out, _) =
+        output(squad().args(["ping", "--port", &port(addr), "--user", "app"]).env("SQUAD_PASSWORD", "pw"));
+    assert!(ok && out.trim().ends_with("accepting connections"), "{out}");
+    stop(child);
+
+    // SQUAD_PASSWORD_FILE (Docker secrets) with SQUAD_USER; no warning.
+    let secret = dir.path().join("pw");
+    std::fs::write(&secret, "from file\n").unwrap();
+    let mut cmd = squad();
+    cmd.env("SQUAD_PASSWORD_FILE", &secret).env("SQUAD_USER", "svc");
+    let (child, addr, printed) = serve_with(cmd, &["--memory"]);
+    assert!(!printed.contains("warning"), "{printed}");
+    let (ok, out, _) = output(
+        squad().args(["ping", "--port", &port(addr)]).env("SQUAD_USER", "svc").env("SQUAD_PASSWORD_FILE", &secret),
+    );
+    assert!(ok && out.trim().ends_with("accepting connections"), "{out}");
+    let (ok, out, _) =
+        output(squad().args(["ping", "--port", &port(addr), "--user", "svc"]).env("SQUAD_PASSWORD", "other"));
+    assert!(ok && out.contains("login failed"), "{out}");
+    stop(child);
+
+    // A users file with a verifier from `squad hash-password`.
+    let mut hash = squad().arg("hash-password").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    hash.stdin.take().unwrap().write_all(b"hashed pw\n").unwrap();
+    let hashed = hash.wait_with_output().unwrap();
+    assert!(hashed.status.success());
+    let verifier = String::from_utf8(hashed.stdout).unwrap();
+    assert!(verifier.starts_with("SCRAM-SHA-256$4096:"), "{verifier}");
+    let users = dir.path().join("users");
+    std::fs::write(&users, format!("# logins\nreader:{verifier}plain:plain pw\n")).unwrap();
+    let (child, addr, _) = serve_with(squad(), &["--memory", "--users-file", users.to_str().unwrap()]);
+    for (user, pw) in [("reader", "hashed pw"), ("plain", "plain pw")] {
+        let (ok, out, _) =
+            output(squad().args(["ping", "--port", &port(addr), "--user", user]).env("SQUAD_PASSWORD", pw));
+        assert!(ok && out.trim().ends_with("accepting connections"), "{user}: {out}");
+    }
+    stop(child);
+    std::fs::write(&users, "broken line\n").unwrap();
+    let (ok, _, err) = output(squad().args(["serve", "--memory", "--users-file", users.to_str().unwrap()]));
+    assert!(!ok && err.contains("line 1"), "{err}");
+}
+
+#[test]
+fn tls_and_limit_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+    let cert = dir.path().join("server.crt");
+    let key = dir.path().join("server.key");
+    std::fs::write(&cert, ck.cert.pem()).unwrap();
+    std::fs::write(&key, ck.key_pair.serialize_pem()).unwrap();
+    let (cert, key) = (cert.to_str().unwrap(), key.to_str().unwrap());
+    let (child, addr, printed) = serve_with(
+        squad(),
+        &["--memory", "--tls-cert", cert, "--tls-key", key, "--require-tls", "--max-connections", "1"],
+    );
+    assert!(printed.contains("TLS enabled"), "{printed}");
+    // Without TLS the login is refused, which still means the server is up.
+    let (ok, out, _) = ping(&["--port", &port(addr)]);
+    assert!(ok && out.contains("login refused") && out.contains("no encryption"), "{out}");
+    let mut c = Client::startup(addr, &[("user", "squad")]);
+    assert_eq!(c.recv().fields()[&'C'], "28000");
+    stop(child);
+
+    let (child, addr) = serve(&["--memory", "--max-connections", "1", "--idle-timeout", "300ms"]);
+    let first = Client::connect(addr);
+    let (ok, _, err) = ping(&["--port", &port(addr)]);
+    assert!(!ok && err.contains("sorry, too many clients already"), "{err}");
+    drop(first);
+    ping_until_ready(addr);
+    // The idle timeout frees the slot of a silent client.
+    let mut silent = Client::connect(addr);
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    assert_eq!(silent.recv().fields()[&'C'], "57P05");
+    ping_until_ready(addr);
+    stop(child);
+
+    for (args, msg) in [
+        (vec!["--tls-cert", cert], "must be given together"),
+        (vec!["--require-tls"], "--require-tls needs --tls-cert"),
+        (vec!["--tls-cert", key, "--tls-key", key], "certificate"),
+        (vec!["--max-connections", "0"], "at least 1"),
+        (vec!["--idle-timeout", "soon"], "invalid --idle-timeout"),
+        (vec!["--authentication-timeout", "5parsecs"], "invalid --authentication-timeout"),
+    ] {
+        let (ok, _, err) = output(squad().args(["serve", "--memory"]).args(&args));
+        assert!(!ok && err.contains(msg), "{args:?}: {err}");
+    }
+}
+
+#[test]
+fn remote_url_from_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let url_file = dir.path().join("remote-url");
+    std::fs::write(&url_file, format!("file://{}\n", dir.path().join("remote").display())).unwrap();
+    let data = dir.path().join("data");
+    let (child, addr) =
+        serve(&[data.to_str().unwrap(), "--remote-file", url_file.to_str().unwrap(), "--remote-sync", "sync"]);
+    let mut c = Client::connect(addr);
+    c.rows("CREATE TABLE t (a int); INSERT INTO t VALUES (1)");
+    stop(child);
+    assert!(dir.path().join("remote").read_dir().unwrap().next().is_some(), "nothing was shipped");
+    let (ok, _, err) = output(squad().args([
+        "serve",
+        data.to_str().unwrap(),
+        "--remote",
+        "memory://",
+        "--remote-file",
+        url_file.to_str().unwrap(),
+    ]));
+    assert!(!ok && err.contains("either --remote or --remote-file"), "{err}");
+    // AWS_*_FILE variables are read like Docker secrets.
+    let key_file = dir.path().join("key");
+    std::fs::write(&key_file, "AKIDFROMFILE\n").unwrap();
+    let (ok, _, err) = output(
+        squad()
+            .args(["restore", "s3://bucket/prefix?endpoint=http://127.0.0.1:1", dir.path().join("x").to_str().unwrap()])
+            .env_remove("AWS_ACCESS_KEY_ID")
+            .env_remove("AWS_SECRET_ACCESS_KEY")
+            .env("AWS_ACCESS_KEY_ID_FILE", &key_file),
+    );
+    // The access key was found; the secret key is still missing.
+    assert!(!ok && err.contains("no S3 secret key"), "{err}");
 }

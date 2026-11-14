@@ -18,6 +18,45 @@ fn skip(tool: &str) -> bool {
 }
 
 #[test]
+fn psql_over_tls_and_notices() {
+    if skip("psql") {
+        return;
+    }
+    let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string(), "localhost".to_string()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root.crt");
+    std::fs::write(&root, ck.cert.pem()).unwrap();
+    let tls =
+        squad_server::TlsConfig::from_pem(ck.cert.pem().as_bytes(), ck.key_pair.serialize_pem().as_bytes()).unwrap();
+    let (server, addr) = start(ServerConfig { tls: Some(tls), require_tls: true, ..Default::default() });
+    let run = |mode: &str, sql: &str| {
+        let out = Command::new("psql")
+            .args(["-h", "127.0.0.1", "-p", &addr.port().to_string(), "-U", "squad", "-d", "squad", "-X", "-A", "-t"])
+            .args(["-c", sql])
+            .env("PGSSLMODE", mode)
+            .env("PGSSLROOTCERT", &root)
+            .env("PGCONNECT_TIMEOUT", "10")
+            .output()
+            .expect("run psql");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (ok, out, err) = run("verify-full", "\\conninfo");
+    assert!(ok, "{err}");
+    assert!(out.contains("SSL connection (protocol: TLSv1.3"), "{out}");
+    let (ok, _, err) = run("disable", "SELECT 1");
+    assert!(!ok && err.contains("no encryption"), "{err}");
+    // psql prints the notice of a statement without effect.
+    let (ok, _, err) = run("require", "CREATE TABLE t (a int); GRANT SELECT ON t TO PUBLIC");
+    assert!(ok, "{err}");
+    assert!(err.contains("WARNING:  squad has no privileges; GRANT has no effect"), "{err}");
+    server.shutdown();
+}
+
+#[test]
 fn psql_queries() {
     if skip("psql") {
         return;

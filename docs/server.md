@@ -9,8 +9,8 @@ tools, migration tools, and applications in any language.
 ```sh
 cargo install --path crates/squad-server     # installs the `squad` binary
 
-squad serve ./data                           # 127.0.0.1:5432, every client trusted
-squad serve ./data --listen 0.0.0.0:5433 --user app --password secret
+squad serve ./data                           # 127.0.0.1:5432, local clients trusted
+SQUAD_PASSWORD=secret squad serve ./data --listen 0.0.0.0:5433
 squad serve ./data --unix-socket-dir /tmp    # also /tmp/.s.PGSQL.5432
 squad serve --memory                         # volatile, for tests and CI
 
@@ -21,21 +21,39 @@ psql -h 127.0.0.1 -U squad squad
 | --- | --- |
 | `--listen <addr>` | TCP address (default `127.0.0.1:5432`) |
 | `--unix-socket-dir <dir>` | additionally listen on `<dir>/.s.PGSQL.<port>` |
-| `--user <name> --password <pw>` | require this login (SCRAM-SHA-256); repeatable. Without it every client is trusted. |
+| `--users-file <file>` | logins, see [authentication](#authentication) |
+| `--user <name>` | login name for the password in `SQUAD_PASSWORD` |
+| `--user <name> --password <pw>` | a login given on the command line (repeatable); prints a warning, because other users of the machine can read it in the process list |
+| `--trust` | let every client in without a password, also on an address other than loopback |
 | `--cleartext-password` | ask for the password in clear text, for clients without SCRAM |
+| `--tls-cert <file> --tls-key <file>` | PEM certificate chain and private key; see [TLS](#tls) |
+| `--require-tls` | refuse TCP connections that did not switch to TLS |
+| `--max-connections <n>` | open connections at most (default 100) |
+| `--authentication-timeout <d>` | time from connecting to being logged in (default `60s`) |
+| `--idle-timeout <d>` | close connections whose client sends nothing for this long (default off) |
+| `--max-message-size <bytes>` | largest message a logged-in client may send (default 1 GiB) |
 | `--sync sync\|group\|async` | commit durability, see [durability](durability.md) |
 | `--memory` | serve an in-memory database |
-| `--remote <url>`, `--remote-sync async\|sync`, `--remote-restore` | keep the durable copy in an object store, see [cloud storage](cloud-storage.md) |
-| `--replica-of <url>` | serve a **read replica** of the database whose writer runs with `--remote <url>`; `<dir>` holds the replica's local copy |
+| `--remote <url>`, `--remote-file <file>`, `--remote-sync async\|sync`, `--remote-restore` | keep the durable copy in an object store, see [cloud storage](cloud-storage.md); `--remote-file` reads the URL from a file, so that credentials in it stay out of the process list |
+| `--replica-of <url>`, `--replica-of-file <file>` | serve a **read replica** of the database whose writer runs with `--remote <url>`; `<dir>` holds the replica's local copy |
 | `--poll-interval <ms>` | how often a replica looks for new commits (default 1000) |
+
+Durations are written `30s`, `500ms`, `5min` or `1h`; a bare number
+means seconds.
+
+| Environment variable | Meaning |
+| --- | --- |
+| `SQUAD_PASSWORD`, `SQUAD_PASSWORD_FILE` | password of the login `SQUAD_USER` (or `--user`); the `_FILE` form reads it from a file, as Docker and Kubernetes secrets provide it |
+| `SQUAD_USER` | login name for `SQUAD_PASSWORD` (default `squad`) |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT_URL` | S3 settings for `--remote`/`--replica-of`; each also as `<NAME>_FILE` |
 
 A replica answers queries and refuses writes with SQLSTATE `25006`;
 `SELECT squad_promote()` from any client turns it into the writer. See
 [replication](replication.md) for guarantees, monitoring and the
 failover procedure.
 
-The database name and, without `--user`, the user name a client sends
-are accepted as given; there is one database per directory.
+The database name a client sends is accepted as given; there is one
+database per directory.
 
 Other subcommands:
 
@@ -43,35 +61,141 @@ Other subcommands:
 squad shell ./data            # interactive SQL prompt on the embedded API
 squad backup ./data ./copy    # consistent copy of a database directory
 squad verify ./data           # integrity check
+squad ping --host 127.0.0.1 --port 5432   # health check, exit code 0 or 1
+echo 'secret' | squad hash-password       # SCRAM verifier for a users file
 ```
 
 `backup` and `verify` open the directory themselves, so the database must
 not be open elsewhere; a running application calls `Database::backup`
 instead.
 
+## Authentication
+
+Without any password configured, the server trusts every client: the
+user name a client sends is accepted as given. This is only allowed on
+loopback addresses (`127.0.0.1`, `::1`) and the Unix socket. On any other
+address, `squad serve` refuses to start, and `Server::bind` fails with
+`PermissionDenied`, unless trust is asked for explicitly (`--trust`,
+`ServerConfig::trust_remote`).
+
+Logins come from three places, which can be combined:
+
+- `SQUAD_PASSWORD` or `SQUAD_PASSWORD_FILE`, for the user `SQUAD_USER`
+  (default `squad`) or the single `--user`.
+- `--users-file <file>`: one login per line, `user:password` or
+  `user:SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`. The
+  second form is PostgreSQL's verifier format: it can be copied from
+  `pg_authid.rolpassword` of a PostgreSQL server or produced with `squad
+  hash-password`, and the file then holds no password. Empty lines and
+  lines starting with `#` are ignored. Passwords are turned into
+  verifiers when the file is read.
+- `--user <name> --password <pw>`, with a warning (process list).
+
+Clients authenticate with SCRAM-SHA-256, or with a clear-text password
+under `--cleartext-password` (protect it with TLS). An unknown user and a
+wrong password fail the same way, with `28P01`. Logins grant full access;
+there are no roles or privileges in SQL (`GRANT` and `CREATE ROLE` are
+accepted with a warning and do nothing, see
+[compatibility](compatibility.md#accepted-without-effect)).
+
+## TLS
+
+With `--tls-cert` and `--tls-key` (PEM; the key in PKCS#8, PKCS#1 or SEC1
+form), the server answers a client's SSLRequest with `S` and switches the
+connection to TLS 1.2 or 1.3 (rustls with the ring provider). Clients
+choose with libpq's `sslmode`: `prefer` (libpq's default) and `require`
+encrypt, `verify-ca` and `verify-full` also check the certificate.
+Without a certificate, the request is declined and the connection
+continues unencrypted, as before.
+
+`--require-tls` refuses TCP connections that did not switch to TLS with
+`FATAL 28000` ("… no encryption …"). Connections over the Unix socket
+are not affected. Data a client sends in clear text together with its
+SSLRequest is rejected as a protocol violation (the issue of
+CVE-2021-23214). The newer "direct" TLS handshake of PostgreSQL 17
+(`sslnegotiation=direct`) is not supported; client certificates are not
+checked unless the application builds its own rustls configuration and
+passes it with `TlsConfig::from_rustls`. Certificates are read at start;
+a renewed certificate takes effect after a restart.
+
+## Limits and timeouts
+
+| Limit | Default | When exceeded |
+| --- | --- | --- |
+| open connections | 100 | `FATAL 53300` "sorry, too many clients already" after the client's startup packet. Cancel requests are still served. At most 16 refused clients are answered at a time; beyond that the socket is closed. |
+| time to log in, TLS handshake included | 60 s | the connection is closed |
+| message size before login | 10,000 bytes | `FATAL 08P01`, as for the startup packet in PostgreSQL |
+| message size after login | 1 GiB | `FATAL 08P01` |
+| silence of a logged-in client | off | `FATAL 57P05`, or `25P03` inside a transaction block |
+
+The idle timeout applies whenever the server waits for the client,
+including between the messages of an extended-protocol exchange and
+during `COPY FROM STDIN`. There is no write timeout: a client that stops
+reading a large result holds its connection thread until the operating
+system gives up on the socket.
+
+## Cancelling queries
+
+Every connection receives a process id and a random secret key
+(BackendKeyData). A cancel request with both, as `psql` sends on Ctrl-C
+and drivers send through their cancel APIs (`cancel_token()` in
+tokio-postgres), stops the statement running on that connection with
+`57014` ("canceling statement due to user request"). A request with a
+wrong key is ignored; the requester never gets an answer, as in
+PostgreSQL. `SET statement_timeout` works as well. What can be
+interrupted is described in
+[transactions](transactions.md#cancelling-statements-and-statement_timeout).
+
+## Health checks
+
+`squad ping` connects like a client and exits with 0 if the server
+accepts connections, 1 otherwise:
+
+- With `SQUAD_PASSWORD` (or `SQUAD_PASSWORD_FILE`) set, or with a server
+  that trusts the client, it logs in and runs `SELECT 1`.
+- If the server asks for a password it does not have, refuses the
+  password, or requires TLS, it still reports the server as up (the
+  server answered correctly) and says why it did not log in.
+- No connection, no or a malformed answer, "too many clients" (`53300`)
+  and a failing `SELECT 1` count as not ready.
+
+Options: `--host` (a directory means a Unix socket), `--port`, `--user`
+(default `SQUAD_USER` or `squad`), `--database`, `--timeout` (default
+`5s`). `ping` does not use TLS.
+
 ## Embedding the server
 
 ```rust
 use squad::Database;
-use squad_server::{Auth, Serve, Server, ServerConfig};
+use squad_server::{Auth, Serve, Server, ServerConfig, TlsConfig};
 
 let db = Database::open("data/", Default::default())?;
 
-// Simple: trust every client on this address.
+// Simple: trust every client on a loopback address.
 let handle = db.serve("127.0.0.1:5432")?;
 println!("{}", handle.url().unwrap());   // postgres://squad@127.0.0.1:5432/squad
 
-// Configured: password authentication and a Unix socket.
+// Configured: passwords, TLS, limits and a Unix socket.
 let mut server = Server::new(db.clone(), ServerConfig {
     auth: Auth::Password { users: [("app".into(), "secret".into())].into() },
+    tls: Some(TlsConfig::from_pem_files("server.crt", "server.key")?),
+    require_tls: true,
+    max_connections: 50,
+    idle_timeout: Some(std::time::Duration::from_secs(600)),
     unix_socket: Some("/tmp".into()),
     ..ServerConfig::default()
 });
-server.bind("127.0.0.1:5432")?;
+server.bind("0.0.0.0:5432")?;
 let handle = server.spawn();
 // …
 handle.shutdown();
 ```
+
+`Serve::serve` trusts every client and therefore only accepts loopback
+addresses; anything else fails with `PermissionDenied`. `Auth::Verifiers`
+takes SCRAM verifiers instead of passwords, e.g. from
+`squad_server::users::read_users_file`. `ServerConfig` prints passwords
+as their user names only (`Debug`).
 
 ## Using squad from an sqlx application
 
@@ -111,32 +235,36 @@ Two caveats:
 
 | Client | Result |
 | --- | --- |
-| `psql` 16 | queries, scripts, `\copy`, `\d`, `\dt`, `\di`, `\dn`, `\ds`, `\dv`, `\dT`, `\l`, `\du` |
+| `psql` 16 | queries, scripts, `\copy`, `\d`, `\dt`, `\di`, `\dn`, `\ds`, `\dv`, `\dT`, `\l`, `\du`; TLS with `sslmode=verify-full`, notices |
 | `pg_dump` plain format | a dump with enum, serial and identity columns, jsonb, arrays, bytea, views, constraints and indexes loads through psql |
-| `pgbench` | initialization, TPC-B-like and select-only scripts, simple and prepared mode, no failed transactions |
-| `tokio-postgres` | typed parameters and results, transactions, savepoints, portals, `COPY IN`, SCRAM |
+| `pgbench` 16 | initialization, TPC-B-like and select-only scripts, simple and prepared mode, no failed transactions |
+| `tokio-postgres` | typed parameters and results, transactions, savepoints, portals, `COPY IN`, SCRAM, TLS (tokio-postgres-rustls), cancel tokens, notices |
 | `sqlx` 0.8 | see above |
 
 ## Protocol coverage
 
-Implemented: startup and parameter status, SSL and GSS requests (declined),
-simple query with multiple statements, extended query (Parse, Bind,
-Describe, Execute with row limits and portal suspension, Close, Flush,
-Sync), text and binary parameter and result formats, error responses with
-SQLSTATE, detail, hint and position, `COPY … FROM STDIN` and
-`COPY … TO STDOUT` in text and CSV format, trust, cleartext and
-SCRAM-SHA-256 authentication, Unix domain sockets.
+Implemented: startup and parameter status, TLS through SSLRequest, GSS
+requests (declined), cancel requests, simple query with multiple
+statements, extended query (Parse, Bind, Describe, Execute with row
+limits and portal suspension, Close, Flush, Sync), text and binary
+parameter and result formats, error responses with SQLSTATE, detail,
+hint and position, notice responses (WARNING and NOTICE for statements
+accepted without effect), `COPY … FROM STDIN` and `COPY … TO STDOUT` in
+text and CSV format, trust, cleartext and SCRAM-SHA-256 authentication,
+Unix domain sockets.
 
 Not implemented:
 
-- **TLS.** Connections are unencrypted. Bind to localhost or a Unix
-  socket, or put a TLS-terminating proxy in front.
-- **Query cancellation.** Cancel requests are accepted and ignored.
+- **Direct TLS** (PostgreSQL 17's `sslnegotiation=direct`), client
+  certificate authentication from the command line, GSSAPI encryption,
+  SCRAM channel binding (`SCRAM-SHA-256-PLUS`).
 - **`LISTEN`/`NOTIFY`**, PostgreSQL's replication protocols (streaming
   and logical; squad's own [replication](replication.md) goes through
-  an object store), and notices.
+  an object store).
 - **`COPY` binary format**, `COPY` from or to server-side files.
 - In the extended protocol each `Execute` outside a transaction block
   commits on its own, whereas Postgres commits at `Sync`. This only
   matters for clients that pipeline several statements before one `Sync`
   and rely on them being atomic without `BEGIN`.
+- One thread per connection: `max_connections` bounds the threads, but
+  thousands of connections need a pooler in front, as with PostgreSQL.

@@ -3,11 +3,12 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use std::time::Instant;
 
 use squad::copy::{self, CopyDecoder, CopyRequest};
 use squad::session::{Prepared, TypeResolver};
 use squad::value::{decode_binary, encode_binary, format_value, parse_value};
-use squad::{sqlstate, Error, FnCtx, OutputColumn, QueryResult, Session, TxnStatus, Type, Value};
+use squad::{sqlstate, Error, FnCtx, Notice, OutputColumn, QueryResult, Session, TxnStatus, Type, Value};
 
 use crate::proto::{Io, Reader};
 use crate::scram;
@@ -69,6 +70,18 @@ pub(crate) struct Conn {
     portals: HashMap<String, Portal>,
     reported_tz: String,
     reported_app: String,
+    /// Answer the startup packet with "too many clients".
+    refuse: bool,
+    /// Process id under which this connection accepts cancel requests.
+    registered_pid: Option<i32>,
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        if let Some(pid) = self.registered_pid {
+            self.inner.backends.lock().remove(&pid);
+        }
+    }
 }
 
 fn protocol_violation(msg: impl Into<String>) -> Error {
@@ -146,6 +159,21 @@ fn command_complete(io: &mut Io, tag: &str) {
     }
 }
 
+fn notice_response(io: &mut Io, n: &Notice) {
+    let m = io.begin(b'N');
+    let severity = n.severity.as_str();
+    for (code, value) in [(b'S', severity), (b'V', severity), (b'C', n.code), (b'M', n.message.as_str())] {
+        io.out.push(code);
+        io.cstr(value);
+    }
+    if let Some(h) = &n.hint {
+        io.out.push(b'H');
+        io.cstr(h);
+    }
+    io.out.push(0);
+    io.end(m);
+}
+
 fn error_response(io: &mut Io, severity: &str, e: &Error) {
     let m = io.begin(b'E');
     for (code, value) in [(b'S', severity), (b'V', severity), (b'C', e.code()), (b'M', e.message())] {
@@ -173,7 +201,7 @@ fn io_as_db(e: io::Error) -> Error {
 }
 
 impl Conn {
-    pub(crate) fn new(io: Io, session: Session, inner: Arc<Inner>) -> Conn {
+    pub(crate) fn new(io: Io, session: Session, inner: Arc<Inner>, refuse: bool) -> Conn {
         Conn {
             io,
             session,
@@ -182,7 +210,14 @@ impl Conn {
             portals: HashMap::new(),
             reported_tz: String::new(),
             reported_app: String::new(),
+            refuse,
+            registered_pid: None,
         }
+    }
+
+    /// Bounds the wait for the client's next message by the idle timeout.
+    fn arm_idle_timeout(&mut self) {
+        self.io.deadline = self.inner.idle_timeout.map(|d| Instant::now() + d);
     }
 
     fn fn_ctx(&self) -> FnCtx {
@@ -231,7 +266,8 @@ impl Conn {
                     return Ok(false);
                 };
                 let given = body.split(|b| *b == 0).next().unwrap_or_default();
-                if users.get(user).is_none_or(|pw| pw.as_bytes() != given) {
+                let given = String::from_utf8_lossy(given);
+                if users.get(user).is_none_or(|v| !v.matches_password(&given)) {
                     self.fatal(failed(user))?;
                     return Ok(false);
                 }
@@ -295,17 +331,33 @@ impl Conn {
     /// Handles everything up to the first ReadyForQuery. Returns false if
     /// the connection ends here (cancel request, failed authentication).
     fn startup(&mut self) -> io::Result<bool> {
+        if self.io.deadline.is_none() {
+            self.io.deadline = Some(Instant::now() + self.inner.authentication_timeout);
+        }
         let params = loop {
             let (code, payload) = self.io.read_startup()?;
             match code {
-                SSL_REQUEST | GSSENC_REQUEST => {
-                    // Encryption is not offered; the client may continue
-                    // in clear text.
+                SSL_REQUEST => match self.inner.tls.clone() {
+                    Some(config) if self.io.stream().is_tcp() && !self.io.stream().is_tls() => {
+                        self.io.out.push(b'S');
+                        self.io.flush()?;
+                        self.io.start_tls(config)?;
+                    }
+                    // Not configured, or over a Unix socket: the client
+                    // may continue in clear text.
+                    _ => {
+                        self.io.out.push(b'N');
+                        self.io.flush()?;
+                    }
+                },
+                GSSENC_REQUEST => {
                     self.io.out.push(b'N');
                     self.io.flush()?;
                 }
-                // Queries cannot be cancelled yet; the request is ignored.
-                CANCEL_REQUEST => return Ok(false),
+                CANCEL_REQUEST => {
+                    self.cancel_request(&payload);
+                    return Ok(false);
+                }
                 v if v >> 16 == 3 => {
                     if v & 0xFFFF != 0 {
                         // Newer minor version: negotiate down to 3.0.
@@ -334,6 +386,20 @@ impl Conn {
                 }
             }
         };
+        if self.refuse {
+            self.fatal(Error::new(sqlstate::TOO_MANY_CONNECTIONS, "sorry, too many clients already"))?;
+            return Ok(false);
+        }
+        if self.inner.require_tls && self.io.stream().is_tcp() && !self.io.stream().is_tls() {
+            self.fatal(
+                Error::new(
+                    sqlstate::INVALID_AUTHORIZATION_SPECIFICATION,
+                    "this server accepts only TLS-encrypted TCP connections, no encryption was requested",
+                )
+                .with_hint("Connect with sslmode=require (or verify-ca, verify-full)."),
+            )?;
+            return Ok(false);
+        }
         let Some(user) = params.get("user").filter(|u| !u.is_empty()).cloned() else {
             self.fatal(Error::new(
                 sqlstate::INVALID_AUTHORIZATION_SPECIFICATION,
@@ -344,6 +410,8 @@ impl Conn {
         if !self.authenticate(&user)? {
             return Ok(false);
         }
+        self.io.deadline = None;
+        self.io.max_message = self.inner.max_message_size;
         self.session.state_mut().user = user.clone();
 
         // Run-time parameters passed in the startup packet.
@@ -396,11 +464,26 @@ impl Conn {
         }
         self.reported_tz = tz;
         self.reported_app = app;
+        let pid = self.session.state().pid;
+        let secret = rand::random::<i32>();
+        self.inner.backends.lock().insert(pid, (secret, self.session.cancel_handle()));
+        self.registered_pid = Some(pid);
         let m = self.io.begin(b'K');
-        self.io.i32(self.session.state().pid);
-        self.io.i32(rand::random::<i32>());
+        self.io.i32(pid);
+        self.io.i32(secret);
         self.io.end(m);
         Ok(true)
+    }
+
+    /// A CancelRequest: process id and secret key from BackendKeyData. As
+    /// in PostgreSQL, the requester gets no answer either way.
+    fn cancel_request(&mut self, payload: &[u8]) {
+        let mut r = Reader::new(payload);
+        let (Ok(pid), Ok(secret)) = (r.i32(), r.i32()) else { return };
+        let target = self.inner.backends.lock().get(&pid).filter(|(s, _)| *s == secret).map(|(_, h)| h.clone());
+        if let Some(handle) = target {
+            handle.cancel();
+        }
     }
 
     /// Sends ReadyForQuery, preceded by ParameterStatus for settings the
@@ -444,14 +527,23 @@ impl Conn {
         // until the next Sync.
         let mut skipping = false;
         loop {
-            let (ty, body) = match self.io.read_message() {
+            self.arm_idle_timeout();
+            let read = self.io.read_message();
+            self.io.deadline = None;
+            let (ty, body) = match read {
                 Ok(Some(m)) => m,
                 Ok(None) => return Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                     return self.fatal(protocol_violation(e.to_string()));
                 }
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => return self.idle_timeout(),
                 Err(e) => return Err(e),
             };
+            if matches!(ty, b'Q' | b'E') {
+                // A cancel request that arrived while the connection was
+                // idle must not cancel this statement.
+                self.session.clear_cancel();
+            }
             if skipping && !matches!(ty, b'S' | b'X') {
                 continue;
             }
@@ -496,9 +588,20 @@ impl Conn {
                 Err(Fail::Io(e)) if e.kind() == io::ErrorKind::InvalidData => {
                     return self.fatal(protocol_violation(e.to_string()));
                 }
+                Err(Fail::Io(e)) if e.kind() == io::ErrorKind::TimedOut => return self.idle_timeout(),
                 Err(Fail::Io(e)) => return Err(e),
             }
         }
+    }
+
+    /// Ends a connection on which the client was silent for too long.
+    fn idle_timeout(&mut self) -> io::Result<()> {
+        let e = if self.session.status() == TxnStatus::Idle {
+            Error::new("57P05", "terminating connection due to idle-session timeout")
+        } else {
+            Error::new("25P03", "terminating connection due to idle-in-transaction timeout")
+        };
+        self.fatal(e)
     }
 
     // ---------------------------------------------------------------
@@ -523,6 +626,9 @@ impl Conn {
         let types = self.session.types();
         let io = &mut self.io;
         self.session.execute_each(sql, &mut |r| {
+            for n in &r.notices {
+                notice_response(io, n);
+            }
             if !r.columns.is_empty() {
                 row_description(io, &r.columns, &[], &types);
                 for row in &r.rows {
@@ -674,7 +780,11 @@ impl Conn {
         // sending until it has seen the error, so the remaining copy
         // messages are consumed (and dropped) by the main loop.
         while !finished {
-            match self.io.read_message()? {
+            self.session.check_canceled()?;
+            self.arm_idle_timeout();
+            let message = self.io.read_message();
+            self.io.deadline = None;
+            match message? {
                 Some((b'd', data)) => decoder.feed(&data),
                 Some((b'c', _)) => finished = true,
                 Some((b'f', body)) => {
@@ -888,7 +998,10 @@ impl Conn {
             StmtKind::Sql(p) => p.clone(),
         };
         if portal.result.is_none() {
-            let result = self.session.execute_prepared(&prepared, &portal.params)?;
+            let mut result = self.session.execute_prepared(&prepared, &portal.params)?;
+            for n in std::mem::take(&mut result.notices) {
+                notice_response(&mut self.io, &n);
+            }
             portal.result = Some((result, 0));
         }
         let (result, sent) = portal.result.as_mut().expect("portal was just executed");
