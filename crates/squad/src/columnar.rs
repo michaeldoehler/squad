@@ -98,7 +98,7 @@ const MERGE_MIN_SEGMENTS: usize = 8;
 const MERGE_MAX_SEGMENTS: usize = 32;
 /// Most rows one compaction moves out of the delta; the rest waits for
 /// the next run. Bounds the memory of a compaction.
-pub(crate) const COMPACT_MAX_ROWS: usize = 1_000_000;
+pub(crate) const COMPACT_MAX_ROWS: usize = 262_144;
 /// Rows of one delta block.
 const BLOCK_ROWS: usize = 65_536;
 /// Rows of one `INSERT` from which they are written straight into
@@ -2076,11 +2076,16 @@ impl Compactor {
         self.wake.notify_one();
     }
 
-    /// Waits until no table is due or busy, or the timeout passes.
-    /// Returns true if the compactor is idle.
+    /// Makes every pending delta due and waits until none is left or
+    /// being compacted, or the timeout passes. Returns true if the
+    /// compactor is idle.
     pub(crate) fn wait_idle(&self, config: &ColumnarConfig, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut state = self.state.lock();
+        // Everything pending is due now.
+        let long_ago = Instant::now().checked_sub(Duration::from_secs(86_400)).unwrap_or_else(Instant::now);
+        state.tables.values_mut().for_each(|s| s.since = long_ago);
+        self.wake.notify_one();
         loop {
             let due = state.tables.values().any(|s| s.rows > 0 || s.blocks > 0);
             if !due && state.busy.is_empty() {

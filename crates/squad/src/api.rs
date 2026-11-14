@@ -185,11 +185,12 @@ impl Database {
         Ok(Database::start(shared, columnar))
     }
 
-    /// Waits until the background compaction of columnar tables has
-    /// caught up: no table's delta is due for compaction and none is being
-    /// compacted. Returns false if that did not happen within `timeout`.
-    /// Rows are readable before compaction too; this is for tests,
-    /// benchmarks and orderly shutdowns.
+    /// Compacts the deltas of columnar tables that hold rows now, whatever
+    /// the thresholds, and waits until the background compactor has
+    /// caught up. Returns false if that did not happen within `timeout`.
+    /// With background compaction off nothing is compacted. Rows are
+    /// readable before compaction too; this is for tests, benchmarks and
+    /// orderly shutdowns.
     pub fn wait_for_compaction(&self, timeout: std::time::Duration) -> bool {
         let columnar = &self.shared.columnar;
         columnar.compactor.wait_idle(&columnar.config(), timeout)

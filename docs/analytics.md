@@ -84,8 +84,8 @@ GROUP BY 1 ORDER BY 1;
 The compactor thread compacts a table once its delta holds
 `compact_rows` rows (default 65,536) or `compact_blocks` blocks
 (default 512), or once its oldest rows are `compact_age` old (default
-10 s). One run moves at most a million rows; the rest follows in the
-next run. Afterwards it merges small segments: when at least 8
+10 s). One run moves at most 262,144 rows (four row groups); the rest
+follows in the next run. Afterwards it merges small segments: when at least 8
 segments have fewer than 2 million rows each, up to 32 of them, at most
 4 million rows and `merge_max_bytes` (default 256 MiB) of segment data
 in total, are merged into one. The merge streams: it holds one decoded
@@ -313,8 +313,8 @@ you filter or group by in their own columns rather than inside `jsonb`.
   restart fetches the column chunks it needs from the object store
   again (see [benchmarks](benchmarks.md#analytics) for cold-cache
   timings against Garage).
-- A compaction of the delta holds the rows it moves (at most one
-  million) in memory while encoding; a bulk insert holds its rows, in
+- A compaction of the delta holds the rows it moves (at most 262,144)
+  in memory while encoding; a bulk insert holds its rows, in
   chunks of one million per segment. A merge holds its encoded output
   (bounded by `merge_max_bytes`).
 - The delta has no back-pressure: if inserts outpace compaction for a

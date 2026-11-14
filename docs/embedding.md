@@ -54,8 +54,9 @@ cheap to clone and safe to share between threads.
 `Database::open_in_memory_with(columnar)` takes the columnar settings
 for an in-memory database, and `Database::with_engine_and_objects`
 opens a database on your own storage engine and object store.
-`db.wait_for_compaction(timeout)` waits until the background compactor
-has caught up, for tests, benchmarks and orderly shutdowns.
+`db.wait_for_compaction(timeout)` compacts what is pending regardless of
+the thresholds and waits until the background compactor has caught up,
+for tests, benchmarks and orderly shutdowns.
 
 ## Connections
 
