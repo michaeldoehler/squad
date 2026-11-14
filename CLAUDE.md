@@ -38,5 +38,5 @@ SQUAD_SIM_SEEDS=50 cargo test --release -p squad --test crash_sim
 
 Tests against a real S3 implementation run when `SQUAD_TEST_S3_URL` is set.
 `eval "$(scripts/garage-dev.sh start)"` starts a local single-node Garage
-(binary `garage` on the PATH) and exports it. `pgbench_runs` needs pgbench 15
-or newer.
+(binary `garage` on the PATH) and exports it. Tests that drive `psql` and
+`pgbench` skip themselves when the tools are not installed.
