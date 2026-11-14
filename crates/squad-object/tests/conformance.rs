@@ -276,7 +276,10 @@ fn s3_permanent_errors_are_not_retried() {
 /// its own, or `None` (and a visible note) if none is configured.
 fn real_s3(what: &str) -> Option<String> {
     let Ok(url) = std::env::var("SQUAD_TEST_S3_URL") else {
-        eprintln!("skipped {what}: SQUAD_TEST_S3_URL not set");
+        // Written to the handle directly: the test harness captures
+        // `eprintln!`, and a skipped test should be noticed.
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "skipped {what}: SQUAD_TEST_S3_URL not set");
         return None;
     };
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
