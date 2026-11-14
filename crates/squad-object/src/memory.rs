@@ -26,7 +26,7 @@ type FaultFn = dyn Fn(&str, &str) -> Fault + Send + Sync;
 #[derive(Clone, Default)]
 pub struct MemoryStore {
     objects: Arc<Mutex<BTreeMap<String, Arc<Vec<u8>>>>>,
-    faults: Arc<Mutex<Option<Box<FaultFn>>>>,
+    faults: Arc<Mutex<Option<Arc<FaultFn>>>>,
     puts: Arc<AtomicU64>,
     put_bytes: Arc<AtomicU64>,
     requests: Arc<AtomicU64>,
@@ -42,8 +42,11 @@ impl MemoryStore {
     /// should fail. It receives the operation name (`"put"`, `"get"`,
     /// `"list"`, `"delete"`, `"head"`) and the key or prefix. `None`
     /// removes the hook.
+    ///
+    /// The hook runs outside the store's locks, so concurrent operations
+    /// stay concurrent while it, for example, sleeps.
     pub fn set_faults(&self, hook: Option<Box<FaultFn>>) {
-        *self.faults.lock() = hook;
+        *self.faults.lock() = hook.map(Arc::from);
     }
 
     /// Makes [`put_if_absent`](ObjectStore::put_if_absent) behave like a
@@ -71,7 +74,8 @@ impl MemoryStore {
 
     fn fault(&self, op: &str, key: &str) -> Fault {
         self.requests.fetch_add(1, Ordering::Relaxed);
-        match &*self.faults.lock() {
+        let hook = self.faults.lock().clone();
+        match hook {
             Some(hook) => hook(op, key),
             None => Fault::None,
         }
