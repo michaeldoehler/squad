@@ -334,8 +334,8 @@ fn level_keys(level: &Level, env: &Env, top: bool) -> Result<Keys> {
         undeclared: level.undeclared.clone(),
     };
     let mut roots: Vec<usize> = Vec::new();
-    for i in 0..n {
-        if level.instances[i].dist.is_none() {
+    for (i, instance) in level.instances.iter().enumerate() {
+        if instance.dist.is_none() {
             continue;
         }
         let root = find(&mut parent, i);

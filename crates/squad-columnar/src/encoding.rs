@@ -105,7 +105,7 @@ pub(crate) fn decode_ints(cur: &mut Cur, n: usize) -> Result<Vec<i64>> {
     match cur.u8()? {
         0 => {
             let bytes = cur.take(n.checked_mul(8).ok_or_else(|| corrupt("row count overflow"))?)?;
-            Ok(bytes.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect())
+            Ok(bytes.as_chunks::<8>().0.iter().map(|c| i64::from_le_bytes(*c)).collect())
         }
         1 => {
             let min = cur.i64()?;
@@ -290,15 +290,13 @@ pub(crate) fn decode_column(payload: &[u8], ty: ColumnType, rows: usize) -> Resu
         ColumnType::Float64 => {
             let bytes = cur.take(rows.checked_mul(8).ok_or_else(|| corrupt("row count overflow"))?)?;
             ColumnData::Float64(
-                bytes.chunks_exact(8).map(|c| f64::from_bits(u64::from_le_bytes(c.try_into().unwrap()))).collect(),
+                bytes.as_chunks::<8>().0.iter().map(|c| f64::from_bits(u64::from_le_bytes(*c))).collect(),
             )
         }
         ColumnType::Decimal { .. } => match cur.u8()? {
             0 => {
                 let bytes = cur.take(rows.checked_mul(16).ok_or_else(|| corrupt("row count overflow"))?)?;
-                ColumnData::Decimal(
-                    bytes.chunks_exact(16).map(|c| i128::from_le_bytes(c.try_into().unwrap())).collect(),
-                )
+                ColumnData::Decimal(bytes.as_chunks::<16>().0.iter().map(|c| i128::from_le_bytes(*c)).collect())
             }
             1 => ColumnData::Decimal(decode_ints(&mut cur, rows)?.into_iter().map(i128::from).collect()),
             _ => return Err(corrupt("unknown decimal encoding")),

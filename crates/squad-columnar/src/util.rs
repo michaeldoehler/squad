@@ -183,13 +183,12 @@ pub(crate) fn unpack(cur: &mut Cur, width: u8, n: usize) -> Result<Vec<u64>> {
 #[inline]
 pub fn hash_bytes(data: &[u8]) -> u64 {
     let mut h: u64 = 0x9E37_79B9_7F4A_7C15 ^ (data.len() as u64).wrapping_mul(0xA24B_AED4_963E_E407);
-    let mut chunks = data.chunks_exact(8);
-    for c in &mut chunks {
-        let v = u64::from_le_bytes(c.try_into().unwrap());
+    let (chunks, rem) = data.as_chunks::<8>();
+    for c in chunks {
+        let v = u64::from_le_bytes(*c);
         h = (h ^ v).wrapping_mul(0x9FB2_1C65_1E98_DF25);
         h ^= h >> 29;
     }
-    let rem = chunks.remainder();
     if !rem.is_empty() {
         let mut buf = [0u8; 8];
         buf[..rem.len()].copy_from_slice(rem);
