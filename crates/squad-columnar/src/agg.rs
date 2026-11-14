@@ -1026,6 +1026,8 @@ pub fn aggregate(source: &TableSource, request: &AggregateRequest) -> Result<Bat
         owners.iter().map(|o| AggSpec::new(&request.aggregates[*o], schema).map(|(s, _)| s)).collect::<Result<_>>()?;
 
     let units = source.units(request.predicate.as_ref());
+    source.prefetch_blooms(request.predicate.as_ref(), &units);
+    source.prefetch_columns(request.predicate.as_ref(), &units, &needed);
     let threads = request.parallelism.clamp(1, units.len().max(1));
     let next = AtomicUsize::new(0);
     let work = || -> Result<Partial> {

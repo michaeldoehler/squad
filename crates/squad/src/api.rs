@@ -67,6 +67,7 @@ impl Database {
         };
         // Segments of columnar tables live in the remote store if there
         // is one, otherwise in a directory next to the row store.
+        let remote = config.remote.is_some();
         let (shared, objects): (Arc<Shared>, Arc<dyn ObjectStore>) = match config.remote {
             Some(remote) => {
                 let objects = remote.store.clone();
@@ -80,6 +81,7 @@ impl Database {
             }
         };
         shared.set_objects(objects);
+        shared.columnar.set_remote(remote);
         Ok(Database::start(shared, config.columnar))
     }
 
@@ -114,7 +116,9 @@ impl Database {
     /// the writer.
     pub fn open_replica(path: impl AsRef<Path>, config: crate::ReplicaConfig) -> Result<Database> {
         let columnar = config.columnar.clone();
-        Ok(Database::start(crate::replica::open(path.as_ref(), config)?, columnar))
+        let shared = crate::replica::open(path.as_ref(), config)?;
+        shared.columnar.set_remote(true);
+        Ok(Database::start(shared, columnar))
     }
 
     /// Where this replica stands relative to its writer. `None` for a
@@ -176,6 +180,8 @@ impl Database {
     ) -> Result<Database> {
         let shared = Database::open_shared(engine)?;
         shared.set_objects(objects);
+        // Treated as remote: reads are fetched ahead and in parallel.
+        shared.columnar.set_remote(true);
         Ok(Database::start(shared, columnar))
     }
 

@@ -406,7 +406,6 @@ fn columnar_step(conn: &Connection, rng: &mut Rng, model: &mut ColumnarModel) ->
 }
 
 fn columnar_check(db: &Database, store: &squad::object::MemoryStore, model: &mut ColumnarModel, ctx: &str) {
-    use squad::object::ObjectStore as _;
     let conn = db.connect();
     let exists = conn
         .query_one("SELECT count(*) FROM pg_tables WHERE tablename = 'ev'", &[])
@@ -449,7 +448,7 @@ fn columnar_check(db: &Database, store: &squad::object::MemoryStore, model: &mut
 }
 
 fn run_columnar_seed(seed: u64) {
-    let vfs = SimVfs::new(seed ^ 0xC0_1u64);
+    let vfs = SimVfs::new(seed ^ 0x0C01);
     let store = Arc::new(squad::object::MemoryStore::new());
     let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0x1234_5678);
     let mut model = ColumnarModel::default();

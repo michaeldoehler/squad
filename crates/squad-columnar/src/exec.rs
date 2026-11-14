@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::predicate::{selection, Predicate};
 use crate::segment::Segment;
-use crate::types::{Batch, Column, Schema};
+use crate::types::{Batch, Column, ColumnType, Schema};
 use crate::{Error, Result};
 
 /// What a query runs over: immutable segments plus rows that have not
@@ -53,6 +53,80 @@ impl TableSource {
         }
         units.extend((0..self.delta.len()).map(Unit::Delta));
         units
+    }
+
+    /// Announces the bloom filters the predicate will consult in the
+    /// given units to the segments' sources, so that a remote source
+    /// fetches them in a few parallel requests instead of one by one.
+    pub(crate) fn prefetch_blooms(&self, predicate: Option<&Predicate>, units: &[Unit]) {
+        let Some(p) = predicate else { return };
+        let mut columns: Vec<usize> = Vec::new();
+        let mut required = Vec::new();
+        p.required_values(&mut required);
+        let mut json = Vec::new();
+        p.required_json(&mut json);
+        columns.extend(required.iter().map(|(c, _)| *c).filter(|c| self.schema.columns[*c].ty != ColumnType::Json));
+        columns.extend(json.iter().map(|(c, _)| *c).filter(|c| self.schema.columns[*c].ty == ColumnType::Json));
+        if columns.is_empty() {
+            return;
+        }
+        let mut s = 0;
+        while s < units.len() {
+            let Unit::RowGroup(seg, _) = units[s] else { break };
+            let mut ranges = Vec::new();
+            while let Some(Unit::RowGroup(other, g)) = units.get(s).copied() {
+                if other != seg {
+                    break;
+                }
+                let segment = &self.segments[seg];
+                if p.may_match(&|c| Some(&segment.row_group(g).columns[c].stats)) {
+                    ranges.extend(columns.iter().filter_map(|c| segment.bloom_range(g, *c)));
+                }
+                s += 1;
+            }
+            if ranges.len() > 1 {
+                self.segments[seg].source().prefetch(&ranges);
+            }
+        }
+    }
+
+    /// Announces the column chunks the units will read, segment by
+    /// segment, unless bloom filters may still rule units out (then the
+    /// chunks are fetched unit by unit, after the filters).
+    pub(crate) fn prefetch_columns(&self, predicate: Option<&Predicate>, units: &[Unit], columns: &[usize]) {
+        let mut wanted: Vec<usize> = Vec::new();
+        if let Some(p) = predicate {
+            let (mut required, mut json) = (Vec::new(), Vec::new());
+            p.required_values(&mut required);
+            p.required_json(&mut json);
+            if !required.is_empty() || !json.is_empty() {
+                return;
+            }
+            p.columns(&mut wanted);
+        }
+        for c in columns {
+            if !wanted.contains(c) {
+                wanted.push(*c);
+            }
+        }
+        let mut s = 0;
+        while s < units.len() {
+            let Unit::RowGroup(seg, _) = units[s] else { break };
+            let mut ranges = Vec::new();
+            while let Some(Unit::RowGroup(other, g)) = units.get(s).copied() {
+                if other != seg {
+                    break;
+                }
+                let segment = &self.segments[seg];
+                if predicate.is_none_or(|p| p.may_match(&|c| Some(&segment.row_group(g).columns[c].stats))) {
+                    ranges.extend(segment.chunk_ranges(g, &wanted, false));
+                }
+                s += 1;
+            }
+            if ranges.len() > 1 {
+                self.segments[seg].source().prefetch(&ranges);
+            }
+        }
     }
 
     /// Loads one unit: applies the predicate (pruning by zone maps and
@@ -206,13 +280,10 @@ pub fn scan<'a>(source: &'a TableSource, request: &'a ScanRequest) -> Result<Sca
         return Err(Error::Invalid(format!("column {bad} does not exist")));
     }
     let schema = Schema::new(request.projection.iter().map(|&c| source.schema.columns[c].clone()).collect());
-    Ok(Scan {
-        source,
-        request,
-        schema: Arc::new(schema),
-        units: source.units(request.predicate.as_ref()).into_iter(),
-        remaining: request.limit,
-    })
+    let units = source.units(request.predicate.as_ref());
+    source.prefetch_blooms(request.predicate.as_ref(), &units);
+    source.prefetch_columns(request.predicate.as_ref(), &units, &request.projection);
+    Ok(Scan { source, request, schema: Arc::new(schema), units: units.into_iter(), remaining: request.limit })
 }
 
 impl Scan<'_> {

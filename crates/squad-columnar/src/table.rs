@@ -246,6 +246,7 @@ pub fn merge(segments: &[Arc<Segment>], options: WriterOptions) -> Result<Vec<u8
     if keys.is_empty() {
         for s in segments {
             for g in 0..s.num_row_groups() {
+                s.source().prefetch(&s.chunk_ranges(g, &all, false));
                 writer.write_batch(&s.read_row_group(g, &all)?)?;
             }
         }
@@ -270,6 +271,7 @@ pub fn merge(segments: &[Arc<Segment>], options: WriterOptions) -> Result<Vec<u8
                     self.batch = None;
                     return Ok(false);
                 }
+                self.segment.source().prefetch(&self.segment.chunk_ranges(self.group, all, false));
                 self.batch = Some(self.segment.read_row_group(self.group, all)?);
                 self.group += 1;
                 self.row = 0;

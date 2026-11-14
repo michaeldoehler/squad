@@ -604,48 +604,56 @@ impl ChunkCache {
         self.shard(&key).lock().insert(key, data, size);
     }
 
-    /// The bytes of `key`, fetched with `fetch` on a miss. Concurrent
-    /// misses of one key wait for a single fetch.
-    fn get(&self, key: ChunkKey, fetch: impl FnOnce() -> std::io::Result<Vec<u8>>) -> std::io::Result<Arc<Vec<u8>>> {
-        if let Some(hit) = self.cached(&key) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(hit);
+    /// Registers a fetch of `key` unless it is cached or being fetched.
+    fn claim(&self, key: &ChunkKey) -> Option<Arc<Flight>> {
+        let mut inflight = self.inflight.lock();
+        if inflight.contains_key(key) || self.cached(key).is_some() {
+            return None;
         }
-        let (flight, leader) = {
-            let mut inflight = self.inflight.lock();
-            // Checked again under the lock: a fetch may just have ended.
-            if let Some(hit) = self.cached(&key) {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(hit);
-            }
-            match inflight.get(&key) {
-                Some(f) => (f.clone(), false),
-                None => {
-                    let f = Arc::new(Flight::default());
-                    inflight.insert(key.clone(), f.clone());
-                    (f, true)
-                }
-            }
-        };
-        if !leader {
-            let mut done = flight.done.lock();
-            while done.is_none() {
-                flight.cv.wait(&mut done);
-            }
-            return match done.as_ref().unwrap() {
-                Ok(data) => Ok(data.clone()),
-                Err(msg) => Err(std::io::Error::other(msg.clone())),
-            };
-        }
-        self.misses.fetch_add(1, Ordering::Relaxed);
-        let result = fetch().map(Arc::new);
-        if let Ok(data) = &result {
+        let f = Arc::new(Flight::default());
+        inflight.insert(key.clone(), f.clone());
+        Some(f)
+    }
+
+    /// Ends a fetch registered by [`claim`](ChunkCache::claim).
+    fn complete(&self, key: &ChunkKey, flight: &Flight, result: &std::io::Result<Arc<Vec<u8>>>) {
+        if let Ok(data) = result {
             self.put(key.clone(), data.clone());
         }
         *flight.done.lock() = Some(result.as_ref().map(Arc::clone).map_err(|e| e.to_string()));
         flight.cv.notify_all();
-        self.inflight.lock().remove(&key);
-        result
+        self.inflight.lock().remove(key);
+    }
+
+    /// The bytes of `key`, fetched with `fetch` on a miss. Concurrent
+    /// misses of one key wait for a single fetch.
+    fn get(&self, key: ChunkKey, fetch: impl FnOnce() -> std::io::Result<Vec<u8>>) -> std::io::Result<Arc<Vec<u8>>> {
+        loop {
+            if let Some(hit) = self.cached(&key) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(hit);
+            }
+            if let Some(flight) = self.claim(&key) {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                let result = fetch().map(Arc::new);
+                self.complete(&key, &flight, &result);
+                return result;
+            }
+            let flight = self.inflight.lock().get(&key).cloned();
+            let Some(flight) = flight else { continue };
+            let mut done = flight.done.lock();
+            while done.is_none() {
+                flight.cv.wait(&mut done);
+            }
+            if let Some(Ok(data)) = done.as_ref() {
+                return Ok(data.clone());
+            }
+            // The other fetch failed (perhaps a combined read ahead):
+            // fetch on our own.
+            drop(done);
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return fetch().map(Arc::new);
+        }
     }
 }
 
@@ -661,6 +669,10 @@ struct ObjectSource {
     key: Arc<str>,
     len: u64,
     cache: Arc<ChunkCache>,
+    /// Fetch announced ranges ahead, in parallel (remote stores), up to
+    /// this many bytes per announcement; 0 for local stores, where each
+    /// read is cheap.
+    prefetch_bytes: u64,
 }
 
 fn io_error(key: &str, e: squad_object::Error) -> std::io::Error {
@@ -695,11 +707,21 @@ impl cs::ChunkSource for ObjectSource {
     /// Fetches the missing ranges in a few requests: neighbouring ranges
     /// are fetched together, and separate requests run in parallel.
     fn prefetch(&self, ranges: &[(u64, u64)]) {
+        if self.prefetch_bytes == 0 {
+            return;
+        }
         let mut missing: Vec<(u64, u64)> =
             ranges.iter().copied().filter(|(o, _)| self.cache.cached(&(self.key.clone(), *o)).is_none()).collect();
         if missing.len() < 2 {
             return;
         }
+        // More than the cache should hold at once is read as needed.
+        let mut budget = self.prefetch_bytes;
+        missing.retain(|(_, l)| {
+            let keep = *l <= budget;
+            budget = budget.saturating_sub(*l);
+            keep
+        });
         missing.sort_unstable();
         // Spans of ranges with gaps of at most 64 KiB between them.
         let mut spans: Vec<Span> = Vec::new();
@@ -713,11 +735,22 @@ impl cs::ChunkSource for ObjectSource {
             }
         }
         let fetch = |(start, end, parts): &Span| {
-            if let Ok(data) = self.store.get_range(&self.key, *start, end - start) {
-                for (o, l) in parts {
-                    let at = (o - start) as usize;
-                    self.cache.put((self.key.clone(), *o), Arc::new(data[at..at + *l as usize].to_vec()));
-                }
+            // Ranges another reader is already fetching are left to it.
+            let claimed: Vec<((u64, u64), Arc<Flight>)> =
+                parts.iter().filter_map(|p| self.cache.claim(&(self.key.clone(), p.0)).map(|f| (*p, f))).collect();
+            let (Some(first), Some(last)) = (claimed.first(), claimed.last()) else { return };
+            let (start, end) = (first.0 .0, (last.0 .0 + last.0 .1).min(*end).max(*start));
+            let data = self.store.get_range(&self.key, start, end - start);
+            for ((o, l), flight) in &claimed {
+                let key = (self.key.clone(), *o);
+                let result = match &data {
+                    Ok(data) => {
+                        let at = (o - start) as usize;
+                        Ok(Arc::new(data[at..at + *l as usize].to_vec()))
+                    }
+                    Err(e) => Err(std::io::Error::other(e.to_string())),
+                };
+                self.cache.complete(&key, flight, &result);
             }
         };
         if spans.len() == 1 {
@@ -753,6 +786,9 @@ pub(crate) struct ColumnarState {
     /// Segment objects written by transactions that have not ended yet.
     pending: Mutex<HashMap<String, usize>>,
     pub(crate) compactor: Compactor,
+    /// Segments live in a remote store: announced reads are fetched
+    /// ahead in parallel.
+    remote: AtomicBool,
 }
 
 impl Default for ColumnarState {
@@ -772,6 +808,7 @@ impl ColumnarState {
             retired_count: Default::default(),
             pending: Mutex::new(HashMap::new()),
             compactor: Compactor::default(),
+            remote: AtomicBool::new(false),
             config: Mutex::new(config),
         }
     }
@@ -782,6 +819,12 @@ impl ColumnarState {
         *self.chunks.lock() = Arc::new(ChunkCache::new(bytes));
         *self.blocks.lock() = Lru::new((bytes / 4).max(16 << 20));
         *self.config.lock() = config;
+    }
+
+    /// Declares whether segments are in a remote store (where reads
+    /// are fetched ahead and in parallel) or local.
+    pub(crate) fn set_remote(&self, remote: bool) {
+        self.remote.store(remote, Ordering::Relaxed);
     }
 
     pub(crate) fn config(&self) -> ColumnarConfig {
@@ -858,6 +901,11 @@ impl ColumnarState {
             Some(s) => s,
             None => {
                 let source = ObjectSource {
+                    prefetch_bytes: if self.remote.load(Ordering::Relaxed) {
+                        (self.config.lock().cache_bytes / 8).max(1 << 20)
+                    } else {
+                        0
+                    },
                     store: store.clone(),
                     key: key.clone(),
                     len: meta.bytes,
@@ -1462,7 +1510,10 @@ pub(crate) fn aggregate(
         predicate: filter,
         group_by: keys,
         aggregates: requests,
-        parallelism: std::thread::available_parallelism().map_or(1, |n| n.get()),
+        // Threads cost more than they save on small inputs.
+        parallelism: std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min((source.num_rows() / 200_000) as usize + 1),
         ..Default::default()
     };
     let result = cs::aggregate(&source, &request).map_err(|e| replica_conflict(e.into(), cx))?;
@@ -1807,6 +1858,7 @@ pub(crate) fn delete(plan: &ScanPlan, cx: &mut ExecCx) -> Result<u64> {
                 writer.write_batch(&segment.read_row_group(g, &all)?)?;
                 continue;
             }
+            segment.source().prefetch(&segment.chunk_ranges(g, &all, false));
             let batch = segment.read_row_group(g, &all)?;
             let hits = matching(&batch, cx)?;
             let keep: Vec<u32> = (0..hits.len() as u32).filter(|i| !hits[*i as usize]).collect();

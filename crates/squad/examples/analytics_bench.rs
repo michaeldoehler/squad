@@ -109,7 +109,12 @@ fn main() {
 /// cold (first query after reopening) and warm times.
 #[cfg(feature = "s3")]
 fn remote(rows: i64, url: &str) {
-    let store = squad::object::open_url(url).expect("object store URL");
+    let counting = std::sync::Arc::new(Counting {
+        inner: squad::object::open_url(url).expect("object store URL"),
+        requests: Default::default(),
+        bytes: Default::default(),
+    });
+    let store: std::sync::Arc<dyn squad::object::ObjectStore> = counting.clone();
     let dir = tempfile::tempdir().unwrap();
     let config = || Config {
         sync_mode: SyncMode::Async,
@@ -134,17 +139,72 @@ fn remote(rows: i64, url: &str) {
     println!("rows: {rows}, segments in {}", url.split('?').next().unwrap_or(url));
     println!("load columnar table:       {:>8.1} s  {:>9.0} rows/s", t_col, rows as f64 / t_col);
     println!("final VACUUM (compaction): {:>8.1} s\n", t_compact);
-    println!("{:<46} {:>12} {:>12} {:>12}", "query", "cold (ms)", "warm (ms)", "fetches");
+    println!("{:<46} {:>10} {:>10} {:>9} {:>9}", "query", "cold (ms)", "warm (ms)", "GETs", "MiB");
     for (name, sql) in QUERIES {
         let db = Database::open(dir.path(), config()).unwrap();
         let conn = db.connect();
         let sql = sql.replace("{t}", "events");
+        counting.take();
         let start = Instant::now();
         conn.query(&sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
         let cold = start.elapsed().as_secs_f64() * 1e3;
-        let (_, misses) = db.columnar_cache_stats();
+        let (requests, bytes) = counting.take();
         let (warm, _) = time(&conn, &sql);
-        println!("{name:<46} {cold:>12.1} {warm:>12.2} {misses:>12}");
+        let mib = bytes as f64 / (1 << 20) as f64;
+        println!("{name:<46} {cold:>10.1} {warm:>10.2} {requests:>9} {mib:>9.2}");
+    }
+}
+
+/// Counts the reads of segment objects.
+#[cfg(feature = "s3")]
+struct Counting {
+    inner: std::sync::Arc<dyn squad::object::ObjectStore>,
+    requests: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "s3")]
+impl Counting {
+    fn take(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        (self.requests.swap(0, SeqCst), self.bytes.swap(0, SeqCst))
+    }
+    fn count(&self, key: &str, bytes: u64) {
+        if key.starts_with("columnar/") {
+            self.requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.bytes.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(feature = "s3")]
+impl squad::object::ObjectStore for Counting {
+    fn put(&self, key: &str, data: &[u8]) -> squad::object::Result<()> {
+        self.inner.put(key, data)
+    }
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> squad::object::Result<bool> {
+        self.inner.put_if_absent(key, data)
+    }
+    fn get(&self, key: &str) -> squad::object::Result<Option<Vec<u8>>> {
+        let r = self.inner.get(key)?;
+        self.count(key, r.as_ref().map_or(0, |v| v.len() as u64));
+        Ok(r)
+    }
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> squad::object::Result<Vec<u8>> {
+        self.count(key, len);
+        self.inner.get_range(key, offset, len)
+    }
+    fn head(&self, key: &str) -> squad::object::Result<Option<squad::object::ObjectMeta>> {
+        self.inner.head(key)
+    }
+    fn list(&self, prefix: &str) -> squad::object::Result<Vec<squad::object::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    fn list_after(&self, prefix: &str, after: &str) -> squad::object::Result<Vec<squad::object::ObjectMeta>> {
+        self.inner.list_after(prefix, after)
+    }
+    fn delete(&self, key: &str) -> squad::object::Result<()> {
+        self.inner.delete(key)
     }
 }
 
