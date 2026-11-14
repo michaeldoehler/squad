@@ -61,7 +61,7 @@ use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use sha2::{Digest, Sha256};
 use squad_object::ObjectStore;
 
@@ -112,11 +112,19 @@ pub struct RemoteConfig {
     /// A new snapshot is uploaded once this many bytes of log have been
     /// shipped since the last one.
     pub snapshot_wal_bytes: u64,
+    /// Log uploads that may be under way at the same time (default 1).
+    /// With more than one, commits that arrive while an upload is in
+    /// flight go out in a second upload instead of waiting for the first
+    /// to finish. That helps on stores whose latency is high and which
+    /// handle concurrent requests well; on a single-node Garage it was
+    /// slower, because the groups get smaller and the store does not
+    /// speed up (see `docs/cloud-storage.md`).
+    pub upload_concurrency: usize,
 }
 
 impl RemoteConfig {
     pub fn new(store: Arc<dyn ObjectStore>, mode: RemoteSync) -> RemoteConfig {
-        RemoteConfig { store, mode, restore: false, snapshot_wal_bytes: 64 << 20 }
+        RemoteConfig { store, mode, restore: false, snapshot_wal_bytes: 64 << 20, upload_concurrency: 1 }
     }
 }
 
@@ -126,6 +134,7 @@ impl std::fmt::Debug for RemoteConfig {
             .field("mode", &self.mode)
             .field("restore", &self.restore)
             .field("snapshot_wal_bytes", &self.snapshot_wal_bytes)
+            .field("upload_concurrency", &self.upload_concurrency)
             .finish_non_exhaustive()
     }
 }
@@ -757,12 +766,39 @@ pub fn restore_from(store: &dyn ObjectStore, dir: &Path, opts: DiskOptions) -> R
 
 #[derive(Default)]
 struct Pending {
-    /// Encoded records `first..=last`, not yet uploaded.
+    /// Encoded records `first..=last`, not yet handed to an upload.
     buf: Vec<u8>,
     first: u64,
     last: u64,
     /// Records were dropped; a snapshot must cover them.
     overflowed: bool,
+}
+
+/// Uploads under way and what they have achieved.
+#[derive(Default)]
+struct Shipping {
+    in_flight: usize,
+    /// Every record up to this LSN is in an object that was put (or in a
+    /// snapshot), though not necessarily certified by a fence check yet.
+    put_through: u64,
+    /// Ranges `first -> last` that were put but do not continue
+    /// `put_through` yet, because an earlier range is still in flight.
+    put_done: BTreeMap<u64, u64>,
+    /// Ranges whose upload failed, to be uploaded again first:
+    /// `first -> (last, records)`.
+    retry: BTreeMap<u64, (u64, Vec<u8>)>,
+}
+
+impl Shipping {
+    fn advance(&mut self) {
+        while let Some((&first, &last)) = self.put_done.first_key_value() {
+            if first > self.put_through + 1 {
+                break;
+            }
+            self.put_through = self.put_through.max(last);
+            self.put_done.remove(&first);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -820,8 +856,11 @@ struct Shared {
     /// Orders local writes and their entry into `pending`.
     write_lock: Mutex<()>,
     pending: Mutex<Pending>,
-    /// One uploader at a time; waiting here is what batches commits.
-    ship_lock: Mutex<()>,
+    /// Uploads under way; `shipped` is signalled when one ends.
+    shipping: Mutex<Shipping>,
+    shipped: Condvar,
+    /// Every record up to here is in the store, and a fence check that
+    /// started after it got there found no newer writer.
     shipped_lsn: AtomicU64,
     wal_bytes_since_snapshot: AtomicU64,
     snapshot: Mutex<SnapshotState>,
@@ -850,65 +889,139 @@ impl Shared {
         Ok(())
     }
 
-    /// Uploads all pending log records as one object, unless `target` is
-    /// given and already shipped (another caller's upload carried it).
+    /// Uploads the next unshipped range of log records as one object:
+    /// a range whose earlier upload failed, or else everything pending.
+    /// Returns `false` if there was nothing to upload.
+    ///
+    /// Up to [`RemoteConfig::upload_concurrency`] uploads run at once. Each puts its
+    /// object and then lists the claims (the fence check); a check
+    /// certifies every range whose `PUT` had completed, without gaps, when
+    /// the check started, and only certified records count as shipped.
     ///
     /// # Why no acknowledged commit is lost to a takeover
     ///
-    /// A commit is acknowledged (in `Sync` mode) only after the object
-    /// holding its record was put (`W`) and a following `LIST` of the
-    /// claims (`F`) showed no claim above this writer's epoch. Let `n` be
-    /// the claim of the writer that takes over, `P(n)` its `PUT` and `R(n)`
-    /// the reading of the remote state that it does after winning. If
-    /// `P(n)` took effect before `F` started, `F` sees `n` and nothing is
-    /// acknowledged. Otherwise `W` < `F` < `P(n)` < `R(n)`, so `R(n)` sees
-    /// the object and every earlier one of this writer: the new writer's
-    /// history contains the commit, and its base (the LSN where this
-    /// writer's records stop counting) lies at or after it. Objects this
-    /// writer puts after `R(n)` lie above that base and are ignored by
-    /// every reader.
-    fn ship(&self, target: Option<u64>) -> Result<()> {
-        let _uploader = self.ship_lock.lock();
-        if target.is_some_and(|t| self.shipped_lsn.load(Ordering::Acquire) >= t) {
-            return Ok(());
-        }
+    /// A commit is acknowledged (in `Sync` mode) only once `shipped_lsn`
+    /// covers it: the objects holding its record and every earlier one
+    /// were put (the last of these `PUT`s completing at `W`) and a
+    /// following `LIST` of the claims (`F`) showed no claim above this
+    /// writer's epoch. Let `n` be the claim of the writer that takes over,
+    /// `P(n)` its `PUT` and `R(n)` the reading of the remote state that it
+    /// does after winning. If `P(n)` took effect before `F` started, `F`
+    /// sees `n` and nothing is acknowledged. Otherwise `W` < `F` < `P(n)`
+    /// < `R(n)`, so `R(n)` sees all those objects: the new writer's history
+    /// contains the commit, and its base (the LSN where this writer's
+    /// records stop counting) lies at or after it. Objects this writer
+    /// puts after `R(n)` lie above that base and are ignored by every
+    /// reader.
+    fn ship_one(&self) -> Result<bool> {
         if self.fenced.load(Ordering::Acquire) {
             return Err(self.fenced_error());
         }
-        let (buf, first, last) = {
-            let mut p = self.pending.lock();
-            if p.buf.is_empty() {
-                return Ok(());
-            }
-            (std::mem::take(&mut p.buf), p.first, p.last)
+        let (first, last, buf) = {
+            let mut st = self.shipping.lock();
+            let range = match st.retry.pop_first() {
+                Some((first, (last, buf))) => Some((first, last, buf)),
+                None => {
+                    let mut p = self.pending.lock();
+                    (!p.buf.is_empty()).then(|| (p.first, p.last, std::mem::take(&mut p.buf)))
+                }
+            };
+            let Some(range) = range else { return Ok(false) };
+            st.in_flight += 1;
+            range
         };
-        let result = (|| {
+        let put = (|| {
             // Only records that are durable locally go out: a directory
             // must never be behind what the store holds of its own history.
             self.disk.sync(last)?;
-            self.store.put(&wal_key(&self.claim, first, last), &buf).map_err(remote_err)?;
-            self.check_fence()
+            self.store.put(&wal_key(&self.claim, first, last), &buf).map_err(remote_err)
         })();
-        if let Err(e) = result {
-            // Keep the records for the next attempt, ahead of newer ones.
-            let mut p = self.pending.lock();
-            if !p.overflowed {
-                let newer = std::mem::replace(&mut p.buf, buf);
-                p.buf.extend_from_slice(&newer);
-                p.first = first;
-                if newer.is_empty() {
-                    p.last = last;
+        let certify = {
+            let mut st = self.shipping.lock();
+            match &put {
+                Ok(()) => {
+                    st.put_done.insert(first, last);
+                    st.advance();
+                }
+                // Upload it again later; overflowed records are covered
+                // by the next snapshot instead.
+                Err(_) if self.pending.lock().overflowed => {}
+                Err(_) => {
+                    st.retry.insert(first, (last, buf.clone()));
                 }
             }
-            return Err(e);
-        }
-        self.shipped_lsn.fetch_max(last, Ordering::AcqRel);
+            st.put_through
+        };
+        let result = put.and_then(|()| self.certify(certify));
+        self.shipping.lock().in_flight -= 1;
+        self.shipped.notify_all();
+        result?;
         self.wal_bytes_since_snapshot.fetch_add(buf.len() as u64, Ordering::Relaxed);
         let mut stats = self.stats.lock();
         stats.wal_objects += 1;
         stats.wal_bytes += buf.len() as u64;
         if last > first {
             stats.grouped_uploads += 1;
+        }
+        Ok(true)
+    }
+
+    /// Checks the fence and, if no newer writer exists, marks everything
+    /// up to `put_through` (read before the check started) as shipped.
+    fn certify(&self, put_through: u64) -> Result<()> {
+        self.check_fence()?;
+        self.shipped_lsn.fetch_max(put_through, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Returns once every record up to `lsn` is shipped. The caller
+    /// uploads itself when there is something to upload and room for
+    /// another upload, and otherwise waits for the uploads under way.
+    /// Fails if an upload this caller made fails.
+    fn ship_through(&self, lsn: u64) -> Result<()> {
+        loop {
+            if self.shipped_lsn.load(Ordering::Acquire) >= lsn {
+                return Ok(());
+            }
+            if self.fenced.load(Ordering::Acquire) {
+                return Err(self.fenced_error());
+            }
+            let mut st = self.shipping.lock();
+            if self.shipped_lsn.load(Ordering::Acquire) >= lsn {
+                return Ok(());
+            }
+            let unassigned = !st.retry.is_empty() || !self.pending.lock().buf.is_empty();
+            if unassigned && st.in_flight < self.config.upload_concurrency.max(1) {
+                drop(st);
+                self.ship_one()?;
+            } else if st.in_flight == 0 {
+                // Everything is put, but no fence check covered it yet (the
+                // last one failed): check now.
+                let put_through = st.put_through;
+                drop(st);
+                if put_through < lsn {
+                    return Err(StorageError::Remote(format!("log record {lsn} is not on its way to the store")));
+                }
+                self.certify(put_through)?;
+            } else {
+                self.shipped.wait_for(&mut st, Duration::from_millis(50));
+            }
+        }
+    }
+
+    /// Uploads what is pending now, and ranges to retry, for the
+    /// background thread. Records that arrive meanwhile wait for the next
+    /// round, so that `Async` mode uploads once per interval.
+    fn ship_all(&self) -> Result<()> {
+        let rounds = 1 + self.shipping.lock().retry.len();
+        for _ in 0..rounds {
+            if !self.ship_one()? {
+                break;
+            }
+        }
+        let put_through = self.shipping.lock().put_through;
+        if put_through > self.shipped_lsn.load(Ordering::Acquire) {
+            self.certify(put_through)?;
         }
         Ok(())
     }
@@ -964,6 +1077,10 @@ impl Shared {
             // The manifest goes last: it makes the snapshot exist.
             self.check_fence()?;
             self.store.put(&snapshot_key(&self.claim, manifest.lsn), &manifest.encode()).map_err(remote_err)?;
+            // Records the snapshot covers count as shipped only after a
+            // fence check that started after the manifest was stored, for
+            // the same reason as log objects (see `ship_one`).
+            self.check_fence()?;
             let mut stats = self.stats.lock();
             stats.snapshots += 1;
             stats.snapshot_lsn = manifest.lsn;
@@ -979,7 +1096,14 @@ impl Shared {
         snap.chunks = manifest.chunks.iter().map(|c| c.0.clone()).collect();
         self.wal_bytes_since_snapshot.store(0, Ordering::Relaxed);
         self.pending.lock().overflowed = false;
+        {
+            let mut st = self.shipping.lock();
+            st.put_through = st.put_through.max(manifest.lsn);
+            st.retry.retain(|_, (last, _)| *last > manifest.lsn);
+            st.advance();
+        }
         self.shipped_lsn.fetch_max(manifest.lsn, Ordering::AcqRel);
+        self.shipped.notify_all();
         // Failing to clean up only leaves garbage behind.
         let _ = self.collect_garbage(&manifest, previous);
         Ok(())
@@ -1028,7 +1152,8 @@ impl Shared {
         if self.fenced.load(Ordering::Acquire) {
             return;
         }
-        let _ = self.ship(None);
+        let _ = self.disk.sync(self.disk.last_lsn());
+        let _ = self.ship_all();
         let due = self.wal_bytes_since_snapshot.load(Ordering::Relaxed) >= self.config.snapshot_wal_bytes
             || self.pending.lock().overflowed;
         if due {
@@ -1184,7 +1309,8 @@ impl TieredEngine {
             claim,
             write_lock: Mutex::new(()),
             pending: Mutex::new(Pending::default()),
-            ship_lock: Mutex::new(()),
+            shipping: Mutex::new(Shipping { put_through: shipped, ..Shipping::default() }),
+            shipped: Condvar::new(),
             shipped_lsn: AtomicU64::new(shipped),
             wal_bytes_since_snapshot: AtomicU64::new(0),
             snapshot: Mutex::new(snapshot),
@@ -1209,8 +1335,14 @@ impl TieredEngine {
     /// Uploads all log records written so far. In `Async` mode this is
     /// what the background thread does periodically.
     pub fn flush_remote(&self) -> Result<()> {
-        self.shared.disk.sync(self.shared.disk.last_lsn())?;
-        self.shared.ship(None)
+        let last = self.shared.disk.last_lsn();
+        self.shared.disk.sync(last)?;
+        if self.shared.pending.lock().overflowed {
+            // Some records were dropped from the upload queue; only the
+            // next snapshot can cover them.
+            return self.shared.ship_all();
+        }
+        self.shared.ship_through(last)
     }
 
     /// Records the answer of the conditional-write probe.
@@ -1290,11 +1422,8 @@ impl Engine for TieredEngine {
     fn sync(&self, lsn: u64) -> Result<()> {
         let s = &*self.shared;
         s.disk.sync(lsn)?;
-        if s.config.mode == RemoteSync::Sync && s.shipped_lsn.load(Ordering::Acquire) < lsn {
-            s.ship(Some(lsn))?;
-            if s.shipped_lsn.load(Ordering::Acquire) < lsn {
-                return Err(StorageError::Remote(format!("commit at LSN {lsn} could not be stored remotely")));
-            }
+        if s.config.mode == RemoteSync::Sync {
+            s.ship_through(lsn)?;
         }
         Ok(())
     }

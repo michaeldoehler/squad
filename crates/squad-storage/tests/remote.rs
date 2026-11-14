@@ -589,3 +589,72 @@ fn concurrent_writers_one_wins_and_no_acknowledged_commit_is_lost() {
         assert!(!got.contains_key(&b"late"[..]));
     }
 }
+
+/// Many committers in `Sync` mode on a slow store that fails requests:
+/// a second upload starts while one is in flight, commits share uploads,
+/// and every acknowledged commit is restored.
+#[test]
+fn concurrent_sync_commits_share_and_overlap_uploads() {
+    for seed in 0..env("SQUAD_REMOTE_CONCURRENT_SEEDS", 6) {
+        let store = MemoryStore::new();
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let most = Arc::new(AtomicU64::new(0));
+        let counter = Arc::new(AtomicU64::new(seed * 7919 + 1));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (f, m, c, x) = (in_flight.clone(), most.clone(), counter.clone(), fail.clone());
+        store.set_faults(Some(Box::new(move |op, key| {
+            if op == "put" && key.starts_with("wal/") {
+                let now = f.fetch_add(1, Ordering::SeqCst) + 1;
+                m.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(3));
+                f.fetch_sub(1, Ordering::SeqCst);
+            }
+            let n = c.fetch_add(0x9E37_79B9, Ordering::Relaxed).wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40;
+            match (x.load(Ordering::SeqCst), op, n % 20) {
+                (true, "put" | "list", 0) => Fault::Fail,
+                (true, "put" | "list", 1) => Fault::FailAfterEffect,
+                _ => Fault::None,
+            }
+        })));
+        let cfg = RemoteConfig { upload_concurrency: 2, ..config(&store, RemoteSync::Sync) };
+        let engine = TieredEngine::open(Path::new("/db"), options(&SimVfs::new(seed)), cfg).unwrap();
+        fail.store(seed % 2 == 1, Ordering::SeqCst);
+        let engine = Arc::new(engine);
+        let threads: Vec<_> = (0..12u64)
+            .map(|t| {
+                let engine = engine.clone();
+                std::thread::spawn(move || {
+                    let mut acked = Vec::new();
+                    for i in 0..40u64 {
+                        let key = format!("t{t:02}-{i:03}").into_bytes();
+                        let mut b = WriteBatch::new();
+                        b.put(key.clone(), key.clone());
+                        let lsn = engine.write(b).unwrap();
+                        if engine.sync(lsn).is_ok() {
+                            acked.push(key);
+                        }
+                    }
+                    acked
+                })
+            })
+            .collect();
+        let acked: Vec<Vec<u8>> = threads.into_iter().flat_map(|t| t.join().unwrap()).collect();
+        let stats = engine.remote_stats();
+        assert!(most.load(Ordering::SeqCst) >= 2, "seed {seed}: uploads never overlapped");
+        assert!(stats.grouped_uploads > 0, "seed {seed}: no upload carried more than one commit: {stats:?}");
+        assert!(stats.wal_objects < 480, "seed {seed}: {stats:?}");
+        assert!(!acked.is_empty());
+        // The machine dies; only the store is left.
+        std::mem::forget(Arc::try_unwrap(engine).ok().unwrap());
+        store.set_faults(None);
+        let got = restored(&store);
+        for key in &acked {
+            assert_eq!(
+                got.get(key),
+                Some(key),
+                "seed {seed}: acknowledged commit {} lost",
+                String::from_utf8_lossy(key)
+            );
+        }
+    }
+}
