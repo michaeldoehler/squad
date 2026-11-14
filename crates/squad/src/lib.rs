@@ -49,9 +49,9 @@ pub mod value;
 pub use api::{Config, Connection, Database, Row, RowIndex, Statement, Transaction};
 pub use bind::OutputColumn;
 pub use convert::{FromSql, ToSql};
-pub use error::{sqlstate, Error, Result};
+pub use error::{sqlstate, Error, Notice, Result, Severity};
 pub use replica::{ReplicaConfig, ReplicationRole, ReplicationStatus};
-pub use session::{QueryResult, Session, TxnStatus};
+pub use session::{CancelHandle, QueryResult, Session, TxnStatus};
 pub use squad_storage::{RemoteConfig, RemoteSync, SyncMode, VerifyReport};
 
 /// Object stores for [`Config::remote`]: local directories, memory and

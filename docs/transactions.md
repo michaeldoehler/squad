@@ -100,6 +100,47 @@ When transactions wait for each other in a cycle, the one whose wait
 would close the cycle fails with `40P01` (`deadlock detected`). Detection
 happens at the moment the wait would begin, not after a timeout.
 
+## Table locks
+
+squad has two locks per table: a shared one that every writing
+statement (and `SELECT … FOR UPDATE/SHARE`) holds until the end of its
+transaction, and an exclusive one that schema changes hold. Plain reads
+take neither. `LOCK TABLE` maps PostgreSQL's modes onto these where the
+conflicts come out the same:
+
+| Mode | squad | Conflicts with |
+| --- | --- | --- |
+| `ACCESS SHARE` | no lock, like `SELECT` | nothing (in PostgreSQL only `ACCESS EXCLUSIVE`, which squad does not offer) |
+| `ROW SHARE`, `ROW EXCLUSIVE` | shared table lock | `EXCLUSIVE`, schema changes |
+| `EXCLUSIVE` | exclusive table lock | writers, `ROW SHARE`, `ROW EXCLUSIVE`, `EXCLUSIVE`, schema changes; readers continue |
+| `SHARE UPDATE EXCLUSIVE`, `SHARE`, `SHARE ROW EXCLUSIVE` | fails with `0A000` | |
+| `ACCESS EXCLUSIVE` (the default of `LOCK TABLE t`) | fails with `0A000` | it would have to block readers, which never wait in squad |
+
+As in PostgreSQL, `LOCK TABLE` only works inside a transaction block
+(`25P01` otherwise), `NOWAIT` fails with `55P03` instead of waiting, and
+`lock_timeout` bounds the wait. A read replica refuses `EXCLUSIVE`.
+
+## Cancelling statements and `statement_timeout`
+
+`SET statement_timeout = '5s'` (or a number of milliseconds) makes every
+following statement of the session fail with `57014` ("canceling
+statement due to statement timeout") once it has run that long; `0`
+turns it off. A statement can also be cancelled from another thread with
+`Connection::cancel_handle()` or, over the wire protocol, with a client's
+cancel request; it then fails with `57014` ("canceling statement due to
+user request"). In both cases the transaction is rolled back like after
+any other error (inside a transaction block, the block is marked failed).
+
+The executor looks at the cancel flag and the clock every few hundred
+rows it processes, so a statement stops within milliseconds. Not
+interrupted: waiting for a row or table lock (bound it with
+`lock_timeout`), waiting for a durable commit, a `COPY FROM STDIN` row
+batch while it is being inserted, and the vectorized aggregation over
+columnar segments, which runs to completion once started (rows of
+columnar tables that flow through the ordinary executor are checked like
+all others). The timeout applies to each statement separately, also inside
+a multi-statement query string.
+
 ## Schema changes
 
 DDL is transactional and can be mixed with data changes:

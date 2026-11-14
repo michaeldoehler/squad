@@ -10,6 +10,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// SQLSTATE codes used by squad. The values are identical to Postgres.
 pub mod sqlstate {
     pub const SUCCESSFUL_COMPLETION: &str = "00000";
+    pub const WARNING: &str = "01000";
     pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
     pub const CARDINALITY_VIOLATION: &str = "21000";
     pub const STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
@@ -83,6 +84,7 @@ pub mod sqlstate {
     pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
     pub const LOCK_NOT_AVAILABLE: &str = "55P03";
     pub const QUERY_CANCELED: &str = "57014";
+    pub const TOO_MANY_CONNECTIONS: &str = "53300";
     pub const IO_ERROR: &str = "58030";
     pub const PROTOCOL_VIOLATION: &str = "08P01";
     pub const INTERNAL_ERROR: &str = "XX000";
@@ -161,6 +163,65 @@ impl Error {
     }
     pub fn division_by_zero() -> Error {
         Error::new(sqlstate::DIVISION_BY_ZERO, "division by zero")
+    }
+}
+
+/// How serious a [`Notice`] is, as in a Postgres `NoticeResponse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Warning,
+    Notice,
+}
+
+impl Severity {
+    /// The severity as Postgres spells it: `WARNING` or `NOTICE`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Warning => "WARNING",
+            Severity::Notice => "NOTICE",
+        }
+    }
+}
+
+/// A message about a statement that succeeded, like a Postgres
+/// `NoticeResponse`. squad uses notices to say that a statement was
+/// accepted but had no effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub severity: Severity,
+    /// SQLSTATE: `01000` for warnings, `00000` for notices.
+    pub code: &'static str,
+    pub message: String,
+    pub hint: Option<String>,
+}
+
+impl Notice {
+    pub fn warning(message: impl Into<String>) -> Notice {
+        Notice { severity: Severity::Warning, code: sqlstate::WARNING, message: message.into(), hint: None }
+    }
+
+    pub fn info(message: impl Into<String>) -> Notice {
+        Notice {
+            severity: Severity::Notice,
+            code: sqlstate::SUCCESSFUL_COMPLETION,
+            message: message.into(),
+            hint: None,
+        }
+    }
+
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Notice {
+        self.hint = Some(hint.into());
+        self
+    }
+}
+
+impl fmt::Display for Notice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.severity.as_str(), self.message)?;
+        if let Some(h) = &self.hint {
+            write!(f, "\nHINT: {h}")?;
+        }
+        Ok(())
     }
 }
 

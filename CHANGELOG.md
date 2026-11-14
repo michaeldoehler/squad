@@ -57,3 +57,23 @@ versions may change the API and the on-disk format.
   reference tables, single-shard routing by distribution key,
   scatter-gather queries with merged aggregates, and transactions bound
   to one shard.
+
+### Added (server hardening)
+
+- Statement cancellation: `Connection::cancel_handle()` / `CancelHandle`
+  and `Session::cancel_handle()`; the executor stops with SQLSTATE
+  `57014`. `SET statement_timeout` is honoured (also `57014`).
+- Notices: `QueryResult::notices` (`squad::Notice`, `squad::Severity`).
+
+### Changed (server hardening)
+
+- `GRANT`, `REVOKE`, `CREATE/ALTER/DROP ROLE`, `ALTER DEFAULT
+  PRIVILEGES`, `ENABLE ROW LEVEL SECURITY` and `SET CONSTRAINTS …
+  DEFERRED` are still accepted without effect but now send a WARNING;
+  `CREATE EXTENSION`, `COMMENT ON` and `ALTER … OWNER TO` send a NOTICE.
+  `GRANT`/`REVOKE` on a missing table fail with `42P01`.
+- `LOCK TABLE` takes real table locks in the modes `ACCESS SHARE`, `ROW
+  SHARE`, `ROW EXCLUSIVE` and `EXCLUSIVE`, requires a transaction block
+  (`25P01`) and fails with `0A000` in the other modes, including the
+  default `ACCESS EXCLUSIVE`; it used to succeed without effect.
+- `QueryResult` has a new public field `notices`.
