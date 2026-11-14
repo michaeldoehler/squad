@@ -172,9 +172,11 @@ conflict with recovery`. The transaction can be run again at once.
    [columnar table](analytics.md) as soon as a compaction or `DELETE`
    has replaced it. A replica that has not yet applied that commit may
    still plan a query against the old segment list and find the object
-   missing. Segments a replica has already opened are held in its
-   segment cache and stay readable; the window is the replication lag
-   after a compaction.
+   missing. Column chunks a replica has already read are held in its
+   cache and stay readable, but segments are read in ranges, so a query
+   that needs other chunks of a replaced segment fails; the window is
+   the replication lag after a compaction or merge, which on a busy
+   writer now run in the background at any time.
 
 ## Monitoring
 

@@ -48,8 +48,12 @@ pub struct ExecCx<'a> {
     pub rows_affected: u64,
     /// Segment objects made obsolete by this statement.
     pub dropped_objects: Vec<String>,
-    /// Rows inserted into columnar tables by this statement.
-    pub columnar_inserted: HashMap<u32, u64>,
+    /// Rows and delta blocks inserted into columnar tables by this
+    /// statement.
+    pub columnar_inserted: HashMap<u32, (u64, u64)>,
+    /// Segment objects written by this statement; they belong to the
+    /// transaction until it ends.
+    pub written_objects: Vec<String>,
     /// When `statement_timeout` expires.
     deadline: Option<Instant>,
     /// Calls of [`ExecCx::check_interrupts`] since the last real check.
@@ -83,6 +87,7 @@ impl<'a> ExecCx<'a> {
             rows_affected: 0,
             dropped_objects: Vec::new(),
             columnar_inserted: HashMap::new(),
+            written_objects: Vec::new(),
             deadline: session.statement_timeout.map(|d| Instant::now() + d),
             ticks: 0,
             session,
@@ -297,11 +302,8 @@ pub fn open<'p>(plan: &'p Plan, cx: &mut ExecCx) -> Result<Box<dyn Node + 'p>> {
             }
             rows(out)
         }
-        // A columnar table is its delta rows followed by its segments.
-        Plan::Scan(scan) if scan.table.columnar.is_some() => Box::new(ChainNode {
-            first: Some(Box::new(ScanNode::open(scan, cx)?)),
-            second: Box::new(crate::columnar::SegmentRows::open(scan, cx)?),
-        }),
+        // A columnar table is its delta followed by its segments.
+        Plan::Scan(scan) if scan.table.columnar.is_some() => Box::new(crate::columnar::ColumnarScan::open(scan, cx)?),
         Plan::Scan(scan) => Box::new(ScanNode::open(scan, cx)?),
         Plan::ColumnarAgg { scan, groups, aggs, fallback } => match crate::columnar::aggregate(scan, groups, aggs, cx)?
         {
@@ -483,12 +485,6 @@ pub fn open<'p>(plan: &'p Plan, cx: &mut ExecCx) -> Result<Box<dyn Node + 'p>> {
         Plan::Update(p) => rows(crate::dml::update(p, cx)?),
         Plan::Delete(p) => rows(crate::dml::delete(p, cx)?),
     })
-}
-
-/// Scan of the row store part of a table (for a columnar table: its
-/// delta).
-pub(crate) fn row_store_scan<'p>(plan: &'p ScanPlan, cx: &mut ExecCx) -> Result<Box<dyn Node + 'p>> {
-    Ok(Box::new(ScanNode::open(plan, cx)?))
 }
 
 /// Smallest byte string greater than every string starting with `key`.

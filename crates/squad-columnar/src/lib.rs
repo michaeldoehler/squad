@@ -56,6 +56,7 @@
 mod agg;
 mod encoding;
 mod exec;
+mod json;
 mod predicate;
 mod segment;
 mod sketch;
@@ -64,11 +65,16 @@ mod types;
 mod util;
 
 pub use agg::{aggregate, floor_time, Aggregate, AggregateRequest, GroupKey, OrderBy, TimeUnit};
+pub use encoding::{decode_batch, encode_batch};
 pub use exec::{scan, Scan, ScanRequest, TableSource};
+pub use json::{field_text as json_field_text, for_each_field as json_for_each_field, json_key_hash, json_pair_hash};
 pub use predicate::{CmpOp, Predicate};
-pub use segment::{Bloom, ChunkMeta, ChunkSource, ColumnStats, RowGroupMeta, Segment, SegmentWriter, WriterOptions};
+pub use segment::{
+    Bloom, ChunkMeta, ChunkSource, ColumnStats, ProjectedColumn, RowGroupMeta, Segment, SegmentStreamWriter,
+    SegmentWriter, WriterOptions,
+};
 pub use sketch::{Hll, QuantileSketch};
-pub use table::{compact, Manifest, SegmentMeta};
+pub use table::{compact, merge, Manifest, SegmentMeta};
 pub use types::{
     cmp_datum, cmp_f64, Batch, BytesColumn, BytesData, Column, ColumnBuilder, ColumnData, ColumnType, Datum, Field,
     Schema,

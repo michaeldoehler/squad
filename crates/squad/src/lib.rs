@@ -49,6 +49,7 @@ pub mod value;
 
 pub use api::{Config, Connection, Database, Row, RowIndex, Statement, Transaction};
 pub use bind::OutputColumn;
+pub use columnar::ColumnarConfig;
 pub use convert::{FromSql, ToSql};
 pub use error::{sqlstate, Error, Notice, Result, Severity};
 pub use replica::{ReplicaConfig, ReplicationRole, ReplicationStatus};

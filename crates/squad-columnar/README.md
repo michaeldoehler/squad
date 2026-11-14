@@ -81,7 +81,8 @@ let per_day = aggregate(&table, &AggregateRequest {
 | `Int64` | integers of any width, dates, timestamps in microseconds, enum ordinals | `Datum::Int` |
 | `Float64` | floats; NaN sorts above everything and equals itself, as in PostgreSQL | `Datum::Float` |
 | `Decimal { scale }` | `i128` unscaled value | `Datum::Decimal` |
-| `Bytes`, `Utf8` | byte strings, text, UUIDs, JSON text; compared bytewise | `Datum::Bytes` |
+| `Bytes`, `Utf8` | byte strings, text, UUIDs; compared bytewise | `Datum::Bytes` |
+| `Json` | JSON documents as text, stored like `Utf8`; bloom filters cover top-level keys and key/value pairs | `Datum::Bytes` |
 
 Every column may contain NULLs. A `Batch` is a schema plus one `Column`
 per field; `Batch::from_rows` / `to_rows` convert from and to rows of
@@ -128,13 +129,15 @@ can load unaligned 64-bit words.
 
 **Bloom filter chunk:** `crc:u32 hashes:u8 bits`. Built for integer and
 byte columns with ten bits per distinct value and seven probes (about 1 %
-false positives).
+false positives); for `Json` columns over the hashes of top-level keys
+and key/value pairs instead.
 
 **Footer**
 
 ```text
 version:u32 (1)
 columns:u32, per column: name (u32 length + bytes), type:u8, scale:u8, nullable:u8
+    (type: 0 Bool, 1 Int64, 2 Float64, 3 Decimal, 4 Bytes, 5 Utf8, 6 Json)
 sort_key:u32, per key: column:u32
 rows:u64
 row_groups:u32, per row group:
@@ -147,8 +150,10 @@ row_groups:u32, per row group:
 decimal, `5` bytes) followed by the value.
 
 A reader fetches the last 64 KiB of the file, which normally contains
-the whole footer, and afterwards only the chunks it needs: one request
-per column chunk (and bloom filter) of the row groups that survive pruning.
+the whole footer, and afterwards only the chunks it needs: one read per
+column chunk (and bloom filter) of the row groups that survive pruning,
+announced beforehand through `ChunkSource::prefetch` so that a remote
+source can combine and parallelize the requests.
 
 ### Choosing encodings
 
@@ -168,7 +173,10 @@ LZ4 is applied on top when it saves at least a tenth.
 ### Statistics
 
 Per column chunk the footer records minimum, maximum, NULL count and the
-number of distinct values; per segment these are combined. Bounds of
+number of distinct values; per segment these are combined. Integer and
+byte columns get a bloom filter over their values (about 1 % false
+positives); `Json` columns one over the documents' top-level keys and
+`key`/`value text` pairs, which `JsonIn` and `JsonIsNull` consult. Bounds of
 long byte strings are shortened to 64 bytes (the upper bound is rounded
 up), so they are bounds rather than actual values.
 
@@ -242,7 +250,10 @@ memory in proportion.
 
 `Cmp` (`=`, `<>`, `<`, `<=`, `>`, `>=`), `In`, `Between`, `IsNull`,
 `Like` (`%`, `_`, `\` escape, optionally case-insensitive),
-`BoolColumn`, `And`, `Or`, `Not`, `Const`, with SQL three-valued logic.
+`BoolColumn`, `JsonIn` / `JsonIsNull` (the text of a top-level field of
+a JSON column, as PostgreSQL's `->>` returns it), `And`, `Or`, `Not`,
+`Const`, with SQL three-valued logic. `GroupKey::JsonField` groups by
+such a field.
 Constants must have the column's type (`Datum::Int` or `Datum::Float`
 for numeric columns, `Datum::Decimal` at the column's scale).
 
@@ -257,10 +268,18 @@ let manifest = Manifest::from_bytes(&bytes)?;
 // Retention: segments whose newest row is older than the cutoff.
 let drop = manifest.expired(0, &Datum::Int(cutoff_micros));
 
-// Compaction: merge small segments into one sorted segment.
-let small = manifest.compaction_candidates(4_000_000, 4);
-let merged: Vec<u8> = compact(&segments_to_merge, WriterOptions { sort_key: vec![1, 0], ..Default::default() })?;
+// Compaction: merge small segments into one sorted segment, streaming
+// (one decoded row group per input in memory).
+let small = manifest.merge_candidates(4_000_000, 256 << 20, 32, 4);
+let merged: Vec<u8> = merge(&segments_to_merge, WriterOptions { sort_key: vec![1, 0], ..Default::default() })?;
 ```
+
+Manifests record caller-defined column ids per segment
+(`SegmentMeta::with_columns`, format `SQMANI02`; `SQMANI01` is still
+read). `Segment::project` reads a segment in another column layout,
+filling columns it does not store with a constant, so that a table can
+add and drop columns without rewriting its segments. `encode_batch` and
+`decode_batch` serialize a batch, for rows kept outside segments.
 
 ## Limits
 
@@ -269,12 +288,15 @@ let merged: Vec<u8> = compact(&segments_to_merge, WriterOptions { sort_key: vec!
   a predicate, or by rewriting a segment).
 - `SegmentWriter` and `compact` hold their whole input in memory and
   sort it there; size segments accordingly (millions of rows, not
-  billions). Compaction is a re-sort of the merged input, not a
-  streaming k-way merge.
+  billions). `merge` streams, but holds its encoded output in memory;
+  `SegmentStreamWriter` writes pre-sorted input with one row group in
+  memory.
 - Encoding runs on one thread per writer.
-- Arrays and nested types are not supported; store JSON as text.
+- Arrays and nested types are not supported; store JSON as text (`Json`
+  for field filters on top-level keys).
 - Decoded chunks are not cached between queries; a `ChunkSource` for
-  remote storage should cache.
+  remote storage should cache, and can fetch ahead what
+  `ChunkSource::prefetch` announces.
 - Run-length and bit-packed integer chunks are decoded before filters
   are evaluated; only dictionary columns are filtered in encoded form.
 - Group keys: any number, any column type; time buckets need Int64.

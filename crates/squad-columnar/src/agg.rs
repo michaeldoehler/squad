@@ -56,6 +56,12 @@ pub enum GroupKey {
         utc_offset_micros: i64,
         epoch_unix_micros: i64,
     },
+    /// The text of a top-level field of a JSON column (`column ->> key`),
+    /// NULL where the field is missing or a JSON null. The result is Utf8.
+    JsonField {
+        column: usize,
+        key: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -222,8 +228,12 @@ impl IdTable {
 
     /// Ids of the selected rows of one unit, appended to `out`.
     fn ids(&mut self, key: &GroupKey, l: &Loaded, out: &mut Vec<u32>) -> Result<()> {
+        if let GroupKey::JsonField { column, key } = key {
+            return self.json_ids(*column, key, l, out);
+        }
         let (column, bucket) = match key {
             GroupKey::Column(c) => (*c, None),
+            GroupKey::JsonField { .. } => unreachable!(),
             GroupKey::TimeBucket { column, unit, utc_offset_micros, epoch_unix_micros } => {
                 (*column, Some((*unit, utc_offset_micros.wrapping_add(*epoch_unix_micros))))
             }
@@ -314,6 +324,47 @@ impl IdTable {
     }
 }
 
+impl IdTable {
+    fn json_ids(&mut self, column: usize, key: &str, l: &Loaded, out: &mut Vec<u32>) -> Result<()> {
+        let col = l.columns[column].as_ref().expect("group key column was loaded");
+        let ColumnData::Bytes(b) = &col.data else {
+            return Err(Error::Type("JSON field keys need a text column".into()));
+        };
+        let n = l.selected();
+        let row_at = |k: usize| l.selection.as_ref().map_or(k, |s| s[k] as usize);
+        out.reserve(n);
+        let id_of = |doc: &[u8], t: &mut IdTable| match crate::json::field_text(doc, key.as_bytes()) {
+            Some(text) => t.bytes_id(&text),
+            None => t.null_id(),
+        };
+        match b {
+            BytesColumn::Dict { codes, dict } => {
+                let mut entry_ids = vec![u32::MAX; dict.len()];
+                for k in 0..n {
+                    let r = row_at(k);
+                    if col.is_null(r) {
+                        out.push(self.null_id());
+                        continue;
+                    }
+                    let code = codes[r] as usize;
+                    if entry_ids[code] == u32::MAX {
+                        entry_ids[code] = id_of(dict.get(code), self);
+                    }
+                    out.push(entry_ids[code]);
+                }
+            }
+            BytesColumn::Plain(d) => {
+                for k in 0..n {
+                    let r = row_at(k);
+                    let id = if col.is_null(r) { self.null_id() } else { id_of(d.get(r), self) };
+                    out.push(id);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Calls `f(k, row)` for every selected row whose value in `col` is not
 /// NULL; `k` is the position within the selection.
 #[inline]
@@ -343,7 +394,7 @@ fn kind_of(ty: ColumnType) -> Kind {
         ColumnType::Int64 => Kind::Int,
         ColumnType::Float64 => Kind::Float,
         ColumnType::Decimal { scale } => Kind::Decimal(scale),
-        ColumnType::Bytes | ColumnType::Utf8 => Kind::Bytes,
+        ColumnType::Bytes | ColumnType::Utf8 | ColumnType::Json => Kind::Bytes,
     }
 }
 
@@ -928,13 +979,17 @@ pub fn aggregate(source: &TableSource, request: &AggregateRequest) -> Result<Bat
     let mut key_fields = Vec::with_capacity(nkeys);
     for key in &request.group_by {
         let c = match key {
-            GroupKey::Column(c) | GroupKey::TimeBucket { column: c, .. } => *c,
+            GroupKey::Column(c) | GroupKey::TimeBucket { column: c, .. } | GroupKey::JsonField { column: c, .. } => *c,
         };
         let field = schema.columns.get(c).ok_or_else(|| Error::Invalid(format!("column {c} does not exist")))?;
         if matches!(key, GroupKey::TimeBucket { .. }) && field.ty != ColumnType::Int64 {
             return Err(Error::Type("time buckets need an Int64 column of microseconds".into()));
         }
-        key_fields.push(Field::new(field.name.clone(), field.ty, true));
+        if matches!(key, GroupKey::JsonField { .. }) && !field.ty.is_bytes() {
+            return Err(Error::Type("JSON field keys need a text column".into()));
+        }
+        let ty = if matches!(key, GroupKey::JsonField { .. }) { ColumnType::Utf8 } else { field.ty };
+        key_fields.push(Field::new(field.name.clone(), ty, true));
         if !needed.contains(&c) {
             needed.push(c);
         }
@@ -971,6 +1026,8 @@ pub fn aggregate(source: &TableSource, request: &AggregateRequest) -> Result<Bat
         owners.iter().map(|o| AggSpec::new(&request.aggregates[*o], schema).map(|(s, _)| s)).collect::<Result<_>>()?;
 
     let units = source.units(request.predicate.as_ref());
+    source.prefetch_blooms(request.predicate.as_ref(), &units);
+    source.prefetch_columns(request.predicate.as_ref(), &units, &needed);
     let threads = request.parallelism.clamp(1, units.len().max(1));
     let next = AtomicUsize::new(0);
     let work = || -> Result<Partial> {

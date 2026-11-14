@@ -43,6 +43,9 @@ pub struct ReplicaConfig {
     pub cache_size: usize,
     /// Local log size that triggers a checkpoint of the local copy.
     pub checkpoint_wal_bytes: u64,
+    /// Cache and compaction settings of columnar tables (compaction runs
+    /// only after promotion).
+    pub columnar: crate::ColumnarConfig,
 }
 
 impl ReplicaConfig {
@@ -57,6 +60,7 @@ impl ReplicaConfig {
             sync_mode: SyncMode::Sync,
             cache_size: 128 << 20,
             checkpoint_wal_bytes: 64 << 20,
+            columnar: crate::ColumnarConfig::default(),
         }
     }
 }

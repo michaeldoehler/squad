@@ -889,6 +889,9 @@ impl<'a> Binder<'a> {
                     }
                     return Err(Error::unsupported("FOR UPDATE on a relation that is not a base table"));
                 };
+                if table.columnar.is_some() {
+                    return Err(Error::unsupported("FOR UPDATE/FOR SHARE on columnar tables"));
+                }
                 plan = Plan::LockRows {
                     input: Box::new(plan),
                     table: table.clone(),

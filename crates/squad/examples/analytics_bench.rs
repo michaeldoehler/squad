@@ -4,7 +4,15 @@
 //!
 //! ```text
 //! cargo run --release -p squad --example analytics_bench [-- <rows> [<dir>]]
+//! cargo run --release -p squad --features s3 --example analytics_bench -- <rows> --s3 <url>
 //! ```
+//!
+//! With `--s3`, only the columnar table is loaded, into a database whose
+//! segments live in that bucket (for example a local Garage, see
+//! `scripts/garage-dev.sh`; give the URL a fresh key prefix). Every query
+//! then runs once right after reopening the database — with an empty
+//! segment cache, so every column chunk it needs is fetched from the
+//! bucket — and three more times warm.
 
 use std::time::Instant;
 
@@ -55,7 +63,13 @@ fn time(conn: &Connection, sql: &str) -> (f64, usize) {
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(i) = all.iter().position(|a| a == "--s3") {
+        let rows: i64 = all.first().map_or(2_000_000, |v| v.parse().expect("row count"));
+        remote(rows, all.get(i + 1).expect("--s3 needs a URL"));
+        return;
+    }
+    let mut args = all.into_iter();
     let rows: i64 = args.next().map_or(2_000_000, |v| v.parse().expect("row count"));
     let db = match args.next() {
         Some(dir) => Database::open(dir, Config { sync_mode: SyncMode::Async, ..Config::default() }).unwrap(),
@@ -82,7 +96,124 @@ fn main() {
     );
     println!("final VACUUM (compaction): {:>8.1} s\n", t_compact);
 
-    let queries: &[(&str, &str)] = &[
+    println!("{:<46} {:>12} {:>12} {:>9}", "query", "row (ms)", "columnar (ms)", "speed-up");
+    for (name, sql) in QUERIES {
+        let (row_ms, n1) = time(&conn, &sql.replace("{t}", "events_row"));
+        let (col_ms, n2) = time(&conn, &sql.replace("{t}", "events"));
+        assert_eq!(n1, n2, "{name}: different number of result rows");
+        println!("{name:<46} {row_ms:>12.1} {col_ms:>12.2} {:>8.0}x", row_ms / col_ms);
+    }
+}
+
+/// The columnar table in a database whose segments live in an S3 bucket:
+/// cold (first query after reopening) and warm times.
+#[cfg(feature = "s3")]
+fn remote(rows: i64, url: &str) {
+    let counting = std::sync::Arc::new(Counting {
+        inner: squad::object::open_url(url).expect("object store URL"),
+        requests: Default::default(),
+        bytes: Default::default(),
+    });
+    let store: std::sync::Arc<dyn squad::object::ObjectStore> = counting.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let config = || Config {
+        sync_mode: SyncMode::Async,
+        remote: Some(squad::RemoteConfig::new(
+            store.clone(),
+            squad::RemoteSync::Async { interval: std::time::Duration::from_millis(200) },
+        )),
+        ..Config::default()
+    };
+    let (t_col, t_compact) = {
+        let db = Database::open(dir.path(), config()).unwrap();
+        let conn = db.connect();
+        conn.batch_execute(&format!(
+            "CREATE TABLE events ({COLUMNS}) USING columnar WITH (order_by = 'project_id, ts')"
+        ))
+        .unwrap();
+        let t_col = load(&conn, "events", rows);
+        let start = Instant::now();
+        conn.batch_execute("VACUUM events").unwrap();
+        (t_col, start.elapsed().as_secs_f64())
+    };
+    println!("rows: {rows}, segments in {}", url.split('?').next().unwrap_or(url));
+    println!("load columnar table:       {:>8.1} s  {:>9.0} rows/s", t_col, rows as f64 / t_col);
+    println!("final VACUUM (compaction): {:>8.1} s\n", t_compact);
+    println!("{:<46} {:>10} {:>10} {:>9} {:>9}", "query", "cold (ms)", "warm (ms)", "GETs", "MiB");
+    for (name, sql) in QUERIES {
+        let db = Database::open(dir.path(), config()).unwrap();
+        let conn = db.connect();
+        let sql = sql.replace("{t}", "events");
+        counting.take();
+        let start = Instant::now();
+        conn.query(&sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let cold = start.elapsed().as_secs_f64() * 1e3;
+        let (requests, bytes) = counting.take();
+        let (warm, _) = time(&conn, &sql);
+        let mib = bytes as f64 / (1 << 20) as f64;
+        println!("{name:<46} {cold:>10.1} {warm:>10.2} {requests:>9} {mib:>9.2}");
+    }
+}
+
+/// Counts the reads of segment objects.
+#[cfg(feature = "s3")]
+struct Counting {
+    inner: std::sync::Arc<dyn squad::object::ObjectStore>,
+    requests: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "s3")]
+impl Counting {
+    fn take(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        (self.requests.swap(0, SeqCst), self.bytes.swap(0, SeqCst))
+    }
+    fn count(&self, key: &str, bytes: u64) {
+        if key.starts_with("columnar/") {
+            self.requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.bytes.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(feature = "s3")]
+impl squad::object::ObjectStore for Counting {
+    fn put(&self, key: &str, data: &[u8]) -> squad::object::Result<()> {
+        self.inner.put(key, data)
+    }
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> squad::object::Result<bool> {
+        self.inner.put_if_absent(key, data)
+    }
+    fn get(&self, key: &str) -> squad::object::Result<Option<Vec<u8>>> {
+        let r = self.inner.get(key)?;
+        self.count(key, r.as_ref().map_or(0, |v| v.len() as u64));
+        Ok(r)
+    }
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> squad::object::Result<Vec<u8>> {
+        self.count(key, len);
+        self.inner.get_range(key, offset, len)
+    }
+    fn head(&self, key: &str) -> squad::object::Result<Option<squad::object::ObjectMeta>> {
+        self.inner.head(key)
+    }
+    fn list(&self, prefix: &str) -> squad::object::Result<Vec<squad::object::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    fn list_after(&self, prefix: &str, after: &str) -> squad::object::Result<Vec<squad::object::ObjectMeta>> {
+        self.inner.list_after(prefix, after)
+    }
+    fn delete(&self, key: &str) -> squad::object::Result<()> {
+        self.inner.delete(key)
+    }
+}
+
+#[cfg(not(feature = "s3"))]
+fn remote(_: i64, _: &str) {
+    panic!("build with --features s3 for --s3");
+}
+
+const QUERIES: &[(&str, &str)] = &[
         ("count(*) of one week", "SELECT count(*) FROM {t} WHERE ts >= '2024-02-01' AND ts < '2024-02-08'"),
         (
             "events per day, one project, 30 days",
@@ -109,12 +240,4 @@ fn main() {
         ("one user's events", "SELECT ts, event, path FROM {t} WHERE user_id = 123457 ORDER BY ts"),
         ("sum over all data", "SELECT sum(duration_ms), count(*) FROM {t}"),
         ("errors per hour, last day of one project", "SELECT date_trunc('hour', ts), count(*) FROM {t} WHERE project_id = 7 AND event = 'error' AND ts >= '2024-03-30' GROUP BY 1 ORDER BY 1"),
-    ];
-    println!("{:<46} {:>12} {:>12} {:>9}", "query", "row (ms)", "columnar (ms)", "speed-up");
-    for (name, sql) in queries {
-        let (row_ms, n1) = time(&conn, &sql.replace("{t}", "events_row"));
-        let (col_ms, n2) = time(&conn, &sql.replace("{t}", "events"));
-        assert_eq!(n1, n2, "{name}: different number of result rows");
-        println!("{name:<46} {row_ms:>12.1} {col_ms:>12.2} {:>8.0}x", row_ms / col_ms);
-    }
-}
+];

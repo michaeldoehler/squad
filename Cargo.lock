@@ -2532,6 +2532,7 @@ dependencies = [
  "postgres",
  "rusqlite",
  "squad",
+ "squad-server",
  "tempfile",
 ]
 
@@ -2553,6 +2554,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "lz4_flex",
+ "serde_json",
 ]
 
 [[package]]

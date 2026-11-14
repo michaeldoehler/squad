@@ -36,6 +36,27 @@ cheap to clone and safe to share between threads.
 | `sync_mode` | `Sync` | `Sync`: every commit waits for `fsync`. `Group`: the same guarantee, waiting up to ~200 µs to share an `fsync` with other commits. `Async`: commits return at once and are flushed in the background; a process crash loses nothing, a power failure may lose the last few milliseconds. |
 | `cache_size` | 128 MiB | Page cache size in bytes. |
 | `checkpoint_wal_bytes` | 64 MiB | Log size that triggers an automatic checkpoint. |
+| `remote` | `None` | Keep a durable copy in an object store; see [cloud storage](cloud-storage.md). |
+| `columnar` | see below | Settings of columnar tables (`ColumnarConfig`). |
+
+`ColumnarConfig` (see [analytics](analytics.md)):
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `cache_bytes` | 512 MiB | Memory for cached segment data (column chunks and footers); a quarter of it more for decoded delta blocks. |
+| `background_compaction` | `true` | Compact deltas on a background thread. When `false`, only `VACUUM` compacts. |
+| `compact_rows` | 65,536 | Delta rows of a table that start a compaction. |
+| `compact_blocks` | 512 | Delta blocks (insert statements) of a table that start a compaction. |
+| `compact_age` | 10 s | A delta whose oldest rows are this old is compacted regardless of size. |
+| `merge_max_bytes` | 256 MiB | Largest amount of segment data merged into one segment; bounds a merge's memory. |
+| `orphan_grace` | 1 hour | `VACUUM` deletes unreferenced segment objects only once they are this old. |
+
+`Database::open_in_memory_with(columnar)` takes the columnar settings
+for an in-memory database, and `Database::with_engine_and_objects`
+opens a database on your own storage engine and object store.
+`db.wait_for_compaction(timeout)` compacts what is pending regardless of
+the thresholds and waits until the background compactor has caught up,
+for tests, benchmarks and orderly shutdowns.
 
 ## Connections
 
@@ -77,6 +98,40 @@ for row in conn.query("SELECT id, email FROM users ORDER BY id", &[])? {
 | `simple_query(sql)` | like `batch_execute`, returning every statement's result |
 | `prepare(sql) -> Statement` | plan once, run many times |
 | `transaction() -> Transaction` | a transaction that rolls back unless committed |
+| `append(table, rows) -> u64` | insert rows given as values, without SQL text (below) |
+
+### Appending rows without SQL
+
+`append` inserts rows given as `Vec<Value>`, one value per visible
+column of the table in table order, as one statement:
+
+```rust
+use squad::Value;
+
+let rows: Vec<Vec<Value>> = events
+    .iter()
+    .map(|e| vec![
+        Value::TimestampTz(e.ts),          // microseconds since 2000-01-01
+        Value::Int4(e.project_id),
+        Value::Text(e.name.clone()),
+        Value::Text(e.properties_json.clone()), // text is converted to jsonb
+    ])
+    .collect();
+let n = conn.append("events", &rows)?;
+```
+
+Values are converted to the column types as parameters of an `INSERT`
+are (text is accepted for any type), and defaults, `NOT NULL`, `CHECK`
+and length limits apply as for `INSERT`. It runs in the connection's
+open transaction or in one of its own. The table name may be
+schema-qualified (`"analytics.events"`) and is not parsed as SQL. A row
+with the wrong number of values fails with SQLSTATE `08P01`.
+
+`append` works for every table. For columnar tables it is the fastest
+way to insert: the rows of one call are stored as one delta block
+without parsing or planning SQL. Batches of about 1,000 rows from
+several connections reach the highest throughput (see
+[benchmarks](benchmarks.md#ingestion)).
 
 ## Prepared statements
 

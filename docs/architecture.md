@@ -167,8 +167,9 @@ On one core this takes about 1.1 µs end to end (see
 ## Columnar tables (`squad-columnar`, `squad::columnar`)
 
 A table created `USING columnar` keeps new rows in the row store — its
-*delta* — and moves them, in one transaction, into immutable
-column-oriented segments. The list of segments is a versioned record in
+*delta*, one entry (block) per insert statement holding the rows in
+columnar form — and a background thread moves them, in one transaction,
+into immutable column-oriented segments. The list of segments is a versioned record in
 the transactional store, which is what makes the two parts one table:
 a snapshot that sees a segment in the manifest does not see its rows in
 the delta, and the other way round.
@@ -178,7 +179,9 @@ the delta, and the other way round.
 bloom filters) and a vectorized, parallel engine for filters and
 aggregations over segments plus in-memory batches. The planner hands it
 aggregations it can express; other queries read segments as rows through
-the ordinary executor. See [analytics](analytics.md).
+the ordinary executor. Segments are read in ranges — footer, then the
+column chunks a query needs — through a byte-bounded cache. See
+[analytics](analytics.md).
 
 ## Object storage (`squad-object`)
 

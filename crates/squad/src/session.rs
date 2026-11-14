@@ -41,10 +41,12 @@ pub struct Shared {
     /// Where segments of columnar tables are kept: a directory next to
     /// the database, memory, or a remote bucket.
     objects: RwLock<Arc<dyn squad_object::ObjectStore>>,
-    /// Opened segments.
-    pub(crate) segments: crate::columnar::SegmentCache,
-    /// Rows inserted into columnar tables since their last compaction.
-    pub(crate) delta_rows: Mutex<HashMap<u32, u64>>,
+    /// Caches, pending and retired segment objects and the background
+    /// compaction of columnar tables.
+    pub(crate) columnar: crate::columnar::ColumnarState,
+    /// Held by every handle and session of the database; the last one to
+    /// go stops background work before the database closes.
+    guard: Mutex<std::sync::Weak<CloseGuard>>,
     next_pid: AtomicI32,
     pub database_name: String,
     /// Version of `catalog`, readable without taking its lock. Sessions
@@ -131,8 +133,8 @@ impl Shared {
             sequences: Mutex::new(HashMap::new()),
             plan_cache: Arc::new(Mutex::new(HashMap::new())),
             objects: RwLock::new(Arc::new(squad_object::MemoryStore::new())),
-            segments: Default::default(),
-            delta_rows: Mutex::new(HashMap::new()),
+            columnar: Default::default(),
+            guard: Mutex::new(std::sync::Weak::new()),
             next_pid: AtomicI32::new(1),
             advisory: Arc::default(),
             database_name: database_name.to_string(),
@@ -185,9 +187,23 @@ impl Shared {
         if self.set_recovery(false) {
             self.store.replay_finish();
             self.sequences.lock().clear();
-            self.delta_rows.lock().clear();
+            self.columnar.compactor.reset();
+            let catalog = self.catalog.read().clone();
+            for t in catalog.tables.values().filter(|t| t.columnar.is_some()) {
+                self.columnar.compactor.mark_due(t.id);
+            }
             self.plan_cache.lock().clear();
         }
+    }
+
+    /// Starts the background work of a database whose handles hold the
+    /// returned guard.
+    pub(crate) fn start(self: &Arc<Self>, config: crate::columnar::ColumnarConfig) -> Arc<CloseGuard> {
+        self.columnar.configure(config);
+        let guard = Arc::new(CloseGuard { shared: self.clone() });
+        *self.guard.lock() = Arc::downgrade(&guard);
+        self.columnar.compactor.start(self);
+        guard
     }
 
     /// The object store holding the segments of columnar tables.
@@ -304,6 +320,18 @@ impl Shared {
         txn.delete_blind(&sequence_key(id))?;
         txn.commit()?;
         Ok(())
+    }
+}
+
+/// Stops a database's background work when the last handle or session
+/// goes away, before the database itself is closed.
+pub(crate) struct CloseGuard {
+    shared: Arc<Shared>,
+}
+
+impl Drop for CloseGuard {
+    fn drop(&mut self) {
+        self.shared.columnar.compactor.shutdown();
     }
 }
 
@@ -431,8 +459,11 @@ pub(crate) struct TxnState {
     pub(crate) reset_counters: Vec<u32>,
     /// Segment objects to delete once the transaction has committed.
     pub(crate) dropped_objects: Vec<String>,
-    /// Rows this transaction inserted into columnar tables.
-    pub(crate) columnar_inserted: HashMap<u32, u64>,
+    /// Rows and delta blocks this transaction inserted into columnar
+    /// tables.
+    pub(crate) columnar_inserted: HashMap<u32, (u64, u64)>,
+    /// Segment objects this transaction wrote; deleted if it rolls back.
+    pub(crate) written_objects: Vec<String>,
 }
 
 pub(crate) struct Savepoint {
@@ -464,6 +495,9 @@ pub struct Session {
     replans: HashMap<usize, (Arc<Prepared>, Arc<Prepared>)>,
     /// The transaction object of the last finished transaction.
     spare_txn: Option<Txn>,
+    /// Keeps the database's background work running while the session
+    /// exists (absent for the background work's own sessions).
+    _guard: Option<Arc<CloseGuard>>,
 }
 
 fn now_micros() -> i64 {
@@ -476,6 +510,15 @@ pub(crate) fn feature(what: &str) -> Error {
 
 impl Session {
     pub fn new(shared: Arc<Shared>) -> Session {
+        let guard = shared.guard.lock().upgrade();
+        let mut session = Session::internal(shared);
+        session._guard = guard;
+        session
+    }
+
+    /// A session that does not keep the database's background work
+    /// alive (used by that work itself).
+    pub(crate) fn internal(shared: Arc<Shared>) -> Session {
         let pid = shared.next_pid.fetch_add(1, Ordering::Relaxed);
         let catalog_cache = shared.catalog.read().clone();
         Session {
@@ -499,6 +542,7 @@ impl Session {
             catalog_cache,
             replans: HashMap::new(),
             spare_txn: None,
+            _guard: None,
         }
     }
 
@@ -974,9 +1018,12 @@ impl Session {
         let rows = collect(plan, &mut cx)?;
         let affected = cx.rows_affected;
         let (dropped, inserted) = (std::mem::take(&mut cx.dropped_objects), std::mem::take(&mut cx.columnar_inserted));
+        t.written_objects.append(&mut cx.written_objects);
         t.dropped_objects.extend(dropped);
-        for (table, n) in inserted {
-            *t.columnar_inserted.entry(table).or_default() += n;
+        for (table, (rows, blocks)) in inserted {
+            let e = t.columnar_inserted.entry(table).or_default();
+            e.0 += rows;
+            e.1 += blocks;
         }
         let (tag, rows_affected) = match stmt.tag {
             Tag::Select => (format!("SELECT {}", rows.len()), rows.len() as u64),
@@ -986,6 +1033,118 @@ impl Session {
             Tag::Other(t) => (t.to_string(), affected),
         };
         Ok(QueryResult { columns: stmt.columns.clone(), rows, tag, rows_affected, notices: Vec::new() })
+    }
+
+    /// Inserts rows given as values, one per visible column of `table`
+    /// in table order, as one statement. See
+    /// [`Connection::append`](crate::Connection::append).
+    pub fn append(&mut self, table: &str, rows: &[Vec<Value>]) -> Result<u64> {
+        let result = self.append_rows(table, rows);
+        self.after_statement(result).map(|r| r.rows_affected)
+    }
+
+    fn append_rows(&mut self, table: &str, rows: &[Vec<Value>]) -> Result<QueryResult> {
+        self.check_not_failed()?;
+        let quoted = match table.split_once('.') {
+            Some((schema, name)) => format!("{}.{}", crate::copy::quote_ident(schema), crate::copy::quote_ident(name)),
+            None => crate::copy::quote_ident(table),
+        };
+        // The statement `INSERT INTO t VALUES ($1, …)` is planned once per
+        // catalog version; its value expressions do the conversions,
+        // defaults and length checks of an ordinary insert.
+        let catalog = self.catalog();
+        let (schema, name) = match table.split_once('.') {
+            Some((s, n)) => (Some(s), n),
+            None => (None, table),
+        };
+        let def = catalog
+            .table(schema, name, &self.state.search_path)
+            .cloned()
+            .ok_or_else(|| Error::new(sqlstate::UNDEFINED_TABLE, format!("relation \"{table}\" does not exist")))?;
+        let width = def.visible_columns().count();
+        let mut sql = format!("INSERT INTO {quoted} VALUES (");
+        for i in 1..=width {
+            if i > 1 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("${i}"));
+        }
+        sql.push(')');
+        let stmt = match self.cache_lookup(&sql) {
+            Some(p) => p,
+            None => {
+                let p = self.prepare(&sql, &[])?;
+                if !self.txn.as_ref().is_some_and(|t| t.dirty) {
+                    let key = format!("{}\u{0}{}", self.state.search_path.join(","), sql);
+                    let mut cache = self.shared.plan_cache.lock();
+                    if cache.len() >= PLAN_CACHE_LIMIT {
+                        cache.clear();
+                    }
+                    cache.insert(key, p.clone());
+                }
+                p
+            }
+        };
+        let Kind::Plan { plan: Plan::Insert(insert), tables, .. } = &stmt.kind else {
+            return Err(Error::internal("append did not plan an insert"));
+        };
+        let Plan::Values(exprs) = &insert.source else { return Err(Error::internal("append without values")) };
+        let exprs = exprs.first().ok_or_else(|| Error::internal("append without values"))?;
+        let mut params = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.len() != width {
+                return Err(Error::new(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    format!("append to \"{table}\" needs {width} values per row, got {}", row.len()),
+                ));
+            }
+            params.push(self.convert_params(&stmt, row)?);
+        }
+        let fn_ctx = self.fn_ctx();
+        let wait = WaitPolicy::Wait(self.state.lock_timeout);
+        self.start_statement()?;
+        let fn_ctx = FnCtx { txn_time: self.txn.as_ref().unwrap().start_time, ..fn_ctx };
+        let t = self.txn.as_mut().unwrap();
+        if t.txn.is_read_only() {
+            return Err(Error::new(
+                sqlstate::READ_ONLY_SQL_TRANSACTION,
+                "cannot execute INSERT in a read-only transaction",
+            ));
+        }
+        for id in tables {
+            t.txn.lock(&table_lock_key(*id), LockMode::Shared, wait)?;
+        }
+        let mut cx = ExecCx::new(&mut t.txn, &t.catalog, &[], &mut self.state, &self.shared, fn_ctx, 0);
+        let mut full = Vec::with_capacity(rows.len());
+        for p in &params {
+            cx.params = p;
+            full.push(exprs.iter().map(|e| e.eval(&[], &mut cx)).collect::<Result<Row>>()?);
+        }
+        cx.params = &[];
+        if insert.table.columnar.is_some() {
+            crate::dml::insert_columnar(insert, full, &mut cx)?;
+        } else {
+            let values =
+                Plan::Values(full.into_iter().map(|r| r.into_iter().map(crate::expr::Expr::Const).collect()).collect());
+            let direct = crate::plan::InsertPlan {
+                table: insert.table.clone(),
+                source: values,
+                on_conflict: None,
+                checks: insert.checks.clone(),
+                returning: None,
+            };
+            crate::dml::insert(&direct, &mut cx)?;
+        }
+        let affected = cx.rows_affected;
+        let (dropped, inserted) = (std::mem::take(&mut cx.dropped_objects), std::mem::take(&mut cx.columnar_inserted));
+        t.written_objects.append(&mut cx.written_objects);
+        t.dropped_objects.extend(dropped);
+        for (table, (rows, blocks)) in inserted {
+            let e = t.columnar_inserted.entry(table).or_default();
+            e.0 += rows;
+            e.1 += blocks;
+        }
+        Ok(QueryResult { tag: format!("INSERT 0 {affected}"), rows_affected: affected, ..Default::default() })
     }
 
     // ---------------------------------------------------------------
@@ -1021,6 +1180,7 @@ impl Session {
             reset_counters: Vec::new(),
             dropped_objects: Vec::new(),
             columnar_inserted: HashMap::new(),
+            written_objects: Vec::new(),
         });
         Ok(())
     }
@@ -1031,57 +1191,97 @@ impl Session {
         if t.failed {
             return Ok(());
         }
-        let TxnState { mut txn, catalog, dirty, dropped_objects, columnar_inserted, .. } = t;
+        let TxnState { mut txn, catalog, dirty, dropped_objects, columnar_inserted, written_objects, .. } = t;
         let result = txn.end(true);
         self.spare_txn = Some(txn);
-        result?;
+        if let Err(e) = result {
+            // A failed commit may still have reached the log (an error
+            // while syncing it), so the objects it wrote may be named by
+            // a manifest after all. They stay; if they are garbage,
+            // `VACUUM` removes them.
+            self.shared.columnar.pending_done(&written_objects);
+            return Err(e.into());
+        }
         if dirty {
             self.shared.publish_catalog(catalog);
         }
+        let columnar = &self.shared.columnar;
         // Segment objects the transaction replaced are no longer named by
         // any manifest a new snapshot can read.
         // They are deleted once the snapshots that began before this
         // commit, and may still read the old manifest, are gone.
         if !dropped_objects.is_empty() {
-            self.shared.segments.retire(self.shared.store.last_committed(), dropped_objects);
+            columnar.retire(self.shared.store.last_committed(), dropped_objects);
         }
-        if self.shared.segments.has_retired() {
-            self.shared.segments.sweep(self.shared.store.oldest_snapshot(), &*self.shared.objects());
+        if !written_objects.is_empty() {
+            columnar.pending_done(&written_objects);
         }
-        // Columnar tables with a large delta are compacted right away, by
-        // the session that pushed them over the threshold.
-        let mut due = Vec::new();
+        if columnar.has_retired() {
+            columnar.sweep(self.shared.store.oldest_snapshot(), &*self.shared.objects());
+        }
+        // The background compactor decides when deltas are compacted.
         if !columnar_inserted.is_empty() {
-            let mut delta = self.shared.delta_rows.lock();
-            for (table, n) in columnar_inserted {
-                let total = delta.entry(table).or_default();
-                *total += n;
-                if *total >= crate::columnar::AUTO_COMPACT_ROWS {
-                    *total = 0;
-                    due.push(table);
-                }
-            }
-        }
-        for table in due {
-            // Best effort: a failure leaves the rows in the delta, where
-            // they stay correct and visible.
-            if self.compact_table(table).is_ok() {
-                // The moved delta rows leave tombstones that every scan of
-                // the delta would have to step over; remove those no
-                // snapshot needs any more.
-                if let Some(next) = table.checked_add(1) {
-                    let lo = crate::catalog::object_prefix(table);
-                    let hi = crate::catalog::object_prefix(next);
-                    let _ = self.shared.store.gc_range(&lo, &hi);
-                }
-            }
+            let config = columnar.config.lock().clone();
+            columnar.compactor.note_inserted(&config, &columnar_inserted);
         }
         Ok(())
     }
 
-    /// Moves the delta of a columnar table into a segment and merges
-    /// small segments. Returns the number of rows moved.
+    /// Deletes segment objects of a transaction that did not commit.
+    fn discard_objects(&self, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        let store = self.shared.objects();
+        for k in keys {
+            let _ = store.delete(k);
+        }
+        self.shared.columnar.pending_done(keys);
+    }
+
+    /// Moves the whole delta of a columnar table into segments and merges
+    /// small segments (`VACUUM`). Returns the number of rows moved.
     pub fn compact_table(&mut self, table_id: u32) -> Result<u64> {
+        let mut moved = 0;
+        loop {
+            let n = self.compact_step(table_id, Step::Delta, None)?;
+            moved += n;
+            if n == 0 {
+                break;
+            }
+        }
+        while self.compact_step(table_id, Step::Merge, None)? > 0 {}
+        self.collect_table_garbage(table_id);
+        Ok(moved)
+    }
+
+    /// One background compaction of a table: a bounded part of the delta,
+    /// then merges of small segments.
+    pub(crate) fn compact_background(&mut self, table_id: u32) -> Result<u64> {
+        // Do not wait behind DDL for long; the table is retried later.
+        let wait = Some(Duration::from_millis(200));
+        let moved = self.compact_step(table_id, Step::Delta, wait)?;
+        while self.compact_step(table_id, Step::Merge, wait)? > 0 {}
+        // More rows than one run takes: run again soon.
+        if moved as usize >= crate::columnar::COMPACT_MAX_ROWS {
+            self.shared.columnar.compactor.mark_due(table_id);
+        }
+        self.collect_table_garbage(table_id);
+        Ok(moved)
+    }
+
+    /// Removes the tombstones compaction leaves in a table's key range.
+    fn collect_table_garbage(&self, table_id: u32) {
+        if let Some(next) = table_id.checked_add(1) {
+            let lo = crate::catalog::object_prefix(table_id);
+            let hi = crate::catalog::object_prefix(next);
+            let _ = self.shared.store.gc_range(&lo, &hi);
+        }
+    }
+
+    /// Runs one compaction step in a transaction of its own. Returns rows
+    /// moved (delta) or segments merged.
+    fn compact_step(&mut self, table_id: u32, step: Step, wait: Option<Duration>) -> Result<u64> {
         self.shared.check_writable("compaction")?;
         if self.txn.is_some() {
             return Err(Error::new(
@@ -1090,15 +1290,32 @@ impl Session {
             ));
         }
         self.begin(Some(Isolation::ReadCommitted), false)?;
-        let catalog = self.txn.as_ref().unwrap().catalog.clone();
-        let Some(table) = catalog.table_by_id(table_id).filter(|t| t.columnar.is_some()).cloned() else {
-            self.rollback();
-            return Ok(0);
-        };
-        match self.with_cx(|cx| crate::columnar::compact(&table, cx)) {
+        let result = (|| {
+            let wait = match wait {
+                Some(d) => WaitPolicy::Wait(Some(d)),
+                None => WaitPolicy::Wait(self.state.lock_timeout),
+            };
+            let t = self.txn.as_mut().unwrap();
+            // Like a writer: DDL on the table waits, and the definition
+            // read below is the one in force while the lock is held.
+            t.txn.lock(&table_lock_key(table_id), LockMode::Shared, wait)?;
+            t.txn.refresh_snapshot();
+            let catalog = match t.txn.get_current(CATALOG_KEY)? {
+                Some(bytes) => Arc::new(Catalog::from_bytes(&bytes)?),
+                None => Arc::new(Catalog::bootstrap()),
+            };
+            let Some(table) = catalog.table_by_id(table_id).filter(|t| t.columnar.is_some()).cloned() else {
+                return Ok(0);
+            };
+            t.catalog = catalog;
+            self.with_cx(|cx| match step {
+                Step::Delta => crate::columnar::compact_delta(&table, cx),
+                Step::Merge => crate::columnar::merge_segments(&table, cx).map(|n| n as u64),
+            })
+        })();
+        match result {
             Ok(n) => {
                 self.commit()?;
-                self.shared.delta_rows.lock().remove(&table_id);
                 Ok(n)
             }
             Err(e) => {
@@ -1116,6 +1333,7 @@ impl Session {
             for id in t.reset_counters {
                 let _ = self.shared.reset_counter(id);
             }
+            self.discard_objects(&t.written_objects);
         }
     }
 
@@ -1224,6 +1442,12 @@ impl Session {
         let result = f(&mut cx);
         let dropped = std::mem::take(&mut cx.dropped_objects);
         t.dropped_objects.extend(dropped);
+        t.written_objects.append(&mut cx.written_objects);
+        for (table, (rows, blocks)) in std::mem::take(&mut cx.columnar_inserted) {
+            let e = t.columnar_inserted.entry(table).or_default();
+            e.0 += rows;
+            e.1 += blocks;
+        }
         result
     }
 }
@@ -1233,6 +1457,12 @@ impl Drop for Session {
         self.rollback();
         self.shared.advisory.release_all(self.state.pid, true, true);
     }
+}
+
+#[derive(Clone, Copy)]
+enum Step {
+    Delta,
+    Merge,
 }
 
 fn tag_name(tag: &Tag) -> &'static str {

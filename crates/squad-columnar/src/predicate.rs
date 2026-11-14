@@ -64,6 +64,21 @@ pub enum Predicate {
     },
     /// A boolean column used as a condition.
     BoolColumn(usize),
+    /// `column ->> key IN (values)` on a column of JSON text (`=` when
+    /// there is one value): the text of top-level field `key` is one of
+    /// `values`. Unknown where the document is NULL, not an object, or
+    /// has no such field or a JSON null there.
+    JsonIn {
+        column: usize,
+        key: String,
+        values: Vec<Vec<u8>>,
+    },
+    /// `column ->> key IS [NOT] NULL` on a column of JSON text.
+    JsonIsNull {
+        column: usize,
+        key: String,
+        negated: bool,
+    },
     And(Vec<Predicate>),
     Or(Vec<Predicate>),
     Not(Box<Predicate>),
@@ -177,6 +192,18 @@ fn bytes_test(col: &BytesColumn, test: impl Fn(&[u8]) -> bool) -> Vec<u8> {
     }
 }
 
+/// Per-row truth values computed by `f` from each value of a bytes
+/// column, once per dictionary entry where there is a dictionary.
+fn bytes_eval(col: &BytesColumn, f: impl Fn(&[u8]) -> u8) -> Vec<u8> {
+    match col {
+        BytesColumn::Plain(d) => d.iter().map(f).collect(),
+        BytesColumn::Dict { codes, dict } => {
+            let per_entry: Vec<u8> = dict.iter().map(f).collect();
+            codes.iter().map(|c| per_entry[*c as usize]).collect()
+        }
+    }
+}
+
 fn eval_cmp(col: &Column, column: usize, op: CmpOp, value: &Datum) -> Result<Vec<u8>> {
     let n = col.len();
     if value.is_null() {
@@ -228,6 +255,8 @@ impl Predicate {
             | Predicate::Between { column, .. }
             | Predicate::IsNull { column, .. }
             | Predicate::Like { column, .. }
+            | Predicate::JsonIn { column, .. }
+            | Predicate::JsonIsNull { column, .. }
             | Predicate::BoolColumn(column) => {
                 if !out.contains(column) {
                     out.push(*column);
@@ -291,6 +320,35 @@ impl Predicate {
                     bytes_test(b, |x| like_match(&toks, x))
                 };
                 mask(c, out)
+            }
+            Predicate::JsonIn { column, key, values } => {
+                let c = col(*column)?;
+                let ColumnData::Bytes(b) = &c.data else {
+                    return Err(Error::Type(format!("->> on column {column}, which is not text")));
+                };
+                // UNKNOWN for a missing field, as for NULL.
+                let out = bytes_eval(b, |doc| match crate::json::field_text(doc, key.as_bytes()) {
+                    None => UNKNOWN,
+                    Some(text) => truth(values.iter().any(|v| *v == *text)),
+                });
+                mask(c, out)
+            }
+            Predicate::JsonIsNull { column, key, negated } => {
+                let c = col(*column)?;
+                let ColumnData::Bytes(b) = &c.data else {
+                    return Err(Error::Type(format!("->> on column {column}, which is not text")));
+                };
+                let mut out =
+                    bytes_eval(b, |doc| truth(crate::json::field_text(doc, key.as_bytes()).is_none() != *negated));
+                // A NULL document has NULL fields.
+                if let Some(v) = &c.validity {
+                    for (o, valid) in out.iter_mut().zip(v) {
+                        if !*valid {
+                            *o = truth(!*negated);
+                        }
+                    }
+                }
+                out
             }
             Predicate::BoolColumn(column) => {
                 let c = col(*column)?;
@@ -385,6 +443,12 @@ impl Predicate {
                 }
             }
             Predicate::BoolColumn(column) => cmp_may(*column, CmpOp::Eq, &Datum::Bool(true)),
+            // Statistics of JSON text say nothing about its fields, but a
+            // column of NULLs has no fields at all.
+            Predicate::JsonIn { column, .. } | Predicate::JsonIsNull { column, negated: true, .. } => {
+                stats(*column).is_none_or(|s| !s.all_null())
+            }
+            Predicate::JsonIsNull { .. } => true,
             Predicate::And(ps) => ps.iter().all(|p| p.may_match(stats)),
             Predicate::Or(ps) => ps.iter().any(|p| p.may_match(stats)),
             // The negation of "may match" is not "cannot match".
@@ -399,6 +463,22 @@ impl Predicate {
             Predicate::Cmp { column, op: CmpOp::Eq, value } => out.push((*column, vec![value.clone()])),
             Predicate::In { column, values } => out.push((*column, values.clone())),
             Predicate::And(ps) => ps.iter().for_each(|p| p.required_values(out)),
+            _ => {}
+        }
+    }
+
+    /// Like [`required_values`](Predicate::required_values) for fields of
+    /// JSON columns: `(column, hashes)` where every matching row's
+    /// document has one of the hashes in a JSON bloom filter.
+    pub(crate) fn required_json(&self, out: &mut Vec<(usize, Vec<u64>)>) {
+        match self {
+            Predicate::JsonIn { column, key, values } => {
+                out.push((*column, values.iter().map(|v| crate::json::json_pair_hash(key.as_bytes(), v)).collect()))
+            }
+            Predicate::JsonIsNull { column, key, negated: true } => {
+                out.push((*column, vec![crate::json::json_key_hash(key.as_bytes())]))
+            }
+            Predicate::And(ps) => ps.iter().for_each(|p| p.required_json(out)),
             _ => {}
         }
     }

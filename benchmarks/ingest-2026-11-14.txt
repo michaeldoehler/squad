@@ -1,0 +1,84 @@
+# Ingestion into a columnar events table (ts timestamptz, project_id int, event text,
+# distinct_id text, properties jsonb of about 200 bytes), batches of 1,000 events,
+# durable commits (SyncMode::Sync, local disk), a reader running a small aggregation
+# every 200 ms.
+#
+#   cargo run --release -p squad-bench --bin ingest -- --mode MODE --threads N --events N
+#   cargo run --release -p squad-bench --bin ingest -- --delta-cost
+#
+# 4 vCPU, 15 GiB RAM, shared with two other build jobs (load average shown per run);
+# numbers are indicative only.
+#
+# ---- before: commit bed110e (rows stored one per key, synchronous compaction in the
+# ---- committing session); 500,000 events, 4 threads; the append API did not exist.
+# ---- Load average about 9 during these runs.
+
+mode=prepared threads=4 batch=1000 events=500000 sync="Sync"
+throughput:                 45860 events/s (10.90 s)
+batch latency (ms):    p50    47.83  p99   635.81  max  4687.48
+reader latency (ms):   p50   541.50  p99  1043.61  max  1043.61  (16 queries)
+query after ingest:        168.89 ms
+mode=sql threads=4 batch=1000 events=500000 sync="Sync"
+throughput:                 28306 events/s (17.66 s)
+batch latency (ms):    p50    92.77  p99   734.46  max  6303.20
+reader latency (ms):   p50   462.92  p99  1713.55  max  1713.55  (23 queries)
+query after ingest:        173.79 ms
+mode=copy threads=4 batch=1000 events=500000 sync="Sync"
+throughput:                 45709 events/s (10.94 s)
+batch latency (ms):    p50    49.72  p99   554.34  max  4408.02
+reader latency (ms):   p50   288.77  p99   856.26  max   856.26  (19 queries)
+query after ingest:        193.98 ms
+
+# ---- after: delta blocks, background compaction, Connection::append; 1,000,000 events.
+
+ 08:55:53 up  1:45,  0 user,  load average: 7.44, 6.17, 6.88
+mode=append threads=4 batch=1000 events=1000000 sync="Sync"
+throughput:                191965 events/s (5.21 s)
+batch latency (ms):    p50    19.93  p99    44.02  max    59.89
+reader latency (ms):   p50    26.66  p99    91.77  max    91.77  (24 queries)
+query after ingest:         15.98 ms
+
+ 08:55:59 up  1:45,  0 user,  load average: 7.29, 6.18, 6.87
+mode=prepared threads=4 batch=1000 events=1000000 sync="Sync"
+throughput:                187110 events/s (5.34 s)
+batch latency (ms):    p50    20.32  p99    44.95  max    56.15
+reader latency (ms):   p50    24.13  p99    56.77  max    56.77  (24 queries)
+query after ingest:          5.11 ms
+
+ 08:56:06 up  1:45,  0 user,  load average: 7.43, 6.23, 6.89
+mode=sql threads=4 batch=1000 events=1000000 sync="Sync"
+throughput:                 71541 events/s (13.98 s)
+batch latency (ms):    p50    51.92  p99   108.20  max   220.72
+reader latency (ms):   p50    16.09  p99    48.06  max   139.99  (63 queries)
+query after ingest:          3.33 ms
+
+ 08:56:21 up  1:45,  0 user,  load average: 7.63, 6.34, 6.91
+mode=copy threads=4 batch=1000 events=1000000 sync="Sync"
+throughput:                115322 events/s (8.67 s)
+batch latency (ms):    p50    32.30  p99    85.20  max   132.13
+reader latency (ms):   p50    40.25  p99   220.52  max   220.52  (34 queries)
+query after ingest:         15.65 ms
+
+ 08:56:32 up  1:45,  0 user,  load average: 7.60, 6.37, 6.92
+mode=append threads=8 batch=1000 events=1000000 sync="Sync"
+throughput:                211093 events/s (4.74 s)
+batch latency (ms):    p50    35.66  p99    84.31  max   128.01
+reader latency (ms):   p50    28.00  p99    59.06  max    59.06  (21 queries)
+query after ingest:          7.48 ms
+
+
+# ---- per-query cost of the delta (no compaction) against the same rows in segments,
+# ---- best of five.
+delta rows   query                                  delta (ms)   segments (ms)
+      8192   count by event, one project                0.05            0.05
+      8192   events with a property                     1.79            2.27
+     16384   count by event, one project                0.10            0.07
+     16384   events with a property                     3.33            4.58
+     32768   count by event, one project                0.37            0.15
+     32768   events with a property                     6.86           12.65
+     65536   count by event, one project                0.70            0.45
+     65536   events with a property                    19.25           25.69
+    131072   count by event, one project                1.20            0.42
+    131072   events with a property                    26.42           34.96
+    262144   count by event, one project                3.85            3.30
+    262144   events with a property                    39.35           51.95

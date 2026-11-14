@@ -58,7 +58,8 @@ fn unique_violation(table: &Table, name: &str, cols: &[usize], row: &[Value], cx
 
 fn check_row(table: &Table, checks: &[(String, Expr)], row: &[Value], cx: &mut ExecCx) -> Result<()> {
     for (i, col) in table.columns.iter().enumerate() {
-        if col.not_null && row[i].is_null() {
+        // Rows of columnar tables have no row id.
+        if col.not_null && row[i].is_null() && !(col.hidden && table.columnar.is_some()) {
             return Err(Error::new(
                 sqlstate::NOT_NULL_VIOLATION,
                 format!(
@@ -412,42 +413,37 @@ fn returning(exprs: &Option<Vec<Expr>>, row: &[Value], out: &mut Vec<Row>, cx: &
 }
 
 pub(crate) fn insert(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
-    let table = &plan.table;
-    let affected_before = cx.rows_affected;
-    // A large insert into a columnar table is written straight into
-    // segments; small ones go through the delta like any row.
-    if table.columnar.is_some() && plan.returning.is_none() && !matches!(plan.source, crate::plan::Plan::Values(_)) {
+    if plan.table.columnar.is_some() {
         let rows = collect(&plan.source, cx)?;
-        if rows.len() >= crate::columnar::BULK_INSERT_ROWS {
-            for row in &rows {
-                check_row(table, &plan.checks, row, cx)?;
-            }
-            crate::columnar::bulk_insert(table, &rows, cx)?;
-            cx.rows_affected += rows.len() as u64;
-            return Ok(Vec::new());
-        }
-        return insert_rows(plan, rows.into_iter(), cx);
+        return insert_columnar(plan, rows, cx);
     }
-    let _ = affected_before;
     insert_stream(plan, cx)
 }
 
-/// Inserts already computed rows through the ordinary path.
-fn insert_rows(plan: &InsertPlan, rows: std::vec::IntoIter<Row>, cx: &mut ExecCx) -> Result<Vec<Row>> {
-    let values = crate::plan::Plan::Values(rows.map(|r| r.into_iter().map(Expr::Const).collect()).collect());
-    let direct = InsertPlan {
-        table: plan.table.clone(),
-        source: values,
-        on_conflict: None,
-        checks: plan.checks.clone(),
-        returning: None,
-    };
-    insert_stream(&direct, cx)
+/// Inserts computed rows into a columnar table: a large insert is written
+/// straight into segments, smaller ones go to the delta as blocks.
+/// Columnar tables have no unique constraints, so ON CONFLICT never
+/// applies.
+pub(crate) fn insert_columnar(plan: &InsertPlan, rows: Vec<Row>, cx: &mut ExecCx) -> Result<Vec<Row>> {
+    let table = &plan.table;
+    for row in &rows {
+        check_row(table, &plan.checks, row, cx)?;
+    }
+    if rows.len() >= crate::columnar::BULK_INSERT_ROWS && plan.returning.is_none() {
+        crate::columnar::bulk_insert(table, &rows, cx)?;
+    } else {
+        crate::columnar::append_rows(table, &rows, cx)?;
+    }
+    cx.rows_affected += rows.len() as u64;
+    let mut out = Vec::new();
+    for row in &rows {
+        returning(&plan.returning, row, &mut out, cx)?;
+    }
+    Ok(out)
 }
 
 fn insert_stream(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
     let table = &plan.table;
-    let affected_before = cx.rows_affected;
     let mut out = Vec::new();
     // Rows this statement inserted or updated; ON CONFLICT DO UPDATE may
     // not touch any of them again.
@@ -552,9 +548,6 @@ fn insert_stream(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
     }
     for row in &fk_pending {
         check_outgoing_fks(table, row, None, cx)?;
-    }
-    if table.columnar.is_some() {
-        *cx.columnar_inserted.entry(table.id).or_default() += cx.rows_affected - affected_before;
     }
     Ok(out)
 }
