@@ -867,8 +867,9 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
 /// A database written by squad 0.1.0 before delta blocks, column ids and
 /// JSON columns (`tests/data/columnar-v0.1`, made by inserting rows 1–370
 /// with two compactions in between: two segments with a `SQMANI01`
-/// manifest and 20 delta rows stored one per key) is read, changed and
-/// compacted by this version.
+/// manifest and 20 delta rows stored one per key, then checkpointed by
+/// that version, so that its log is an empty segment of log format 1) is
+/// read, changed and compacted by this version.
 #[test]
 fn databases_of_the_previous_format_are_read_and_upgraded() {
     let dir = tempfile::tempdir().unwrap();
