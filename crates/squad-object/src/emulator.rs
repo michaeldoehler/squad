@@ -5,7 +5,8 @@
 //! `DeleteObject` and `ListObjectsV2` with continuation tokens — and
 //! **verifies the Signature V4 of every request**, so tests against it
 //! exercise the client's signing. It can also fail or drop requests on
-//! demand to test retries.
+//! demand to test retries, and it can ignore `If-None-Match: *` the way
+//! some S3-compatible services do.
 //!
 //! This is test infrastructure, not a storage service: objects live in
 //! memory and one bucket and one credential are known.
@@ -38,6 +39,8 @@ struct State {
     requests: AtomicU64,
     rejected: AtomicU64,
     page_size: AtomicU64,
+    /// Treat a conditional `PUT` like a plain one.
+    ignore_if_none_match: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -61,8 +64,16 @@ impl Request {
     }
 }
 
+/// Decrements `counter` if it is above zero; true if it was.
 fn take_one(counter: &AtomicU64) -> bool {
-    counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
+    let mut n = counter.load(Ordering::SeqCst);
+    while n > 0 {
+        match counter.compare_exchange_weak(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => n = now,
+        }
+    }
+    false
 }
 
 impl S3Emulator {
@@ -123,6 +134,12 @@ impl S3Emulator {
     /// confirming them.
     pub fn drop_after_next(&self, n: u64) {
         self.state.drop_after_next.store(n, Ordering::SeqCst);
+    }
+
+    /// Makes conditional puts (`If-None-Match: *`) overwrite an existing
+    /// object and report success, as Garage does.
+    pub fn set_ignore_if_none_match(&self, ignore: bool) {
+        self.state.ignore_if_none_match.store(ignore, Ordering::SeqCst);
     }
 
     /// Maximum number of keys per list response (default 1000).
@@ -317,7 +334,9 @@ fn serve(stream: TcpStream, state: &State) {
             ("GET", true) => list(state, &req),
             ("PUT", false) => {
                 let mut objects = state.objects.lock();
-                if req.header("if-none-match") == Some("*") && objects.contains_key(&key) {
+                let conditional =
+                    req.header("if-none-match") == Some("*") && !state.ignore_if_none_match.load(Ordering::SeqCst);
+                if conditional && objects.contains_key(&key) {
                     (412, vec![], error_xml("PreconditionFailed", "object exists"))
                 } else {
                     objects.insert(key, req.body.clone());

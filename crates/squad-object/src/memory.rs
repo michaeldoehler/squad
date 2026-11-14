@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -30,6 +30,7 @@ pub struct MemoryStore {
     puts: Arc<AtomicU64>,
     put_bytes: Arc<AtomicU64>,
     requests: Arc<AtomicU64>,
+    ignore_conditions: Arc<AtomicBool>,
 }
 
 impl MemoryStore {
@@ -43,6 +44,14 @@ impl MemoryStore {
     /// removes the hook.
     pub fn set_faults(&self, hook: Option<Box<FaultFn>>) {
         *self.faults.lock() = hook;
+    }
+
+    /// Makes [`put_if_absent`](ObjectStore::put_if_absent) behave like a
+    /// plain put that reports success, as some S3-compatible services do
+    /// with `If-None-Match: *` (Garage, for one). For testing code that
+    /// must not rely on conditional writes.
+    pub fn set_ignore_conditions(&self, ignore: bool) {
+        self.ignore_conditions.store(ignore, Ordering::SeqCst);
     }
 
     /// Number of successful puts and the bytes they carried.
@@ -80,7 +89,7 @@ impl MemoryStore {
         }
         let created = {
             let mut objects = self.objects.lock();
-            if only_if_absent && objects.contains_key(key) {
+            if only_if_absent && !self.ignore_conditions.load(Ordering::SeqCst) && objects.contains_key(key) {
                 false
             } else {
                 objects.insert(key.to_string(), Arc::new(data.to_vec()));
