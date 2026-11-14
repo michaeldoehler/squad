@@ -129,13 +129,15 @@ can load unaligned 64-bit words.
 
 **Bloom filter chunk:** `crc:u32 hashes:u8 bits`. Built for integer and
 byte columns with ten bits per distinct value and seven probes (about 1 %
-false positives).
+false positives); for `Json` columns over the hashes of top-level keys
+and key/value pairs instead.
 
 **Footer**
 
 ```text
 version:u32 (1)
 columns:u32, per column: name (u32 length + bytes), type:u8, scale:u8, nullable:u8
+    (type: 0 Bool, 1 Int64, 2 Float64, 3 Decimal, 4 Bytes, 5 Utf8, 6 Json)
 sort_key:u32, per key: column:u32
 rows:u64
 row_groups:u32, per row group:
@@ -148,8 +150,10 @@ row_groups:u32, per row group:
 decimal, `5` bytes) followed by the value.
 
 A reader fetches the last 64 KiB of the file, which normally contains
-the whole footer, and afterwards only the chunks it needs: one request
-per column chunk (and bloom filter) of the row groups that survive pruning.
+the whole footer, and afterwards only the chunks it needs: one read per
+column chunk (and bloom filter) of the row groups that survive pruning,
+announced beforehand through `ChunkSource::prefetch` so that a remote
+source can combine and parallelize the requests.
 
 ### Choosing encodings
 
