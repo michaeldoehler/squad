@@ -1,7 +1,7 @@
 //! Benchmark on a synthetic product-analytics events table.
 //!
 //! ```text
-//! cargo run --release -p squad-columnar --example analytics_bench -- [rows] [threads]
+//! cargo run --release -p squad-columnar --example engine_bench -- [rows] [threads]
 //! ```
 //!
 //! Generates `rows` events (default 20 million) spread over 90 days,

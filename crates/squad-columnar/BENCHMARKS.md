@@ -1,7 +1,7 @@
 # squad-columnar benchmarks
 
 ```sh
-cargo run --release -p squad-columnar --example analytics_bench -- 20000000 4
+cargo run --release -p squad-columnar --example engine_bench -- 20000000 4
 ```
 
 The example generates a synthetic product-analytics events table, writes
