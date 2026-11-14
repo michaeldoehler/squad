@@ -103,7 +103,7 @@ impl<'a> ExecCx<'a> {
     }
 
     #[cold]
-    fn check_interrupts_now(&mut self) -> Result<()> {
+    pub(crate) fn check_interrupts_now(&mut self) -> Result<()> {
         if self.session.cancel.take() {
             return Err(crate::session::canceled_error());
         }

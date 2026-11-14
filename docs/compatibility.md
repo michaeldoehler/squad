@@ -107,9 +107,6 @@ show an extra line.
 | `COLLATE` clauses | none | Text always compares bytewise. |
 | `idle_in_transaction_session_timeout` and other unknown settings | none | `SET` stores the value, `SHOW` returns it. |
 
-Advisory lock functions (`pg_advisory_lock` and friends) also succeed
-without locking anything; see [transactions](transactions.md).
-
 `CREATE MATERIALIZED VIEW` creates an ordinary table from the query;
 there is no `REFRESH`.
 
@@ -168,7 +165,8 @@ These fail with SQLSTATE `0A000` (`feature_not_supported`) or an
 - **Serializable** may abort more transactions than Postgres would; see
   [transactions](transactions.md).
 - **Constraints** are checked immediately and cannot be deferred.
-- **Advisory locks** succeed without locking.
+- **Advisory locks** work, but deadlocks between them are not detected;
+  see [transactions](transactions.md#differences-from-postgresql-to-be-aware-of).
 - **Index keys** (the encoded primary key or indexed columns) are
   limited to about 1000 bytes; Postgres allows about 2700. Longer keys
   fail with `54000`.

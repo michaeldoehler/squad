@@ -248,6 +248,9 @@ fn start_time() -> i64 {
 }
 
 pub(crate) fn catalog_fn(name: &str, args: Vec<Value>, cx: &mut ExecCx) -> Result<Value> {
+    if let Some(result) = crate::advisory::call(name, &args, cx) {
+        return result;
+    }
     let env = Env::new(cx);
     let arg = |i: usize| args.get(i).unwrap_or(&Value::Null);
     let opt_text = |s: Option<String>| s.map_or(Value::Null, Value::Text);
@@ -442,21 +445,6 @@ pub(crate) fn catalog_fn(name: &str, args: Vec<Value>, cx: &mut ExecCx) -> Resul
                 _ => Value::Null,
             }
         }
-
-        // ---- advisory locks -----------------------------------------------
-        // Accepted so that migration tools run; they do not block other
-        // sessions.
-        "pg_advisory_lock"
-        | "pg_advisory_lock_shared"
-        | "pg_advisory_xact_lock"
-        | "pg_advisory_xact_lock_shared"
-        | "pg_advisory_unlock_all" => Value::Null,
-        "pg_advisory_unlock"
-        | "pg_advisory_unlock_shared"
-        | "pg_try_advisory_lock"
-        | "pg_try_advisory_lock_shared"
-        | "pg_try_advisory_xact_lock"
-        | "pg_try_advisory_xact_lock_shared" => Value::Bool(true),
 
         other => return Err(Error::internal(format!("unknown catalog function {other}"))),
     })

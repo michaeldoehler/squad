@@ -60,6 +60,8 @@ pub struct Shared {
     /// The replication machinery, if the database was opened as a
     /// replica. It stays after promotion.
     pub(crate) replica: std::sync::OnceLock<crate::replica::Replica>,
+    /// Advisory locks held by the sessions of this database.
+    pub(crate) advisory: Arc<crate::advisory::AdvisoryLocks>,
 }
 
 /// What the apply loop of a read replica changes in a database. It
@@ -132,6 +134,7 @@ impl Shared {
             segments: Default::default(),
             delta_rows: Mutex::new(HashMap::new()),
             next_pid: AtomicI32::new(1),
+            advisory: Arc::default(),
             database_name: database_name.to_string(),
             catalog_version: Arc::new(std::sync::atomic::AtomicU64::new(version)),
             recovery: AtomicBool::new(false),
@@ -1024,6 +1027,7 @@ impl Session {
 
     pub(crate) fn commit(&mut self) -> Result<()> {
         let Some(t) = self.txn.take() else { return Ok(()) };
+        self.shared.advisory.release_all(self.state.pid, true, false);
         if t.failed {
             return Ok(());
         }
@@ -1106,6 +1110,7 @@ impl Session {
 
     pub(crate) fn rollback(&mut self) {
         if let Some(mut t) = self.txn.take() {
+            self.shared.advisory.release_all(self.state.pid, true, false);
             let _ = t.txn.end(false);
             self.spare_txn = Some(t.txn);
             for id in t.reset_counters {
@@ -1226,6 +1231,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.rollback();
+        self.shared.advisory.release_all(self.state.pid, true, true);
     }
 }
 

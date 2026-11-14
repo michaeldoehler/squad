@@ -25,6 +25,7 @@
 //! # }
 //! ```
 
+mod advisory;
 mod agg;
 mod api;
 pub mod bind;

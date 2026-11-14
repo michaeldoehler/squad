@@ -211,8 +211,13 @@ longer, never produce a wrong result.
 - Constraints are always checked immediately, row by row. Foreign key
   actions run as each row is changed rather than at the end of the
   statement, and `DEFERRABLE` / `INITIALLY DEFERRED` have no effect.
-- Advisory locks (`pg_advisory_lock` and friends) succeed without
-  locking anything. Migration tools that use them to prevent concurrent
-  runs are not protected against each other.
+- Advisory locks (`pg_advisory_lock` and friends) lock as in
+  PostgreSQL: exclusive and shared, session- and transaction-level,
+  counted, with the one-`bigint` and two-`int4` key spaces kept apart.
+  They are held in memory by one database, so they coordinate the
+  sessions of one process (and its server connections), not replicas.
+  Deadlocks between advisory locks are **not detected**: a wait ends
+  only with the lock, a cancel request, `lock_timeout` or
+  `statement_timeout`.
 - Row locks do not distinguish the `KEY` variants: `FOR NO KEY UPDATE`
   is `FOR UPDATE`, `FOR KEY SHARE` is `FOR SHARE`.
