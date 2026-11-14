@@ -22,3 +22,18 @@ commit = one 120-byte row, local fsync (SyncMode::Sync) on every commit; 2 uploa
 mode                        writers    commits  commits/s   p50 (ms)  p99 (ms) commits/upload
 remote Sync                       8       6473       1294       5.07     15.73            7.8
 remote Sync                      32      12797       2547      11.27     30.72           27.7
+
+# ---- rerun on the merged main branch, machine otherwise idle
+# cargo run --release -p squad-storage --example remote_sync_bench -- --seconds 5 --writers 1,8,32
+remote_sync_bench: store s3://squad-test (prefix squad-bench/remote-sync-18e7e2c1c06c593e), 5 s per configuration
+commit = one 120-byte row, local fsync (SyncMode::Sync) on every commit; 1 upload(s) in flight
+mode                        writers    commits  commits/s   p50 (ms)  p99 (ms) commits/upload
+local only                        1      41695       8337       0.11      0.29              -
+remote Async 100ms                1      36976       7394       0.12      0.34          859.9
+remote Sync                       1        609        122       7.73     19.05            1.0
+local only                        8     123464      24678       0.31      1.05              -
+remote Async 100ms                8     119099      23812       0.31      1.17         2835.7
+remote Sync                       8       4657        930       8.29     18.11            7.9
+local only                       32     327302      65353       0.44      1.46              -
+remote Async 100ms               32     303341      60612       0.46      1.85         7778.0
+remote Sync                      32       9516       1899      13.69     38.42           22.1

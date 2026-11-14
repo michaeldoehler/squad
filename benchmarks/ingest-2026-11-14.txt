@@ -82,3 +82,30 @@ delta rows   query                                  delta (ms)   segments (ms)
     131072   events with a property                    26.42           34.96
     262144   count by event, one project                3.85            3.30
     262144   events with a property                    39.35           51.95
+
+# ---- rerun on the merged main branch, machine otherwise idle (no build jobs), 2026-11-14
+# ---- 1,000,000 events per run; load average shown is from the benchmarks themselves
+### mode=append threads=8 load=3.91 3.85 3.92
+mode=append threads=8 batch=1000 events=1000000 sync="Sync"
+throughput:                495693 events/s (2.02 s)
+batch latency (ms):    p50    15.45  p99    32.83  max    43.11
+reader latency (ms):   p50    31.07  p99    68.81  max    68.81  (9 queries)
+query after ingest:          5.77 ms
+### mode=prepared threads=4 load=3.84 3.83 3.91
+mode=prepared threads=4 batch=1000 events=1000000 sync="Sync"
+throughput:                480197 events/s (2.08 s)
+batch latency (ms):    p50     7.84  p99    17.25  max    21.21
+reader latency (ms):   p50    24.81  p99    38.88  max    38.88  (10 queries)
+query after ingest:          5.50 ms
+### mode=copy threads=4 load=3.61 3.79 3.90
+mode=copy threads=4 batch=1000 events=1000000 sync="Sync"
+throughput:                261414 events/s (3.83 s)
+batch latency (ms):    p50    14.24  p99    30.41  max    93.22
+reader latency (ms):   p50    61.30  p99   116.09  max   116.09  (15 queries)
+query after ingest:         11.21 ms
+### mode=sql threads=4 load=3.40 3.74 3.88
+mode=sql threads=4 batch=1000 events=1000000 sync="Sync"
+throughput:                153145 events/s (6.53 s)
+batch latency (ms):    p50    23.52  p99    54.77  max   160.33
+reader latency (ms):   p50     8.08  p99    24.19  max    24.19  (31 queries)
+query after ingest:          3.10 ms

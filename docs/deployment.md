@@ -167,16 +167,17 @@ kept in an in-memory cache (`ColumnarConfig::cache_bytes`).
 | Lost when the node and its volume are lost | nothing acknowledged | commits of up to about one `interval` |
 | Store unreachable | commits fail until it is back | commits continue; the backlog is uploaded later |
 
-Measured against a single-node Garage on the same machine (one small row
-per commit, local `fsync` on every commit; indicative numbers from
-[benchmarks](benchmarks.md), `benchmarks/remote-sync-2026-11-14.txt`):
+Measured against a single-node Garage on the same 4-vCPU machine (one
+small row per commit, local `fsync` on every commit; from
+[benchmarks](benchmarks.md#remote-storage),
+`benchmarks/remote-sync-2026-11-14.txt`):
 
 | Writers | Mode | Commits/s | p50 | p99 |
 | ---: | --- | ---: | ---: | ---: |
-| 1 | `Async` | 7,100 | 0.12 ms | 0.43 ms |
-| 1 | `Sync` | 200 | 4.9 ms | 8.6 ms |
-| 8 | `Sync` | 1,110 | 5.5 ms | 31 ms |
-| 32 | `Sync` | 2,630 | 10.4 ms | 27 ms |
+| 1 | `Async` | 7,400 | 0.12 ms | 0.34 ms |
+| 1 | `Sync` | 120 | 7.7 ms | 19 ms |
+| 8 | `Sync` | 930 | 8.3 ms | 18 ms |
+| 32 | `Sync` | 1,900 | 13.7 ms | 38 ms |
 
 In `Sync` mode, concurrent commits share one upload, so throughput grows
 with the number of writers while each commit waits about one round trip
@@ -186,8 +187,12 @@ For ingestion this means: **batch**. An API that accepts events should
 collect them for a few milliseconds and commit them together (for
 example 1,000 events per `Connection::append` call, see
 [analytics](analytics.md)); one durable round trip then covers the whole
-batch. With batches, `Sync` mode keeps a recovery point of zero at
-hundreds of thousands of events per second. Use `Async` only where
+batch. Without a remote, batches of 1,000 events through
+`Connection::append` reach about 500,000 events per second with durable
+local commits on that machine; in `Sync` mode each batch also waits for
+one round trip to Garage, so throughput then depends on how many
+batches are in flight at once. That combination has not been measured
+yet. Use `Async` only where
 losing up to one interval of acknowledged writes when a node dies is
 acceptable.
 

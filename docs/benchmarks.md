@@ -198,20 +198,27 @@ service (`ts`, `project_id`, `event`, `distinct_id`, a `jsonb`
 `properties` of about 200 bytes) into a columnar table from several
 threads, in batches of 1,000, with durable commits (`SyncMode::Sync`),
 while a reader runs a small aggregation every 200 ms
-([raw](../benchmarks/ingest-2026-11-14.txt); 4 vCPU shared with other
-build jobs, load average 7–9, so indicative only):
+([raw](../benchmarks/ingest-2026-11-14.txt)). The "before" and "after"
+columns were measured while other build jobs ran (load average 7–9);
+the last column is a rerun of the merged code on the otherwise idle
+4-vCPU machine, one million events each:
 
 ```sh
 cargo run --release -p squad-bench --bin ingest -- --mode append --threads 8 --events 1000000
 ```
 
-| Way in | Before | After | Batch p99 / max, after |
-| --- | ---: | ---: | ---: |
-| `Connection::append`, 8 threads | — | 211,000 events/s | 84 / 128 ms |
-| `Connection::append`, 4 threads | — | 192,000 events/s | 44 / 60 ms |
-| Prepared `INSERT … VALUES` of 1,000 rows, 4 threads | 46,000 events/s | 187,000 events/s | 45 / 56 ms |
-| `COPY FROM STDIN` through the server, 4 clients | 46,000 events/s | 115,000 events/s | 85 / 132 ms |
-| SQL text `INSERT … VALUES` of 1,000 rows, 4 threads | 28,000 events/s | 72,000 events/s | 108 / 221 ms |
+| Way in | Before (busy) | After (busy) | After (idle) | Batch p50 / p99, idle |
+| --- | ---: | ---: | ---: | ---: |
+| `Connection::append`, 8 threads | — | 211,000 events/s | 496,000 events/s | 15 / 33 ms |
+| `Connection::append`, 4 threads | — | 192,000 events/s | | |
+| Prepared `INSERT … VALUES` of 1,000 rows, 4 threads | 46,000 events/s | 187,000 events/s | 480,000 events/s | 8 / 17 ms |
+| `COPY FROM STDIN` through the server, 4 clients | 46,000 events/s | 115,000 events/s | 261,000 events/s | 14 / 30 ms |
+| SQL text `INSERT … VALUES` of 1,000 rows, 4 threads | 28,000 events/s | 72,000 events/s | 153,000 events/s | 24 / 55 ms |
+
+These commits are durable on the local disk. With the log shipped to an
+object store in `Sync` mode, each batch additionally waits for one
+upload round trip (see below); that was not measured with this
+benchmark.
 
 Before, every row was a key in the row store and the session whose
 commit pushed a table's delta over 100,000 rows compacted it before
@@ -226,23 +233,28 @@ the server inserts in statements of 64 rows.
 
 Commit throughput and latency with the write-ahead log shipped to a
 single-node Garage 2.5 on the same machine, one 120-byte row per commit
-and a local `fsync` on every commit. Other builds were running, so the
-numbers are indicative. Raw output:
+and a local `fsync` on every commit, rerun on the otherwise idle
+machine (an earlier run while other builds ran is in the same file;
+latency to a local single-node Garage varies by a factor of about two
+between runs). Raw output:
 `benchmarks/remote-sync-2026-11-14.txt` (`eval "$(scripts/garage-dev.sh
 start)"; cargo run --release -p squad-storage --example
 remote_sync_bench`).
 
 | Mode | Writers | Commits/s | p50 | p99 |
 | --- | ---: | ---: | ---: | ---: |
-| Local only | 1 | 6,811 | 0.12 ms | 0.46 ms |
-| Remote, `Async` (100 ms) | 1 | 7,093 | 0.12 ms | 0.43 ms |
-| Remote, `Sync` | 1 | 202 | 4.85 ms | 8.64 ms |
-| Local only | 32 | 38,958 | 0.47 ms | 4.33 ms |
-| Remote, `Async` (100 ms) | 32 | 52,064 | 0.47 ms | 4.05 ms |
-| Remote, `Sync` | 32 | 2,629 | 10.40 ms | 26.48 ms |
+| Local only | 1 | 8,337 | 0.11 ms | 0.29 ms |
+| Remote, `Async` (100 ms) | 1 | 7,394 | 0.12 ms | 0.34 ms |
+| Remote, `Sync` | 1 | 122 | 7.73 ms | 19.05 ms |
+| Local only | 8 | 24,678 | 0.31 ms | 1.05 ms |
+| Remote, `Async` (100 ms) | 8 | 23,812 | 0.31 ms | 1.17 ms |
+| Remote, `Sync` | 8 | 930 | 8.29 ms | 18.11 ms |
+| Local only | 32 | 65,353 | 0.44 ms | 1.46 ms |
+| Remote, `Async` (100 ms) | 32 | 60,612 | 0.46 ms | 1.85 ms |
+| Remote, `Sync` | 32 | 1,899 | 13.69 ms | 38.42 ms |
 
 A `Sync` commit waits for one `PUT` and one `LIST`; concurrent commits
-share them (23.8 commits per upload with 32 writers). The full table,
+share them (22 commits per upload with 32 writers). The full table,
 with 8 writers, is in [cloud storage](cloud-storage.md#request-and-storage-cost).
 `remote_bench` (same crate) still measures snapshot upload volume.
 

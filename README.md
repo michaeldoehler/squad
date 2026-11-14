@@ -163,6 +163,13 @@ not meet.
 | Unique users per day, one project | 3.5 s | 1.2 ms |
 | p50/p95/p99 duration per event, all data | 4.5 s | 5.8 ms |
 
+Ingestion into a columnar table in batches of 1,000 events with durable
+local commits: about 500,000 events per second through
+`Connection::append`, 480,000 through prepared `INSERT`s and 260,000
+through `COPY` over the wire protocol. With the log shipped
+synchronously to a single-node Garage on the same machine, a commit
+waits 8–14 ms (p50) for the upload; concurrent commits share it.
+
 A replica that polls every 10 ms shows a commit 22 ms after the writer
 acknowledged it (p50) and applies a backlog at 279,000 rows per second;
 promotion takes 0.1 s. Four shards on the same machine load 422,000
