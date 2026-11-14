@@ -389,6 +389,12 @@ impl DiskEngine {
             let file = vfs.open(&wal_dir.join(&name))?;
             let bytes = read_all(&*file)?;
             if bytes.len() >= wal::SEG_HEADER && &bytes[..8] == wal::SEG_MAGIC_V1 {
+                // An empty segment of the earlier format, as that version
+                // leaves it after a checkpoint, holds nothing to replay;
+                // it is replaced by a segment of the current format below.
+                if bytes[wal::SEG_HEADER..].iter().all(|&b| b == 0) {
+                    continue;
+                }
                 return Err(StorageError::Corruption(format!(
                     "write-ahead log segment {name} has log format 1, written by an earlier squad version; \
                      open the directory once with that version so that it checkpoints the log"

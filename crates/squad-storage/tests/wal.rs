@@ -138,3 +138,48 @@ fn an_oversized_batch_is_an_error() {
     assert!(matches!(err, StorageError::Invalid(_)), "{err}");
     tiered.sync(tiered.write(batch(2)).unwrap()).unwrap();
 }
+
+/// Rewrites the magic of a segment to that of log format 1.
+fn mark_format_1(vfs: &SimVfs, segment: &Path) {
+    let file = vfs.open(segment).unwrap();
+    file.write_at(b"SQWAL001", 0).unwrap();
+    file.sync().unwrap();
+}
+
+#[test]
+fn a_log_of_the_earlier_format_with_records_is_refused() {
+    let vfs = SimVfs::new(7);
+    let segment = fill(&vfs, 5);
+    mark_format_1(&vfs, &segment);
+    let err = DiskEngine::open(Path::new("/db"), options(&vfs)).unwrap_err();
+    assert!(err.to_string().contains("log format 1"), "{err}");
+}
+
+/// What the earlier version leaves after a checkpoint, an empty segment
+/// of its format, opens: there is nothing to replay.
+#[test]
+fn an_empty_log_segment_of_the_earlier_format_is_replaced() {
+    let vfs = SimVfs::new(8);
+    let engine = DiskEngine::open(Path::new("/db"), options(&vfs)).unwrap();
+    let lsn = engine.write(batch(1)).unwrap();
+    engine.sync(lsn).unwrap();
+    engine.checkpoint().unwrap();
+    drop(engine);
+    let segments = vfs.list(Path::new("/db/wal")).unwrap();
+    assert_eq!(segments.len(), 1, "{segments:?}");
+    let segment = Path::new("/db/wal").join(&segments[0]);
+    let file = vfs.open(&segment).unwrap();
+    let mut rest = vec![0u8; (file.size().unwrap() - SEG_HEADER) as usize];
+    file.read_at(&mut rest, SEG_HEADER).unwrap();
+    assert!(rest.iter().all(|&b| b == 0), "the segment is not empty after a checkpoint");
+    mark_format_1(&vfs, &segment);
+
+    let engine = DiskEngine::open(Path::new("/db"), options(&vfs)).unwrap();
+    assert_eq!(keys(&engine), 1);
+    let lsn = engine.write(batch(2)).unwrap();
+    engine.sync(lsn).unwrap();
+    drop(engine);
+    assert!(!vfs.exists(&segment).unwrap(), "the old segment was not replaced");
+    let engine = DiskEngine::open(Path::new("/db"), options(&vfs)).unwrap();
+    assert_eq!(keys(&engine), 2);
+}
