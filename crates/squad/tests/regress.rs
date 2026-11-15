@@ -110,23 +110,8 @@ macro_rules! regress {
     )*};
 }
 
-regress!(
-    basics,
-    tables,
-    joins,
-    aggregates,
-    subqueries,
-    window,
-    cte,
-    types,
-    ddl,
-    transactions,
-    misc,
-    fuzz_misc,
-    noops,
-    settings,
-    rls
-);
+regress!(basics, tables, joins, aggregates, subqueries, window, cte, types, ddl, transactions, misc, fuzz_misc, noops);
+regress!(settings, rls);
 
 /// Every script in the directory must be listed above.
 #[test]
