@@ -45,6 +45,13 @@ pub enum Type {
     /// The single-byte `"char"` type of the system catalogs. Values are
     /// `text`; the type affects only description and wire encoding.
     Char,
+    /// `int2vector` of the system catalogs (`pg_index.indkey`): a
+    /// one-dimensional `smallint` array with lower bound 0, written as
+    /// space-separated numbers. Values are [`Value::Vector`].
+    Int2Vector,
+    /// `oidvector` (`pg_index.indclass`, `pg_proc.proargtypes`): like
+    /// `int2vector` with `oid` elements, which are computed as `int8`.
+    OidVector,
 }
 
 impl Type {
@@ -74,6 +81,8 @@ impl Type {
             Type::Void => 2278,
             Type::Oid => 26,
             Type::Char => 18,
+            Type::Int2Vector => 22,
+            Type::OidVector => 30,
             Type::Array(elem) => match **elem {
                 Type::Oid => 1028,
                 Type::Char => 1002,
@@ -94,6 +103,8 @@ impl Type {
                 Type::Uuid => 2951,
                 Type::Json => 199,
                 Type::Jsonb => 3807,
+                Type::Int2Vector => 1006,
+                Type::OidVector => 1013,
                 _ => 2277,
             },
         }
@@ -106,7 +117,9 @@ impl Type {
                 16 => Type::Bool,
                 17 => Type::Bytea,
                 18 => Type::Char,
+                22 => Type::Int2Vector,
                 26 => Type::Oid,
+                30 => Type::OidVector,
                 20 => Type::Int8,
                 21 => Type::Int2,
                 23 => Type::Int4,
@@ -180,6 +193,8 @@ impl Type {
             Type::Void => "void".into(),
             Type::Oid => "oid".into(),
             Type::Char => "\"char\"".into(),
+            Type::Int2Vector => "int2vector".into(),
+            Type::OidVector => "oidvector".into(),
         }
     }
 
@@ -221,6 +236,8 @@ impl Type {
             "record" => Type::Record,
             "unknown" => Type::Unknown,
             "void" => Type::Void,
+            "int2vector" => Type::Int2Vector,
+            "oidvector" => Type::OidVector,
             _ => return None,
         })
     }
@@ -243,6 +260,23 @@ impl Type {
     pub fn element(&self) -> Option<&Type> {
         match self {
             Type::Array(e) => Some(e),
+            Type::Int2Vector => Some(&Type::Int2),
+            Type::OidVector => Some(&Type::Int8),
+            _ => None,
+        }
+    }
+
+    /// `int2vector` or `oidvector`.
+    pub fn is_vector(&self) -> bool {
+        matches!(self, Type::Int2Vector | Type::OidVector)
+    }
+
+    /// The element type of a vector type as expressions compute it
+    /// (`oid` elements are `int8`), for vector types only.
+    pub fn vector_elem(&self) -> Option<Type> {
+        match self {
+            Type::Int2Vector => Some(Type::Int2),
+            Type::OidVector => Some(Type::Int8),
             _ => None,
         }
     }
@@ -303,6 +337,10 @@ pub enum Value {
     Json(String),
     Jsonb(Box<serde_json::Value>),
     Array(Vec<Value>),
+    /// An `int2vector` or `oidvector`: a one-dimensional array without
+    /// NULLs whose subscripts start at 0 and whose text form is the
+    /// elements separated by spaces. Elements are `Int2` or `Int8` (oid).
+    Vector(Vec<Value>),
     /// Enum value: position in the type's label list and the label.
     Enum(u32, String),
     /// A composite value (`ROW(...)`).
@@ -343,6 +381,10 @@ impl Value {
             Value::Array(items) => {
                 Type::Array(Box::new(items.iter().find(|v| !v.is_null()).map_or(Type::Unknown, Value::type_of)))
             }
+            Value::Vector(items) => match items.first() {
+                Some(Value::Int8(_)) => Type::OidVector,
+                _ => Type::Int2Vector,
+            },
             Value::Enum(..) => Type::Text,
             Value::Record(_) => Type::Record,
         }
@@ -387,6 +429,15 @@ impl Value {
             Value::Numeric(d) => Some(*d),
             Value::Float4(v) => Decimal::from_f32(*v),
             Value::Float8(v) => Decimal::from_f64(*v),
+            _ => None,
+        }
+    }
+
+    /// Elements and lower bound of an array or vector value.
+    pub fn array_items(&self) -> Option<(&[Value], i32)> {
+        match self {
+            Value::Array(items) => Some((items, 1)),
+            Value::Vector(items) => Some((items, 0)),
             _ => None,
         }
     }
@@ -439,7 +490,7 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
         (Jsonb(x), Jsonb(y)) => cmp_json(x, y),
         (Enum(x, _), Enum(y, _)) => x.cmp(y),
         (Enum(_, x), Text(y)) | (Text(x), Enum(_, y)) => x.as_bytes().cmp(y.as_bytes()),
-        (Array(x), Array(y)) | (Record(x), Record(y)) => {
+        (Array(x) | Vector(x), Array(y) | Vector(y)) | (Record(x), Record(y)) => {
             for (i, j) in x.iter().zip(y.iter()) {
                 let o = compare(i, j);
                 if o != Ordering::Equal {
@@ -480,7 +531,7 @@ fn rank(v: &Value) -> u8 {
         Value::Interval(_) => 7,
         Value::Uuid(_) => 8,
         Value::Json(_) | Value::Jsonb(_) => 9,
-        Value::Array(_) => 10,
+        Value::Array(_) | Value::Vector(_) => 10,
         Value::Record(_) => 11,
     }
 }

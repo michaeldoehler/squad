@@ -473,6 +473,12 @@ impl Conn {
         let secret = rand::random::<i32>();
         self.inner.backends.lock().insert(pid, (secret, self.session.cancel_handle()));
         self.registered_pid = Some(pid);
+        // pg_terminate_backend from another session wakes this connection
+        // while it waits for its client; it then reports the termination.
+        if let Ok(stream) = self.io.stream().try_clone() {
+            self.session.set_terminate_hook(move || stream.shutdown_read());
+        }
+        self.session.refresh_activity();
         let m = self.io.begin(b'K');
         self.io.i32(pid);
         self.io.i32(secret);
@@ -532,9 +538,15 @@ impl Conn {
         // until the next Sync.
         let mut skipping = false;
         loop {
+            if self.session.is_terminated() {
+                return self.terminated();
+            }
             self.arm_idle_timeout();
             let read = self.io.read_message();
             self.io.deadline = None;
+            if self.session.is_terminated() {
+                return self.terminated();
+            }
             let (ty, body) = match read {
                 Ok(Some(m)) => m,
                 Ok(None) => return Ok(()),
@@ -555,6 +567,7 @@ impl Conn {
             let step: Step = match ty {
                 b'Q' => {
                     let result = match self.simple_query(&body) {
+                        Err(Fail::Db(_)) if self.session.is_terminated() => return self.terminated(),
                         Err(Fail::Db(e)) => {
                             error_response(&mut self.io, "ERROR", &e);
                             Ok(())
@@ -586,6 +599,7 @@ impl Conn {
             };
             match step {
                 Ok(()) => {}
+                Err(Fail::Db(_)) if self.session.is_terminated() => return self.terminated(),
                 Err(Fail::Db(e)) => {
                     error_response(&mut self.io, "ERROR", &e);
                     skipping = true;
@@ -597,6 +611,12 @@ impl Conn {
                 Err(Fail::Io(e)) => return Err(e),
             }
         }
+    }
+
+    /// Ends a connection whose session another one terminated with
+    /// `pg_terminate_backend`.
+    fn terminated(&mut self) -> io::Result<()> {
+        self.fatal(Error::new(sqlstate::ADMIN_SHUTDOWN, "terminating connection due to administrator command"))
     }
 
     /// Ends a connection on which the client was silent for too long.

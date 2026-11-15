@@ -615,11 +615,13 @@ fn what_cannot_be_answered_correctly_is_rejected() {
     for sql in [
         // Sketches of different shards cannot be combined.
         "SELECT approx_count_distinct(user_id) FROM events",
+        "SELECT approx_distinct(user_id) FROM events",
         "SELECT name, approx_percentile(value, 0.5) FROM events GROUP BY name",
         // Aggregates that need all rows in one place.
         "SELECT string_agg(email, ',' ORDER BY id) FROM users",
         "SELECT array_agg(id) FROM users",
         "SELECT stddev(score) FROM users",
+        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY score) FROM users",
         "SELECT sum(DISTINCT score) FROM users",
         "SELECT count(DISTINCT (id, score)) FROM users",
         // Window functions, set operations, DISTINCT ON.
@@ -663,6 +665,7 @@ fn what_cannot_be_answered_correctly_is_rejected() {
     // With the key (or grouped by it) the same shapes work.
     for sql in [
         "SELECT approx_count_distinct(user_id) FROM events WHERE project_id = 1",
+        "SELECT project_id, approx_distinct(user_id) FROM events GROUP BY project_id",
         "SELECT project_id, approx_percentile(value, 0.5) FROM events GROUP BY project_id",
         "SELECT string_agg(email, ',' ORDER BY id) FROM users WHERE project_id = 1",
         "SELECT id, row_number() OVER (ORDER BY id) FROM users WHERE project_id = 1",
@@ -671,6 +674,7 @@ fn what_cannot_be_answered_correctly_is_rejected() {
         "WITH big AS (SELECT * FROM users WHERE project_id = 1 AND score > 3) SELECT count(*) FROM big",
         "SELECT * FROM users WHERE project_id = 1 FOR UPDATE",
         "SELECT project_id, array_agg(id) FROM users GROUP BY project_id",
+        "SELECT project_id, mode() WITHIN GROUP (ORDER BY score) FROM users GROUP BY project_id",
     ] {
         conn.query(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }

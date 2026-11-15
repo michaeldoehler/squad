@@ -1,0 +1,121 @@
+-- int2vector and oidvector, as pg_index uses them, and the functions
+-- that signal other sessions.
+CREATE TABLE vx (id int PRIMARY KEY, a int, b text, c varchar(10), d bigint, UNIQUE (b), CONSTRAINT vx_ac UNIQUE (a, c));
+CREATE INDEX vx_dca ON vx (d, c, a);
+-- text form, subscripts from 0, casts to text
+SELECT i.relname, ix.indkey, ix.indoption, ix.indclass, ix.indcollation, pg_typeof(ix.indkey), pg_typeof(ix.indclass) FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid WHERE ix.indrelid = 'vx'::regclass ORDER BY 1;
+relname|indkey|indoption|indclass|indcollation|pg_typeof|pg_typeof
+vx_ac|2 4|0 0|1978 3126|0 100|int2vector|oidvector
+vx_b_key|3|0|3126|100|int2vector|oidvector
+vx_dca|5 4 2|0 0 0|3124 3126 1978|0 100 0|int2vector|oidvector
+vx_pkey|1|0|1978|0|int2vector|oidvector
+(4 rows)
+SELECT i.relname, ix.indkey::varchar, ix.indoption::varchar, ix.indkey::text || '!', ix.indkey[0], ix.indkey[1], ix.indkey[2], ix.indkey[3], ix.indkey[-1] FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid WHERE ix.indrelid = 'vx'::regclass ORDER BY 1;
+relname|indkey|indoption|?column?|indkey|indkey|indkey|indkey|indkey
+vx_ac|2 4|0 0|2 4!|2|4|NULL|NULL|NULL
+vx_b_key|3|0|3!|3|NULL|NULL|NULL|NULL
+vx_dca|5 4 2|0 0 0|5 4 2!|5|4|2|NULL|NULL
+vx_pkey|1|0|1!|1|NULL|NULL|NULL|NULL
+(4 rows)
+SELECT i.relname, array_lower(ix.indkey, 1), array_upper(ix.indkey, 1), array_length(ix.indkey, 1), array_dims(ix.indkey), cardinality(ix.indkey), array_ndims(ix.indkey) FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid WHERE ix.indrelid = 'vx'::regclass ORDER BY 1;
+relname|array_lower|array_upper|array_length|array_dims|cardinality|array_ndims
+vx_ac|0|1|2|[0:1]|2|1
+vx_b_key|0|0|1|[0:0]|1|1
+vx_dca|0|2|3|[0:2]|3|1
+vx_pkey|0|0|1|[0:0]|1|1
+(4 rows)
+SELECT i.relname, array_position(ix.indkey, 1::int2), array_position(ix.indkey, 2::int2), array_position(ix.indkey, 4), array_position(ix.indkey, 2::int2, 1), array_positions(ix.indkey, 4::int2), ix.indkey[1:2], ix.indkey[:0], array_to_string(ix.indkey, ',') FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid WHERE ix.indrelid = 'vx'::regclass ORDER BY 1;
+relname|array_position|array_position|array_position|array_position|array_positions|indkey|indkey|array_to_string
+vx_ac|NULL|0|1|NULL|{1}|{4}|{2}|2,4
+vx_b_key|NULL|NULL|NULL|NULL|{}|{}|{3}|3
+vx_dca|NULL|2|1|2|{1}|{4,2}|{5}|5,4,2
+vx_pkey|0|NULL|NULL|NULL|{}|{}|{1}|1
+(4 rows)
+SELECT i.relname, generate_subscripts(ix.indkey, 1) AS ord, unnest(ix.indkey) AS attnum FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid WHERE ix.indrelid = 'vx'::regclass ORDER BY 1, 2;
+relname|ord|attnum
+vx_ac|0|2
+vx_ac|1|4
+vx_b_key|0|3
+vx_dca|0|5
+vx_dca|1|4
+vx_dca|2|2
+vx_pkey|0|1
+(7 rows)
+SELECT i.relname, u.attnum, u.ord, o.opcname, o.opcdefault FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid, unnest(ix.indkey, ix.indclass) WITH ORDINALITY u(attnum, opclass, ord) LEFT JOIN pg_opclass o ON o.oid = u.opclass WHERE ix.indrelid = 'vx'::regclass ORDER BY 1, 3;
+relname|attnum|ord|opcname|opcdefault
+vx_ac|2|1|int4_ops|t
+vx_ac|4|2|text_ops|t
+vx_b_key|3|1|text_ops|t
+vx_dca|5|1|int8_ops|t
+vx_dca|4|2|text_ops|t
+vx_dca|2|3|int4_ops|t
+vx_pkey|1|1|int4_ops|t
+(7 rows)
+SELECT i.relname, ix.indkey = '2 4', ix.indkey <> '2 4', 3 = ANY (ix.indkey), 3 = ALL (ix.indkey), to_json(ix.indkey) FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid WHERE ix.indrelid = 'vx'::regclass ORDER BY 1;
+relname|?column?|?column?|?column?|?column?|to_json
+vx_ac|t|f|f|f|[2,4]
+vx_b_key|f|t|t|t|[3]
+vx_dca|f|t|f|f|[5,4,2]
+vx_pkey|f|t|f|f|[1]
+(4 rows)
+-- the index introspection query of SQLAlchemy 1.4 (used by Apache Superset)
+SELECT i.relname as relname, ix.indisunique, ix.indexprs, a.attname, a.attnum, c.contype, ix.indkey::varchar, ix.indoption::varchar, i.reloptions, am.amname, pg_get_expr(ix.indpred, ix.indrelid), ix.indnkeyatts as indnkeyatts FROM pg_class t join pg_index ix on t.oid = ix.indrelid join pg_class i on i.oid = ix.indexrelid left outer join pg_attribute a on t.oid = a.attrelid and a.attnum = ANY(ix.indkey) left outer join pg_constraint c on (ix.indrelid = c.conrelid and ix.indexrelid = c.conindid and c.contype in ('p', 'u', 'x')) left outer join pg_am am on i.relam = am.oid WHERE t.relkind IN ('r', 'v', 'f', 'm', 'p') and t.oid = 'vx'::regclass and ix.indisprimary = 'f' ORDER BY t.relname, i.relname, a.attnum;
+relname|indisunique|indexprs|attname|attnum|contype|indkey|indoption|reloptions|amname|pg_get_expr|indnkeyatts
+vx_ac|t|NULL|a|2|u|2 4|0 0|NULL|btree|NULL|2
+vx_ac|t|NULL|c|4|u|2 4|0 0|NULL|btree|NULL|2
+vx_b_key|t|NULL|b|3|u|3|0|NULL|btree|NULL|1
+vx_dca|f|NULL|a|2|NULL|5 4 2|0 0 0|NULL|btree|NULL|3
+vx_dca|f|NULL|c|4|NULL|5 4 2|0 0 0|NULL|btree|NULL|3
+vx_dca|f|NULL|d|5|NULL|5 4 2|0 0 0|NULL|btree|NULL|3
+(6 rows)
+-- literals
+SELECT '3 1  4'::int2vector, ' 7 '::int2vector, ''::int2vector, '1 2'::oidvector, pg_typeof('1'::oidvector);
+int2vector|int2vector|int2vector|oidvector|pg_typeof
+3 1 4|7||1 2|oidvector
+(1 row)
+SELECT ('3 1 4'::int2vector)[0], ('3 1 4'::int2vector)[2], ('3 1 4'::int2vector)[3], ('3 1 4'::int2vector)[1:];
+int2vector|int2vector|int2vector|int2vector
+3|4|NULL|{1,4}
+(1 row)
+SELECT array_dims(''::int2vector), array_length(''::int2vector, 1), array_upper(''::int2vector, 1), array_lower(''::int2vector, 1), cardinality(''::int2vector);
+array_dims|array_length|array_upper|array_lower|cardinality
+[0:-1]|0|-1|0|0
+(1 row)
+SELECT '1 2'::int2vector = '1 2'::int2vector, '1 2'::int2vector < '1 3'::int2vector, '1 2'::int2vector::varchar(2) AS v;
+?column?|?column?|v
+t|t|1 
+(1 row)
+SELECT unnest('3 1 4'::int2vector), generate_subscripts('5 6 7'::oidvector, 1);
+unnest|generate_subscripts
+3|0
+1|1
+4|2
+(3 rows)
+SELECT x FROM (VALUES ('1 2'::int2vector), ('1 2'::int2vector), ('3'::int2vector)) v(x) GROUP BY x ORDER BY x;
+x
+1 2
+3
+(2 rows)
+SELECT '{1,2}'::int2vector;
+ERROR:  22P02
+SELECT '40000'::int2vector;
+ERROR:  22003
+SELECT 'x'::oidvector;
+ERROR:  22P02
+SELECT ARRAY[1, 2]::int2[]::int2vector;
+ERROR:  42846
+SELECT format_type('int2vector'::regtype, -1), format_type('oidvector'::regtype, -1), format_type('_int2vector'::regtype, -1);
+format_type|format_type|format_type
+int2vector|oidvector|int2vector[]
+(1 row)
+-- pg_cancel_backend and pg_terminate_backend for a pid that is no backend
+SELECT pg_cancel_backend(2147483647), pg_terminate_backend(2147483647), pg_terminate_backend(2147483647, 10);
+pg_cancel_backend|pg_terminate_backend|pg_terminate_backend
+f|f|f
+(1 row)
+SELECT pg_cancel_backend(NULL), pg_terminate_backend(NULL);
+pg_cancel_backend|pg_terminate_backend
+NULL|NULL
+(1 row)
+SELECT pg_terminate_backend(2147483647, -1);
+ERROR:  22003

@@ -273,6 +273,10 @@ pub(crate) fn is_aggregate(name: &str) -> bool {
             | "stddev_pop"
             | "stddev_samp"
             | "approx_count_distinct"
+            | "approx_distinct"
             | "approx_percentile"
+            | "percentile_cont"
+            | "percentile_disc"
+            | "mode"
     )
 }

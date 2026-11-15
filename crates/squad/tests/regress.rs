@@ -112,6 +112,7 @@ macro_rules! regress {
 
 regress!(basics, tables, joins, aggregates, subqueries, window, cte, types, ddl, transactions, misc, fuzz_misc, noops);
 regress!(settings, rls);
+regress!(vectors, ordered_set);
 
 /// Every script in the directory must be listed above.
 #[test]

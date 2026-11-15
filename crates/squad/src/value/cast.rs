@@ -46,6 +46,9 @@ fn cast_level(from: &Type, to: &Type) -> Option<CastContext> {
         (Json, Jsonb) | (Jsonb, Json) => Assignment,
         (Jsonb, Bool | Int2 | Int4 | Int8 | Float4 | Float8 | Numeric) => Explicit,
         (Array(a), Array(b)) => return cast_level(a, b),
+        // A vector is binary coercible to an array of its element type.
+        (Int2Vector, Array(b)) => return cast_level(&Int2, b),
+        (OidVector, Array(b)) => return cast_level(&Int8, b),
         // I/O conversion casts.
         (Text, Void | Record) => return None,
         (Text, _) => Explicit,
@@ -214,9 +217,10 @@ pub fn cast(v: Value, to: &Type, ctx: &FnCtx) -> Result<Value> {
             }
         }
 
-        (V::Array(items), Type::Array(elem)) => {
+        (V::Array(items) | V::Vector(items), Type::Array(elem)) => {
             V::Array(items.into_iter().map(|i| cast(i, elem, ctx)).collect::<Result<_>>()?)
         }
+        (v @ V::Vector(_), Type::Int2Vector | Type::OidVector) => v,
         (v, Type::Enum(_)) => return Err(cannot_cast(&v, to)),
         (v, _) => return Err(cannot_cast(&v, to)),
     })
@@ -244,7 +248,7 @@ pub fn category(t: &Type) -> Category {
         Type::Text => Category::String,
         Type::Date | Type::Time | Type::Timestamp | Type::TimestampTz => Category::DateTime,
         Type::Interval => Category::Timespan,
-        Type::Array(_) => Category::Array,
+        Type::Array(_) | Type::Int2Vector | Type::OidVector => Category::Array,
         Type::Enum(_) => Category::Enum,
         Type::Unknown => Category::Unknown,
         _ => Category::Other,

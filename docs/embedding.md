@@ -265,6 +265,29 @@ starts. `SET statement_timeout = '2s'` does the same per statement
 without a second thread. What is and is not interruptible is listed in
 [transactions](transactions.md#cancelling-statements-and-statement_timeout).
 
+Every connection (and every `Session`) is a backend with its own pid
+(`pg_backend_pid()`), and `pg_stat_activity` lists all open connections
+of the database with their pid, state (`active`, `idle`, `idle in
+transaction`, `idle in transaction (aborted)`), current or last
+statement and the times PostgreSQL reports; `client_addr` and the wait
+columns are NULL. Another connection can then use SQL instead of the
+handle:
+
+- `pg_cancel_backend(pid)` does what `CancelHandle::cancel` does and
+  returns true.
+- `pg_terminate_backend(pid [, timeout_ms])` ends the connection: its
+  running statement fails with `57P01` ("terminating connection due to
+  administrator command"), its transaction is rolled back, and every
+  later statement on it fails with `57P01` too. In the embedded API
+  nothing can close the connection for its owner, so it stays open until
+  the application drops it; with a timeout, the call waits for that
+  (and returns false with a warning when the time runs out). Over the
+  server the connection is closed at once.
+- For a pid that is no open connection both return false with the
+  warning `PID … is not a PostgreSQL backend process`, as in PostgreSQL.
+  Signalling the calling connection itself ends its own statement at
+  once. Any connection may signal any other: there are no roles.
+
 ## Using several threads
 
 ```rust

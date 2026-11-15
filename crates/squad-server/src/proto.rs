@@ -48,6 +48,18 @@ impl Stream {
         };
     }
 
+    /// Ends reading: a thread blocked reading from the stream sees the
+    /// end of the stream. Writing still works.
+    pub fn shutdown_read(&self) {
+        let _ = match self {
+            Stream::Tcp(s) => s.shutdown(Shutdown::Read),
+            Stream::Tls(s) => s.sock.shutdown(Shutdown::Read),
+            #[cfg(unix)]
+            Stream::Unix(s) => s.shutdown(Shutdown::Read),
+            Stream::Detached => Ok(()),
+        };
+    }
+
     /// True for TCP connections, encrypted or not.
     pub fn is_tcp(&self) -> bool {
         matches!(self, Stream::Tcp(_) | Stream::Tls(_))

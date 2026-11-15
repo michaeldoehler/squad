@@ -181,7 +181,7 @@ fn try_match<'a>(sig: &'a Sig, actual: &[Type]) -> Option<Match<'a>> {
             P::NonArray => {
                 has_poly = true;
                 match a {
-                    Type::Array(_) => return None,
+                    Type::Array(_) | Type::Int2Vector | Type::OidVector => return None,
                     Type::Unknown => {}
                     t => elems.push(t.clone()),
                 }
@@ -195,6 +195,7 @@ fn try_match<'a>(sig: &'a Sig, actual: &[Type]) -> Option<Match<'a>> {
                         }
                     }
                     Type::Unknown => {}
+                    v if v.is_vector() => elems.extend(v.vector_elem()),
                     _ => return None,
                 }
             }
@@ -225,6 +226,12 @@ fn try_match<'a>(sig: &'a Sig, actual: &[Type]) -> Option<Match<'a>> {
                 continue;
             }
             P::Elem | P::NonArray => elem.clone(),
+            // A vector is passed as it is, so that functions see its lower
+            // bound of 0. Only a function that returns an array of a wider
+            // element type gets it converted to such an array.
+            P::Array if a.is_vector() && (a.vector_elem().as_ref() == Some(&elem) || sig.ret != Ret::Array) => {
+                a.clone()
+            }
             P::Array => elem.clone().array_of(),
         };
         if *a == target {

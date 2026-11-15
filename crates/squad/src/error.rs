@@ -84,6 +84,7 @@ pub mod sqlstate {
     pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
     pub const LOCK_NOT_AVAILABLE: &str = "55P03";
     pub const QUERY_CANCELED: &str = "57014";
+    pub const ADMIN_SHUTDOWN: &str = "57P01";
     pub const TOO_MANY_CONNECTIONS: &str = "53300";
     pub const IO_ERROR: &str = "58030";
     pub const PROTOCOL_VIOLATION: &str = "08P01";

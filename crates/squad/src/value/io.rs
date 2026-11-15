@@ -312,6 +312,10 @@ pub fn parse_value(text: &str, ty: &Type, ctx: &FnCtx) -> Result<Value> {
             }
             Value::Array(out)
         }
+        Type::Int2Vector | Type::OidVector => {
+            let elem = if *ty == Type::Int2Vector { Type::Int2 } else { Type::Oid };
+            Value::Vector(text.split_ascii_whitespace().map(|n| parse_value(n, &elem, ctx)).collect::<Result<_>>()?)
+        }
         Type::Enum(_) | Type::Record | Type::Void => {
             return Err(Error::internal(format!("text input of type {} must be handled by the caller", ty.name())))
         }
@@ -596,6 +600,7 @@ pub fn format_value(v: &Value, ctx: &FnCtx) -> String {
         Value::Uuid(u) => fmt_uuid(u),
         Value::Jsonb(j) => fmt_jsonb(j),
         Value::Array(items) => fmt_array(items, ctx),
+        Value::Vector(items) => items.iter().map(|v| format_value(v, ctx)).collect::<Vec<_>>().join(" "),
         Value::Record(items) => fmt_record(items, ctx),
     }
 }

@@ -35,7 +35,8 @@ fn agg_func(name: &str) -> Option<AggFunc> {
         "var_pop" => AggFunc::Variance { sample: false, stddev: false },
         "stddev" | "stddev_samp" => AggFunc::Variance { sample: true, stddev: true },
         "stddev_pop" => AggFunc::Variance { sample: false, stddev: true },
-        "approx_count_distinct" => AggFunc::ApproxCountDistinct,
+        // `approx_distinct` is the name Trino, Presto and Apache Superset use.
+        "approx_count_distinct" | "approx_distinct" => AggFunc::ApproxCountDistinct,
         // The percentile is filled in from the second argument.
         "approx_percentile" => AggFunc::ApproxPercentile(0.5),
         _ => return None,
@@ -605,13 +606,17 @@ impl<'a> Binder<'a> {
                     }
                     other => (r, other),
                 };
-                let Type::Array(elem) = &rt else {
-                    return Err(Error::new(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "op ANY/ALL (array) requires array on right side",
-                    ));
+                let elem = match &rt {
+                    Type::Array(elem) if **elem == Type::Unknown => Type::Text,
+                    Type::Array(elem) => (**elem).clone(),
+                    v if v.is_vector() => v.vector_elem().unwrap_or(Type::Int2),
+                    _ => {
+                        return Err(Error::new(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "op ANY/ALL (array) requires array on right side",
+                        ))
+                    }
                 };
-                let elem = if **elem == Type::Unknown { Type::Text } else { (**elem).clone() };
                 let f = value::resolve_operator(&op, Some(&l.1), &elem)?;
                 if f.ret != Type::Bool {
                     return Err(Error::new(
@@ -739,6 +744,19 @@ impl<'a> Binder<'a> {
                                 t = (**elem).clone();
                             }
                         }
+                        // Subscripts of int2vector and oidvector start at
+                        // 0; a slice of one is an ordinary array.
+                        v if v.is_vector() => {
+                            let elem = v.vector_elem().unwrap_or(Type::Int2);
+                            if ix.is_slice {
+                                e = Expr::Slice(Box::new(e), bound(self, &ix.lidx)?, bound(self, &ix.uidx)?);
+                                t = elem.array_of();
+                            } else {
+                                let idx = bound(self, &ix.uidx)?.ok_or_else(|| Error::syntax("missing subscript"))?;
+                                e = Expr::Subscript(Box::new(e), idx);
+                                t = elem;
+                            }
+                        }
                         Type::Jsonb if !ix.is_slice => {
                             let idx = ix.uidx.as_ref().ok_or_else(|| Error::syntax("missing subscript"))?;
                             let (ie, it) = self.bind_expr(idx, scope)?;
@@ -767,6 +785,15 @@ impl<'a> Binder<'a> {
             return Err(Error::unsupported("VARIADIC function calls"));
         }
 
+        if f.agg_within_group {
+            if f.over.is_some() {
+                return Err(Error::new(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    format!("OVER is not supported for ordered-set aggregate {name}"),
+                ));
+            }
+            return self.bind_ordered_set(f, &name, scope);
+        }
         if let Some(over) = &f.over {
             return self.bind_window(f, &name, over, scope);
         }
@@ -946,6 +973,7 @@ impl<'a> Binder<'a> {
                     let elem = match t {
                         Type::Array(e) if **e != Type::Unknown => (**e).clone(),
                         Type::Array(_) | Type::Unknown => Type::Text,
+                        t if t.is_vector() => t.vector_elem().unwrap_or(Type::Int2),
                         _ => return Err(bad()),
                     };
                     want.push(Type::Array(Box::new(elem.clone())));
@@ -991,7 +1019,7 @@ impl<'a> Binder<'a> {
                 )
             }
             Srf::GenerateSubscripts => {
-                if types.len() != 2 || !matches!(types[0], Type::Array(_)) {
+                if types.len() != 2 || !(matches!(types[0], Type::Array(_)) || types[0].is_vector()) {
                     return Err(bad());
                 }
                 let want = [types[0].clone(), Type::Int4];
@@ -1006,9 +1034,6 @@ impl<'a> Binder<'a> {
         } else {
             agg_func(name).ok_or_else(|| Error::internal("not an aggregate"))?
         };
-        if f.agg_within_group {
-            return Err(Error::unsupported("ordered-set aggregates (WITHIN GROUP)"));
-        }
         // Aggregate arguments belong to this query level but must not
         // contain aggregates themselves.
         let saved = self.agg_levels.last_mut().map(|l| std::mem::replace(&mut l.allow_aggs, nested_aggs));
@@ -1097,6 +1122,135 @@ impl<'a> Binder<'a> {
             level.allow_aggs = allow;
         }
         result
+    }
+
+    /// `percentile_cont`, `percentile_disc` and `mode` with WITHIN GROUP:
+    /// an `array_agg` of the sorted non-null values, and a final function
+    /// of it and the direct argument, which belongs to the enclosing
+    /// expression (so it may use only grouped columns).
+    fn bind_ordered_set(&mut self, f: &pb::FuncCall, name: &str, scope: &Scope) -> Result<Typed> {
+        let (eval, direct): (crate::value::FuncImpl, usize) = match name {
+            "percentile_cont" => (crate::agg::percentile_cont_final, 1),
+            "percentile_disc" => (crate::agg::percentile_disc_final, 1),
+            "mode" => (crate::agg::mode_final, 0),
+            "rank" | "dense_rank" | "percent_rank" | "cume_dist" => {
+                return Err(Error::unsupported(format!("hypothetical-set aggregate {name}(…) WITHIN GROUP")))
+            }
+            _ if f.agg_star => {
+                return Err(Error::new(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    format!("{name} is not an ordered-set aggregate, so it cannot have WITHIN GROUP"),
+                ))
+            }
+            _ => return Err(undefined_function(name, &[])),
+        };
+        match self.agg_levels.last() {
+            Some(l) if l.allow_aggs => {}
+            Some(l) if l.in_aggregate => {
+                return Err(Error::new(sqlstate::GROUPING_ERROR, "aggregate function calls cannot be nested"))
+            }
+            _ => {
+                return Err(Error::new(
+                    sqlstate::GROUPING_ERROR,
+                    format!("aggregate functions are not allowed in {}", self.clause),
+                ))
+            }
+        }
+        // Neither the direct argument nor the sorted one may contain
+        // aggregates.
+        let level = self.agg_levels.last_mut().unwrap();
+        let saved = (std::mem::replace(&mut level.allow_aggs, false), std::mem::replace(&mut level.in_aggregate, true));
+        let result = self.bind_ordered_set_parts(f, name, direct, scope);
+        let level = self.agg_levels.last_mut().unwrap();
+        (level.allow_aggs, level.in_aggregate) = saved;
+        let (direct_args, call, ret) = result?;
+        let level = self.agg_levels.last_mut().unwrap();
+        let idx = match level.aggs.iter().position(|a| *a == call) {
+            Some(i) => i,
+            None => {
+                level.aggs.push(call);
+                level.aggs.len() - 1
+            }
+        };
+        let mut args = direct_args;
+        args.push(Expr::AggRef(idx));
+        Ok((Expr::Call(FuncRef { name: name.into(), eval, strict: false, ret: ret.clone() }, args), ret))
+    }
+
+    fn bind_ordered_set_parts(
+        &mut self,
+        f: &pb::FuncCall,
+        name: &str,
+        direct: usize,
+        scope: &Scope,
+    ) -> Result<(Vec<Expr>, AggCall, Type)> {
+        let mut args = Vec::with_capacity(f.args.len());
+        for a in &f.args {
+            args.push(self.bind_expr(a, scope)?);
+        }
+        let [order] = f.agg_order.as_slice() else {
+            let types: Vec<Type> = args.iter().map(|(_, t)| t.clone()).collect();
+            return Err(undefined_function(name, &types));
+        };
+        let N::SortBy(s) = node(order)? else { return Err(Error::internal("malformed WITHIN GROUP")) };
+        let target = s.node.as_ref().ok_or_else(|| Error::internal("WITHIN GROUP without expression"))?;
+        let (x, xt) = self.bind_expr(target, scope)?;
+        let mut types: Vec<Type> = args.iter().map(|(_, t)| t.clone()).collect();
+        types.push(xt.clone());
+        if args.len() != direct {
+            return Err(undefined_function(name, &types));
+        }
+        // percentile_cont interpolates float8 or interval values; the
+        // others take any sortable type.
+        let elem = match name {
+            "percentile_cont" if xt == Type::Interval => Type::Interval,
+            "percentile_cont" if value::can_cast(&xt, &Type::Float8, CastContext::Implicit) => Type::Float8,
+            "percentile_cont" => return Err(undefined_function(name, &types)),
+            _ if xt == Type::Unknown => {
+                return Err(Error::new(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "could not determine polymorphic type because input has type unknown",
+                ))
+            }
+            _ => xt.clone(),
+        };
+        let x = self.coerce(x, &xt, &elem)?;
+        // The fraction: float8, or an array of them for several results.
+        let mut direct_args = Vec::new();
+        let mut ret = elem.clone();
+        if let Some((p, pt)) = args.pop() {
+            let want = match &pt {
+                Type::Array(_) => Type::Float8.array_of(),
+                _ => Type::Float8,
+            };
+            if !value::can_cast(&pt, &want, CastContext::Implicit) {
+                return Err(undefined_function(name, &types));
+            }
+            if matches!(want, Type::Array(_)) {
+                ret = elem.clone().array_of();
+            }
+            direct_args.push(self.coerce(p, &pt, &want)?);
+        }
+        let key = sort_key(x.clone(), s)?;
+        let not_null = Expr::IsNull(Box::new(x.clone()), true);
+        let filter = match f.agg_filter.as_ref().map(|n| self.bind_bool(n, scope, "FILTER")).transpose()? {
+            Some(cond) => Expr::And(vec![cond, not_null]),
+            None => not_null,
+        };
+        if !self.const_errors.is_empty() {
+            for e in [&x, &filter] {
+                self.check_constant_errors(e)?;
+            }
+        }
+        let call = AggCall {
+            func: AggFunc::ArrayAgg,
+            args: vec![x],
+            distinct: false,
+            filter: Some(filter),
+            order_by: vec![key],
+            ret: elem.array_of(),
+        };
+        Ok((direct_args, call, ret))
     }
 
     fn bind_aggregate(&mut self, f: &pb::FuncCall, name: &str, scope: &Scope) -> Result<Typed> {

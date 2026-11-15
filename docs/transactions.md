@@ -126,9 +126,12 @@ As in PostgreSQL, `LOCK TABLE` only works inside a transaction block
 following statement of the session fail with `57014` ("canceling
 statement due to statement timeout") once it has run that long; `0`
 turns it off. A statement can also be cancelled from another thread with
-`Connection::cancel_handle()` or, over the wire protocol, with a client's
+`Connection::cancel_handle()`, from another session with
+`pg_cancel_backend(pid)`, or, over the wire protocol, with a client's
 cancel request; it then fails with `57014` ("canceling statement due to
-user request"). In both cases the transaction is rolled back like after
+user request"). `pg_terminate_backend(pid)` stops it the same way with
+`57P01` and ends the session (see [embedding](embedding.md#cancelling-and-timeouts)
+and [server](server.md#cancelling-queries)). In both cases the transaction is rolled back like after
 any other error (inside a transaction block, the block is marked failed).
 
 The executor looks at the cancel flag and the clock every few hundred

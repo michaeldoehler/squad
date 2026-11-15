@@ -155,7 +155,7 @@ groups and whole segments whose statistics rule them out.
 | --- | --- |
 | `WHERE` | comparisons of a column with a constant or parameter (`=`, `<>`, `<`, `<=`, `>`, `>=`), `IN (…)`, `BETWEEN`, `IS [NOT] NULL`, `LIKE`/`ILIKE` without escapes, boolean columns; on `jsonb` columns `col ->> 'key' = text`, `<>`, `IN (…)`, `IS [NOT] NULL`; combined with `AND`/`OR`/`NOT` |
 | `GROUP BY` | columns, `date_trunc(unit, timestamp_column)` for second … year, and `jsonb_column ->> 'key'` |
-| Aggregates | `count(*)`, `count(x)`, `count(DISTINCT x)`, `sum`, `min`, `max`, `avg`, `approx_count_distinct(x)`, `approx_percentile(x, p)` |
+| Aggregates | `count(*)`, `count(x)`, `count(DISTINCT x)`, `sum`, `min`, `max`, `avg`, `approx_count_distinct(x)` / `approx_distinct(x)`, `approx_percentile(x, p)` |
 
 `HAVING`, `ORDER BY`, `LIMIT` and expressions over the aggregates are
 applied to the result as usual. `EXPLAIN` shows `Columnar Aggregate` /
@@ -179,8 +179,10 @@ and the query takes the general path.
 
 - `approx_count_distinct(x)` estimates the number of distinct values
   with a HyperLogLog sketch (typical error 1–2 %) in constant memory per
-  group. Exact `count(DISTINCT x)` is available too and keeps every
-  value in memory.
+  group. `approx_distinct(x)` is the same aggregate under the name Trino
+  and Presto use, which Apache Superset writes for its
+  `APPROX_COUNT_DISTINCT` metric. Exact `count(DISTINCT x)` is available
+  too and keeps every value in memory.
 - `approx_percentile(x, p)` estimates the value at percentile `p`
   (0 … 1) with a mergeable quantile sketch.
 

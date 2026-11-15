@@ -182,6 +182,31 @@ PostgreSQL. `SET statement_timeout` works as well. What can be
 interrupted is described in
 [transactions](transactions.md#cancelling-statements-and-statement_timeout).
 
+`pg_stat_activity` lists every connection of the server (and every
+connection the embedding application opened itself) with the pid of its
+BackendKeyData, user, `application_name`, state and current or last
+statement; `client_addr`, `client_port` and the wait columns are NULL.
+Tools that stop queries with SQL work as with PostgreSQL, for example
+Apache Superset's SQL Lab
+(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid = '…'`):
+
+- `pg_cancel_backend(pid)` cancels the statement running on that
+  connection like a cancel request (`57014`) and returns true.
+- `pg_terminate_backend(pid [, timeout_ms])` ends that connection: a
+  running statement stops, the server sends `FATAL 57P01`
+  ("terminating connection due to administrator command") and closes the
+  connection, also when it was idle. With a timeout the call waits until
+  the connection is gone and returns false with a warning if it is not
+  gone in time.
+- An unknown pid gives false and the warning `PID … is not a PostgreSQL
+  backend process`.
+
+There are no roles, so every login may cancel or terminate every
+connection (PostgreSQL allows it for the same role, superusers and
+members of `pg_signal_backend`). A statement waiting for a row lock
+notices the request only when the wait ends, as described for cancel
+requests.
+
 ## Health checks
 
 `squad ping` connects like a client and exits with 0 if the server
@@ -307,6 +332,7 @@ Two caveats:
 | `pgbench` 16 | initialization, TPC-B-like and select-only scripts, simple and prepared mode, no failed transactions |
 | `tokio-postgres` | typed parameters and results, transactions, savepoints, portals, `COPY IN`, SCRAM, TLS (tokio-postgres-rustls), cancel tokens, notices |
 | `sqlx` 0.8 | see above |
+| SQLAlchemy 1.4, 2.0, 2.1 with psycopg2 | `inspect(engine)`: tables, views, columns, primary, foreign and unique keys, indexes, check constraints, compared with PostgreSQL 16 by `scripts/sqlalchemy-check.py` (run by hand). Remaining differences: check constraint text lacks PostgreSQL's casts (`score >= 0` instead of `score >= 0::numeric`), and view columns of type `varchar(n)` are reported as `text`. |
 
 ## Protocol coverage
 

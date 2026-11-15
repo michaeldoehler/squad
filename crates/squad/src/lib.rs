@@ -28,6 +28,7 @@
 mod advisory;
 mod agg;
 mod api;
+mod backends;
 pub mod bind;
 pub mod catalog;
 mod columnar;

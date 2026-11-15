@@ -38,7 +38,10 @@ How the evidence is produced is described in [testing](testing.md).
   `bool_or`, `every`, `bit_and`, `bit_or`, `string_agg`, `array_agg`,
   `json_agg`, `jsonb_agg`, `json_object_agg`, `jsonb_object_agg`,
   `variance`, `var_pop`, `var_samp`, `stddev`, `stddev_pop`,
-  `stddev_samp`; with `DISTINCT`, `ORDER BY` and `FILTER`.
+  `stddev_samp`; with `DISTINCT`, `ORDER BY` and `FILTER`. The
+  ordered-set aggregates `percentile_cont`, `percentile_disc` (with one
+  fraction or an array of them) and `mode` with `WITHIN GROUP (ORDER BY
+  …)`, also with `FILTER`.
 - **Window functions:** `row_number`, `rank`, `dense_rank`,
   `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`,
   `last_value`, `nth_value` and every aggregate, with `PARTITION BY`,
@@ -63,7 +66,8 @@ How the evidence is produced is described in [testing](testing.md).
   CONSTRAINT`, `RENAME TO`, `RENAME COLUMN`, `RENAME CONSTRAINT`.
 - **Columnar tables** (not in PostgreSQL): `CREATE TABLE … USING
   columnar [WITH (order_by = 'a, b')]`, with the aggregates
-  `approx_count_distinct(x)` and `approx_percentile(x, p)`. `INSERT`,
+  `approx_count_distinct(x)` (also called `approx_distinct(x)`, the name
+  Trino and Apache Superset use) and `approx_percentile(x, p)`. `INSERT`,
   `COPY FROM`, `DELETE`, `TRUNCATE`, `DROP TABLE`, and `ALTER TABLE`
   `ADD COLUMN` (constant default), `DROP COLUMN`, `RENAME COLUMN`,
   `RENAME TO`, `ALTER COLUMN SET/DROP DEFAULT`, `DROP NOT NULL`. Not
@@ -143,7 +147,7 @@ These fail with SQLSTATE `0A000` (`feature_not_supported`) or an
 | `INSERT … ON CONFLICT DO UPDATE` on a table whose row-level security policies apply to the statement | `DO NOTHING` works; see [security](security.md) |
 | `SET ROLE`, `SET SESSION AUTHORIZATION` to a name other than the login | there are no roles; the login's own name, `NONE` and `DEFAULT` are accepted |
 | `GROUPING SETS`, `ROLLUP`, `CUBE` | |
-| Ordered-set aggregates (`percentile_cont`, `mode`, `WITHIN GROUP`) | |
+| Hypothetical-set aggregates (`rank(x) WITHIN GROUP (ORDER BY …)` and `dense_rank`, `percent_rank`, `cume_dist` in that form) | the window functions of the same names are supported |
 | Correlated subqueries above `GROUP BY` | a subquery in the select list or `HAVING` of a grouped query that refers to the outer query's columns |
 | SQL cursors (`DECLARE`, `FETCH`) | protocol-level portals work |
 | `LISTEN` / `NOTIFY` | |
@@ -170,6 +174,7 @@ These fail with SQLSTATE `0A000` (`feature_not_supported`) or an
 | `uuid` | `gen_random_uuid()`, `uuid_generate_v4()` |
 | `json`, `jsonb` | `jsonb` numbers do not keep trailing zeros (`1.50` is stored as `1.5`) |
 | arrays | **one-dimensional only**; lower bound always 1 |
+| `int2vector`, `oidvector` | as in `pg_index.indkey` / `indclass`: space-separated text form, subscripts from 0, `= ANY`, `unnest`, `generate_subscripts`, `array_position` and the other array functions. A cast to an array type (`indkey::int2[]`) and the array functions that return arrays (`array_append`, `array_cat`, `array_remove`, …) return arrays with lower bound 1; PostgreSQL keeps the lower bound 0 (`[0:2]={3,1,4}`), so a subscript of such a result picks a different element. `int2vector = int2[]` is accepted (PostgreSQL has no such operator). |
 | enums | labels can be appended, not inserted or renamed |
 | `oid`, `"char"`, `name`, `regclass`, `regtype` | present as far as catalog queries need them; `regclass` values print as numbers in some places where Postgres prints names |
 
@@ -212,7 +217,9 @@ These fail with SQLSTATE `0A000` (`feature_not_supported`) or an
 `pg_namespace`, `pg_index`, `pg_constraint`, `pg_attrdef`, `pg_enum`,
 `pg_sequence(s)`, `pg_tables`, `pg_views`, `pg_indexes`, `pg_database`,
 `pg_roles`, `pg_policy`, `pg_policies`, `pg_settings`, `pg_am`, `pg_collation`, `pg_extension`,
-`pg_stat_activity` and others with content, and about a hundred more
+`pg_opclass` (the default B-tree operator classes), `pg_stat_activity`
+(every open session, see [server](server.md#cancelling-queries)) and
+others with content, and about a hundred more
 relations with the right columns and no rows, so that queries joining
 them still run. `information_schema` has `tables`, `columns`,
 `schemata`, `table_constraints`, `key_column_usage`,
@@ -223,8 +230,9 @@ Helper functions include `format_type`, `pg_get_expr`,
 `pg_get_indexdef`, `pg_get_constraintdef`, `pg_get_viewdef`,
 `pg_get_serial_sequence`, `pg_table_is_visible`, `to_regclass`,
 `current_schema(s)`, `current_setting`, `set_config`, `version`,
-`pg_typeof`, the `has_*_privilege` family (always true) and the size
-functions (which return 0).
+`pg_typeof`, `pg_cancel_backend`, `pg_terminate_backend`, the
+`has_*_privilege` family (always true) and the size functions (which
+return 0).
 
 ## Reporting a difference
 

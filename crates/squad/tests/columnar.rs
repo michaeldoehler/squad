@@ -85,6 +85,7 @@ const QUERIES: &[&str] = &[
     "SELECT name, rank() OVER (ORDER BY count(*) DESC, name) FROM {t} GROUP BY name ORDER BY 2",
     "SELECT count(*) FROM (SELECT DISTINCT user_id, name FROM {t}) s",
     "SELECT name, count(*) FROM {t} GROUP BY name HAVING count(*) > 10 ORDER BY count(*) DESC, name LIMIT 2",
+    "SELECT name, percentile_cont(0.5) WITHIN GROUP (ORDER BY duration), percentile_disc(0.9) WITHIN GROUP (ORDER BY revenue), mode() WITHIN GROUP (ORDER BY project) FROM {t} GROUP BY name ORDER BY name",
 ];
 
 fn rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
@@ -173,8 +174,18 @@ fn approximate_aggregates_are_close() {
         assert!((distinct - 20000).abs() < 1000, "{stage}: distinct estimate {distinct}");
         assert!((p50 - 500.0).abs() < 15.0, "{stage}: median estimate {p50}");
         assert!((p99 - 990.0).abs() < 15.0, "{stage}: p99 estimate {p99}");
+        // approx_distinct is the same aggregate under the name Trino and
+        // Apache Superset use, and takes the same fast path.
+        let alias: i64 = conn.query_one("SELECT approx_distinct(u) FROM e", &[]).unwrap().get(0);
+        assert_eq!(alias, distinct, "{stage}");
+        let plan = rows(&conn, "EXPLAIN SELECT d, approx_distinct(u) FROM e GROUP BY d");
+        assert!(plan[0][0].starts_with("Columnar"), "{stage}: {plan:?}");
         conn.batch_execute("VACUUM e").unwrap();
     }
+    // On an ordinary table both names count exactly.
+    conn.batch_execute("CREATE TABLE r (u int); INSERT INTO r VALUES (1), (2), (2), (NULL)").unwrap();
+    let row = conn.query_one("SELECT approx_distinct(u), approx_count_distinct(u) FROM r", &[]).unwrap();
+    assert_eq!((row.get::<i64>(0), row.get::<i64>(1)), (2, 2));
     let err = conn.query("SELECT approx_percentile(d, 2) FROM e", &[]).unwrap_err();
     assert_eq!(err.code(), sqlstate::INVALID_PARAMETER_VALUE);
 }

@@ -1,52 +1,51 @@
-//! Array functions (one-dimensional arrays, lower bound 1).
+//! Array functions (one-dimensional arrays, lower bound 1, and the
+//! vector types `int2vector` and `oidvector`, lower bound 0).
 
 use std::cmp::Ordering;
 
 use super::f_string::{int, txt};
 use super::io;
-use super::ops::{self, bad_arg};
+use super::ops::{self, bad_arg, items};
 use super::registry::{Registry, Ret, P};
 use crate::error::sqlstate;
 use crate::types::compare;
 use crate::{Error, FnCtx, Result, Type, Value};
 
-fn items(v: &Value) -> Result<&[Value]> {
-    match v {
-        Value::Array(i) => Ok(i),
-        _ => Err(bad_arg()),
-    }
+/// Elements and lower bound of an array argument, and whether it has a
+/// dimension. An empty array has none; an empty vector still has one
+/// (PostgreSQL reports `[0:-1]` for it).
+fn dims(v: &Value) -> Result<(&[Value], i32, bool)> {
+    let (items, lower) = v.array_items().ok_or_else(bad_arg)?;
+    Ok((items, lower, !items.is_empty() || matches!(v, Value::Vector(_))))
 }
 
-fn dim_len(a: &[Value]) -> Result<Value> {
-    let arr = items(&a[0])?;
-    Ok(if int(&a[1])? == 1 && !arr.is_empty() { Value::Int4(arr.len() as i32) } else { Value::Null })
-}
 fn array_length(_: &FnCtx, a: &[Value]) -> Result<Value> {
-    dim_len(a)
+    let (arr, _, has_dim) = dims(&a[0])?;
+    Ok(if int(&a[1])? == 1 && has_dim { Value::Int4(arr.len() as i32) } else { Value::Null })
 }
 fn array_upper(_: &FnCtx, a: &[Value]) -> Result<Value> {
-    dim_len(a)
+    let (arr, lower, has_dim) = dims(&a[0])?;
+    Ok(if int(&a[1])? == 1 && has_dim { Value::Int4(lower + arr.len() as i32 - 1) } else { Value::Null })
 }
 fn array_lower(_: &FnCtx, a: &[Value]) -> Result<Value> {
-    let arr = items(&a[0])?;
-    Ok(if int(&a[1])? == 1 && !arr.is_empty() { Value::Int4(1) } else { Value::Null })
+    let (_, lower, has_dim) = dims(&a[0])?;
+    Ok(if int(&a[1])? == 1 && has_dim { Value::Int4(lower) } else { Value::Null })
 }
 fn cardinality(_: &FnCtx, a: &[Value]) -> Result<Value> {
     Ok(Value::Int4(items(&a[0])?.len() as i32))
 }
 fn array_ndims(_: &FnCtx, a: &[Value]) -> Result<Value> {
-    Ok(if items(&a[0])?.is_empty() { Value::Null } else { Value::Int4(1) })
+    Ok(if dims(&a[0])?.2 { Value::Int4(1) } else { Value::Null })
 }
 fn array_dims(_: &FnCtx, a: &[Value]) -> Result<Value> {
-    let arr = items(&a[0])?;
-    Ok(if arr.is_empty() { Value::Null } else { Value::Text(format!("[1:{}]", arr.len())) })
+    let (arr, lower, has_dim) = dims(&a[0])?;
+    Ok(if has_dim { Value::Text(format!("[{lower}:{}]", lower + arr.len() as i32 - 1)) } else { Value::Null })
 }
 fn array_cat(_: &FnCtx, a: &[Value]) -> Result<Value> {
     Ok(match (&a[0], &a[1]) {
         (Value::Null, Value::Null) => Value::Null,
-        (Value::Array(x), Value::Null) | (Value::Null, Value::Array(x)) => Value::Array(x.clone()),
-        (Value::Array(x), Value::Array(y)) => Value::Array(x.iter().chain(y).cloned().collect()),
-        _ => return Err(bad_arg()),
+        (x, Value::Null) | (Value::Null, x) => Value::Array(items(x)?.to_vec()),
+        (x, y) => Value::Array(items(x)?.iter().chain(items(y)?).cloned().collect()),
     })
 }
 fn same(a: &Value, b: &Value) -> bool {
@@ -60,12 +59,12 @@ fn array_position(_: &FnCtx, a: &[Value]) -> Result<Value> {
     if a[0].is_null() {
         return Ok(Value::Null);
     }
-    let arr = items(&a[0])?;
+    let (arr, lower, _) = dims(&a[0])?;
     let start = match a.get(2) {
         Some(Value::Null) => {
             return Err(Error::new(sqlstate::NULL_VALUE_NOT_ALLOWED, "initial position must not be null"))
         }
-        Some(v) => (int(v)?.max(1) - 1) as usize,
+        Some(v) => (int(v)?.max(lower as i64) - lower as i64) as usize,
         None => 0,
     };
     Ok(arr
@@ -73,19 +72,15 @@ fn array_position(_: &FnCtx, a: &[Value]) -> Result<Value> {
         .enumerate()
         .skip(start)
         .find(|(_, v)| same(v, &a[1]))
-        .map_or(Value::Null, |(i, _)| Value::Int4(i as i32 + 1)))
+        .map_or(Value::Null, |(i, _)| Value::Int4(i as i32 + lower)))
 }
 fn array_positions(_: &FnCtx, a: &[Value]) -> Result<Value> {
     if a[0].is_null() {
         return Ok(Value::Null);
     }
+    let (arr, lower, _) = dims(&a[0])?;
     Ok(Value::Array(
-        items(&a[0])?
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| same(v, &a[1]))
-            .map(|(i, _)| Value::Int4(i as i32 + 1))
-            .collect(),
+        arr.iter().enumerate().filter(|(_, v)| same(v, &a[1])).map(|(i, _)| Value::Int4(i as i32 + lower)).collect(),
     ))
 }
 fn array_remove(_: &FnCtx, a: &[Value]) -> Result<Value> {
