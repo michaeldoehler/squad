@@ -67,6 +67,9 @@ pub struct Shared {
     pub(crate) tiered: std::sync::OnceLock<Arc<squad_storage::TieredEngine>>,
     /// Advisory locks held by the sessions of this database.
     pub(crate) advisory: Arc<crate::advisory::AdvisoryLocks>,
+    /// The sessions of this database, for `pg_stat_activity` and
+    /// `pg_cancel_backend` / `pg_terminate_backend`.
+    pub(crate) backends: crate::backends::Backends,
 }
 
 /// What the apply loop of a read replica changes in a database. It
@@ -140,6 +143,7 @@ impl Shared {
             guard: Mutex::new(std::sync::Weak::new()),
             next_pid: AtomicI32::new(1),
             advisory: Arc::default(),
+            backends: Default::default(),
             database_name: database_name.to_string(),
             catalog_version: Arc::new(std::sync::atomic::AtomicU64::new(version)),
             recovery: AtomicBool::new(false),
@@ -365,26 +369,54 @@ pub struct SessionState {
 /// made while no statement runs is discarded when the next statement
 /// starts through [`Connection`](crate::Connection) or the wire protocol.
 #[derive(Debug, Clone, Default)]
-pub struct CancelHandle(Arc<AtomicBool>);
+pub struct CancelHandle(Arc<CancelFlags>);
+
+#[derive(Debug, Default)]
+struct CancelFlags {
+    requested: AtomicBool,
+    /// Set by `pg_terminate_backend`; never cleared.
+    terminated: AtomicBool,
+}
 
 impl CancelHandle {
     /// Requests cancellation of the running statement.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0.requested.store(true, Ordering::SeqCst);
+    }
+
+    /// Ends the session: the running statement and every later one fail
+    /// with `57P01`.
+    pub(crate) fn terminate(&self) {
+        self.0.terminated.store(true, Ordering::SeqCst);
+        self.cancel();
+    }
+
+    /// True once the session was terminated with `pg_terminate_backend`.
+    pub(crate) fn is_terminated(&self) -> bool {
+        self.0.terminated.load(Ordering::SeqCst)
     }
 
     /// True if a request is pending; clears it.
     pub(crate) fn take(&self) -> bool {
-        self.0.load(Ordering::Relaxed) && self.0.swap(false, Ordering::SeqCst)
+        self.0.requested.load(Ordering::Relaxed) && self.0.requested.swap(false, Ordering::SeqCst)
     }
 
     pub(crate) fn clear(&self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.0.requested.store(false, Ordering::SeqCst);
+    }
+
+    /// The error a statement stopped by this handle fails with.
+    pub(crate) fn error(&self) -> Error {
+        if self.is_terminated() {
+            terminated_error()
+        } else {
+            Error::new(sqlstate::QUERY_CANCELED, "canceling statement due to user request")
+        }
     }
 }
 
-pub(crate) fn canceled_error() -> Error {
-    Error::new(sqlstate::QUERY_CANCELED, "canceling statement due to user request")
+pub(crate) fn terminated_error() -> Error {
+    Error::new(sqlstate::ADMIN_SHUTDOWN, "terminating connection due to administrator command")
 }
 
 /// Command tag and kind of a statement.
@@ -502,6 +534,9 @@ pub struct Session {
     /// Keeps the database's background work running while the session
     /// exists (absent for the background work's own sessions).
     _guard: Option<Arc<CloseGuard>>,
+    /// The session's entry in `pg_stat_activity` (absent for the
+    /// background work's own sessions).
+    backend: Option<Arc<crate::backends::Backend>>,
 }
 
 fn now_micros() -> i64 {
@@ -517,6 +552,9 @@ impl Session {
         let guard = shared.guard.lock().upgrade();
         let mut session = Session::internal(shared);
         session._guard = guard;
+        let backends = &session.shared.backends;
+        session.backend =
+            Some(backends.register(session.state.pid, session.state.cancel.clone(), now_micros(), &session.state.user));
         session
     }
 
@@ -547,6 +585,7 @@ impl Session {
             replans: HashMap::new(),
             spare_txn: None,
             _guard: None,
+            backend: None,
         }
     }
 
@@ -568,6 +607,62 @@ impl Session {
         self.state.cancel.clone()
     }
 
+    /// True once another session ended this one with
+    /// `pg_terminate_backend`: every statement now fails with `57P01`, and
+    /// the owner should close the session.
+    pub fn is_terminated(&self) -> bool {
+        self.state.cancel.is_terminated()
+    }
+
+    /// Installs a function that `pg_terminate_backend` calls after it
+    /// marked this session as terminated, so that an owner waiting for
+    /// something else (a server connection waiting for its client) can
+    /// notice. It runs on the terminating session's thread.
+    pub fn set_terminate_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        if let Some(b) = &self.backend {
+            b.set_terminate_hook(Box::new(hook));
+        }
+    }
+
+    /// Updates this session's row in `pg_stat_activity` from its state,
+    /// e.g. after the owner changed [`SessionState::user`].
+    pub fn refresh_activity(&self) {
+        self.report_activity(None);
+    }
+
+    /// Records in `pg_stat_activity` that a statement starts (`Some`) or
+    /// ended (`None`).
+    fn report_activity(&self, query: Option<&str>) {
+        let Some(backend) = &self.backend else { return };
+        let now = now_micros();
+        let mut a = backend.activity.lock();
+        a.state = match (query, &self.txn) {
+            (Some(_), _) => "active",
+            (None, Some(t)) if t.failed => "idle in transaction (aborted)",
+            (None, Some(t)) if t.explicit => "idle in transaction",
+            (None, _) => "idle",
+        };
+        if let Some(q) = query {
+            a.query.clear();
+            a.query.push_str(q);
+            a.query_start = Some(now);
+        }
+        a.xact_start = match &self.txn {
+            Some(t) if query.is_none() && !t.explicit => None,
+            Some(t) => Some(t.start_time),
+            None if query.is_some() => Some(now),
+            None => None,
+        };
+        a.state_change = now;
+        if a.user != self.state.user {
+            a.user.clone_from(&self.state.user);
+        }
+        let app = self.state.settings.get("application_name").map_or("", String::as_str);
+        if a.application_name != app {
+            a.application_name = app.to_string();
+        }
+    }
+
     /// Discards a cancel request that arrived while no statement ran.
     /// Call it before starting a new request.
     pub fn clear_cancel(&self) {
@@ -576,8 +671,8 @@ impl Session {
 
     /// Fails with 57014 if a cancel request is pending (and clears it).
     pub fn check_canceled(&self) -> Result<()> {
-        if self.state.cancel.take() {
-            return Err(canceled_error());
+        if self.state.cancel.take() || self.state.cancel.is_terminated() {
+            return Err(self.state.cancel.error());
         }
         Ok(())
     }
@@ -657,6 +752,7 @@ impl Session {
         if result.is_err() {
             if let Some(t) = &mut self.txn {
                 t.failed = true;
+                self.report_activity(None);
             }
         }
         result
@@ -906,7 +1002,23 @@ impl Session {
         };
 
         self.state.notices.clear();
-        let result = match &stmt.kind {
+        if self.state.cancel.is_terminated() {
+            return Err(terminated_error());
+        }
+        self.report_activity(Some(&stmt.sql));
+        let result = self.run_prepared(stmt, params);
+        self.report_activity(None);
+        let notices = std::mem::take(&mut self.state.notices);
+        result.map(|mut r| {
+            // `EXECUTE` returns the result of the statement it ran, which
+            // already carries that statement's notices.
+            r.notices.extend(notices);
+            r
+        })
+    }
+
+    fn run_prepared(&mut self, stmt: &Prepared, params: &[Value]) -> Result<QueryResult> {
+        match &stmt.kind {
             Kind::Empty => Ok(QueryResult::default()),
             Kind::Utility(node) => {
                 let n = node.node.as_ref().ok_or_else(|| Error::internal("empty utility statement"))?;
@@ -924,14 +1036,7 @@ impl Session {
                 let result = self.run_plan(stmt, plan, *subqueries, tables, *read_only, &params);
                 self.after_statement(result)
             }
-        };
-        let notices = std::mem::take(&mut self.state.notices);
-        result.map(|mut r| {
-            // `EXECUTE` returns the result of the statement it ran, which
-            // already carries that statement's notices.
-            r.notices.extend(notices);
-            r
-        })
+        }
     }
 
     /// Queues a notice for the result of the running statement.
@@ -1460,6 +1565,9 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.rollback();
         self.shared.advisory.release_all(self.state.pid, true, true);
+        if self.backend.is_some() {
+            self.shared.backends.unregister(self.state.pid);
+        }
     }
 }
 

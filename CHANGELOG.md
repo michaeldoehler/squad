@@ -128,11 +128,19 @@ preparing it for production use.
   and 2.x (Apache Superset) works. `indclass` holds the default B-tree
   operator class of each column, `indcollation` the column's collation,
   and `pg_opclass` lists those classes.
-- `scripts/sqlalchemy-check.py`: compares SQLAlchemy's schema
-  introspection of squad with that of PostgreSQL.
 - `approx_distinct(x)`, another name of `approx_count_distinct(x)` with
   the same fast path on columnar tables; Apache Superset writes it for
   its approximate distinct count.
+- `pg_cancel_backend(pid)` and `pg_terminate_backend(pid [, timeout])`.
+  `pg_stat_activity` lists every open session of the database (server
+  connections and connections of the embedding application) with pid,
+  user, application name, state and statement. A terminated server
+  connection gets `FATAL 57P01` and is closed; a terminated embedded
+  connection fails every statement with `57P01`.
+  `Session::is_terminated`, `Session::set_terminate_hook` and
+  `Session::refresh_activity`.
+- `scripts/sqlalchemy-check.py`: compares SQLAlchemy's schema
+  introspection of squad with that of PostgreSQL.
 
 ### Changed
 
@@ -197,9 +205,11 @@ preparing it for production use.
   `engine_bench`, so that example names are unique in the workspace.
 
 ### Fixed
-
 - `pg_index.indkey` and `indoption` were `smallint[]` (`'{1,2,4}'`)
   instead of `int2vector` (`'1 2 4'`); SQLAlchemy failed to parse them.
+- `pg_stat_activity` showed only the calling session, and
+  `pg_cancel_backend` / `pg_terminate_backend` did not exist.
+
 - Damage in the middle of the write-ahead log (a record that later
   records show was already durable) made recovery drop every later
   commit silently; the open now fails with a corruption error and

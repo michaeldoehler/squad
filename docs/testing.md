@@ -125,7 +125,9 @@ when the tools are missing.
   from PostgreSQL loads; `pgbench` initializes and runs its TPC-B-like
   and select-only scripts and the resulting balances are verified.
 - `tokio-postgres` and `sqlx` run typed queries, transactions, array
-  parameters, custom enum types and sqlx's migrator.
+  parameters, custom enum types and sqlx's migrator; tokio-postgres also
+  stops queries with `pg_cancel_backend` and `pg_terminate_backend`
+  found through `pg_stat_activity`, as Apache Superset does.
 - On demand, `scripts/sqlalchemy-check.py` creates the same tables in
   squad and in PostgreSQL 16 and compares what SQLAlchemy's inspector
   (indexes, keys, columns, constraints) reports for both; it needs

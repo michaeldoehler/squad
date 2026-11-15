@@ -110,7 +110,7 @@ impl<'a> ExecCx<'a> {
     #[cold]
     pub(crate) fn check_interrupts_now(&mut self) -> Result<()> {
         if self.session.cancel.take() {
-            return Err(crate::session::canceled_error());
+            return Err(self.session.cancel.error());
         }
         if self.deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(Error::new(sqlstate::QUERY_CANCELED, "canceling statement due to statement timeout"));

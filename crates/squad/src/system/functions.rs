@@ -93,6 +93,7 @@ pub(crate) fn catalog_fn_type(name: &str, args: usize) -> Option<Type> {
             1 | 2,
         ) => Type::Void,
         ("pg_advisory_unlock_all", 0) => Type::Void,
+        ("pg_cancel_backend", 1) | ("pg_terminate_backend", 1 | 2) => Type::Bool,
         (
             "pg_advisory_unlock"
             | "pg_advisory_unlock_shared"
@@ -249,6 +250,9 @@ fn start_time() -> i64 {
 
 pub(crate) fn catalog_fn(name: &str, args: Vec<Value>, cx: &mut ExecCx) -> Result<Value> {
     if let Some(result) = crate::advisory::call(name, &args, cx) {
+        return result;
+    }
+    if let Some(result) = crate::backends::call(name, &args, cx) {
         return result;
     }
     let env = Env::new(cx);

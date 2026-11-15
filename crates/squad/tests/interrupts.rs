@@ -208,3 +208,122 @@ fn lock_table_modes() {
     a.batch_execute("LOCK TABLE t IN EXCLUSIVE MODE").unwrap();
     a.batch_execute("ROLLBACK").unwrap();
 }
+
+fn pid(conn: &squad::Connection) -> i32 {
+    conn.query_one("SELECT pg_backend_pid()", &[]).unwrap().get(0)
+}
+
+#[test]
+fn pg_stat_activity_lists_every_connection() {
+    let db = Database::open_in_memory().unwrap();
+    let (a, b) = (db.connect(), db.connect());
+    let a_pid = pid(&a);
+    a.batch_execute("SET application_name = 'worker'; BEGIN").unwrap();
+    let row = b
+        .query_one(
+            "SELECT application_name, state, query, xact_start IS NOT NULL, backend_type FROM pg_stat_activity WHERE pid = $1",
+            &[&a_pid],
+        )
+        .unwrap();
+    let got: (String, String, String, bool, String) = (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
+    assert_eq!(got, ("worker".into(), "idle in transaction".into(), "BEGIN".into(), true, "client backend".into()));
+    a.batch_execute("SELECT 1/0").unwrap_err();
+    let state = |c: &squad::Connection| -> String {
+        c.query_one("SELECT state FROM pg_stat_activity WHERE pid = $1", &[&a_pid]).unwrap().get(0)
+    };
+    assert_eq!(state(&b), "idle in transaction (aborted)");
+    a.batch_execute("ROLLBACK").unwrap();
+    assert_eq!(state(&b), "idle");
+    // The calling session is active, with its own statement.
+    let own: (String, String) = {
+        let r = b.query_one("SELECT state, query FROM pg_stat_activity WHERE pid = pg_backend_pid()", &[]).unwrap();
+        (r.get(0), r.get(1))
+    };
+    assert_eq!(own, ("active".into(), "SELECT state, query FROM pg_stat_activity WHERE pid = pg_backend_pid()".into()));
+    let n: i64 = b.query_one("SELECT count(*) FROM pg_stat_activity", &[]).unwrap().get(0);
+    assert_eq!(n, 2);
+    // A closed connection is gone from the list.
+    drop(a);
+    let n: i64 = b.query_one("SELECT count(*) FROM pg_stat_activity WHERE pid = $1", &[&a_pid]).unwrap().get(0);
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn pg_cancel_backend_cancels_the_statement_of_another_connection() {
+    let db = Database::open_in_memory().unwrap();
+    let (a, b) = (db.connect(), db.connect());
+    let a_pid = pid(&a);
+    let worker = {
+        let a = a.clone();
+        std::thread::spawn(move || a.query(ENDLESS, &[]))
+    };
+    let started = Instant::now();
+    while !worker.is_finished() {
+        std::thread::sleep(Duration::from_millis(20));
+        let ok: bool = b
+            .query_one("SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE pid = $1", &[&a_pid])
+            .unwrap()
+            .get(0);
+        assert!(ok);
+        assert!(started.elapsed() < Duration::from_secs(60), "the query was not cancelled");
+    }
+    let err = worker.join().unwrap().unwrap_err();
+    assert_eq!((err.code(), err.message()), ("57014", "canceling statement due to user request"));
+    // Only the statement was cancelled.
+    assert_eq!(a.query_one("SELECT 7", &[]).unwrap().get::<i32>(0), 7);
+    // Cancelling the calling session stops the calling statement.
+    assert_eq!(b.query("SELECT pg_cancel_backend(pg_backend_pid())", &[]).unwrap_err().code(), "57014");
+    assert_eq!(b.query_one("SELECT 8", &[]).unwrap().get::<i32>(0), 8);
+}
+
+#[test]
+fn pg_terminate_backend_ends_another_connection() {
+    let db = Database::open_in_memory().unwrap();
+    let (a, b) = (db.connect(), db.connect());
+    let a_pid = pid(&a);
+    let worker = {
+        let a = a.clone();
+        std::thread::spawn(move || a.query(ENDLESS, &[]))
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    let ok: bool = b.query_one("SELECT pg_terminate_backend($1)", &[&a_pid]).unwrap().get(0);
+    assert!(ok);
+    let err = worker.join().unwrap().unwrap_err();
+    assert_eq!((err.code(), err.message()), ("57P01", "terminating connection due to administrator command"));
+    // Every later statement fails the same way.
+    assert_eq!(a.query("SELECT 1", &[]).unwrap_err().code(), "57P01");
+    assert_eq!(a.batch_execute("ROLLBACK").unwrap_err().code(), "57P01");
+    // With a timeout, the call waits until the connection is closed.
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(a);
+    });
+    let ok: bool = b.query_one("SELECT pg_terminate_backend($1, 10000)", &[&a_pid]).unwrap().get(0);
+    assert!(ok);
+    closer.join().unwrap();
+    let n: i64 = b.query_one("SELECT count(*) FROM pg_stat_activity WHERE pid = $1", &[&a_pid]).unwrap().get(0);
+    assert_eq!(n, 0);
+    // A connection that stays open makes the wait time out.
+    let c = db.connect();
+    let c_pid = pid(&c);
+    let r = &b.simple_query(&format!("SELECT pg_terminate_backend({c_pid}, 50)")).unwrap()[0];
+    assert_eq!(squad::value::format_value(&r.rows[0][0], &Default::default()), "f");
+    assert_eq!(r.notices[0].message, format!("backend with PID {c_pid} did not terminate within 50 milliseconds"));
+    assert_eq!(c.query("SELECT 1", &[]).unwrap_err().code(), "57P01");
+    // Terminating the calling session ends its statement at once.
+    assert_eq!(b.query("SELECT pg_terminate_backend(pg_backend_pid())", &[]).unwrap_err().code(), "57P01");
+    assert_eq!(b.query("SELECT 1", &[]).unwrap_err().code(), "57P01");
+}
+
+#[test]
+fn signalling_an_unknown_pid_warns() {
+    let conn = memory();
+    for f in ["pg_cancel_backend", "pg_terminate_backend"] {
+        let r = &conn.simple_query(&format!("SELECT {f}(123456)")).unwrap()[0];
+        assert_eq!(squad::value::format_value(&r.rows[0][0], &Default::default()), "f");
+        assert_eq!(r.notices.len(), 1);
+        assert_eq!(r.notices[0].severity, Severity::Warning);
+        assert_eq!(r.notices[0].message, "PID 123456 is not a PostgreSQL backend process");
+    }
+    assert_eq!(conn.query("SELECT pg_terminate_backend(1, -1)", &[]).unwrap_err().code(), "22003");
+}

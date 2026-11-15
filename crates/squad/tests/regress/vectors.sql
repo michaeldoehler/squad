@@ -1,4 +1,5 @@
--- int2vector and oidvector, as pg_index uses them.
+-- int2vector and oidvector, as pg_index uses them, and the functions
+-- that signal other sessions.
 CREATE TABLE vx (id int PRIMARY KEY, a int, b text, c varchar(10), d bigint, UNIQUE (b), CONSTRAINT vx_ac UNIQUE (a, c));
 CREATE INDEX vx_dca ON vx (d, c, a);
 -- text form, subscripts from 0, casts to text
@@ -23,3 +24,7 @@ SELECT '40000'::int2vector;
 SELECT 'x'::oidvector;
 SELECT ARRAY[1, 2]::int2[]::int2vector;
 SELECT format_type('int2vector'::regtype, -1), format_type('oidvector'::regtype, -1), format_type('_int2vector'::regtype, -1);
+-- pg_cancel_backend and pg_terminate_backend for a pid that is no backend
+SELECT pg_cancel_backend(2147483647), pg_terminate_backend(2147483647), pg_terminate_backend(2147483647, 10);
+SELECT pg_cancel_backend(NULL), pg_terminate_backend(NULL);
+SELECT pg_terminate_backend(2147483647, -1);

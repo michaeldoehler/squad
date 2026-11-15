@@ -199,7 +199,8 @@ These fail with SQLSTATE `0A000` (`feature_not_supported`) or an
 `pg_sequence(s)`, `pg_tables`, `pg_views`, `pg_indexes`, `pg_database`,
 `pg_roles`, `pg_settings`, `pg_am`, `pg_collation`, `pg_extension`,
 `pg_opclass` (the default B-tree operator classes), `pg_stat_activity`
-and others with content, and about a hundred more
+(every open session, see [server](server.md#cancelling-queries)) and
+others with content, and about a hundred more
 relations with the right columns and no rows, so that queries joining
 them still run. `information_schema` has `tables`, `columns`,
 `schemata`, `table_constraints`, `key_column_usage`,
@@ -210,8 +211,9 @@ Helper functions include `format_type`, `pg_get_expr`,
 `pg_get_indexdef`, `pg_get_constraintdef`, `pg_get_viewdef`,
 `pg_get_serial_sequence`, `pg_table_is_visible`, `to_regclass`,
 `current_schema(s)`, `current_setting`, `set_config`, `version`,
-`pg_typeof`, the `has_*_privilege` family (always true) and the size
-functions (which return 0).
+`pg_typeof`, `pg_cancel_backend`, `pg_terminate_backend`, the
+`has_*_privilege` family (always true) and the size functions (which
+return 0).
 
 ## Reporting a difference
 

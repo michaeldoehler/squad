@@ -3,6 +3,8 @@
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use common::start;
 use squad_server::{Auth, ServerConfig};
 use tokio_postgres::types::Type;
@@ -234,6 +236,127 @@ fn scram_login_with_the_driver() {
         let bad = format!("host=127.0.0.1 port={} user=app password=nope", addr.port());
         let err = tokio_postgres::connect(&bad, NoTls).await.err().expect("wrong password must fail");
         assert_eq!(err.as_db_error().map(|e| e.code().code().to_string()).as_deref(), Some("28P01"));
+    });
+    server.shutdown();
+}
+
+/// A query that takes far longer than any test.
+const ENDLESS: &str = "SELECT count(*) FROM generate_series(1, 100000) a, generate_series(1, 100000) b";
+
+/// Connects and also returns the connection task, whose result tells how
+/// the server ended the connection.
+async fn connect_watched(config: &str) -> (Client, tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>) {
+    let (client, connection) = tokio_postgres::connect(config, NoTls).await.expect("connect");
+    (client, tokio::spawn(connection))
+}
+
+fn sqlstate(e: &tokio_postgres::Error) -> Option<&str> {
+    e.code().map(|c| c.code())
+}
+
+#[test]
+fn pg_cancel_backend_through_pg_stat_activity() {
+    let (server, addr) = start(ServerConfig::default());
+    runtime().block_on(async {
+        let conninfo = format!("host=127.0.0.1 port={} user=squad", addr.port());
+        let lab = connect(&format!("{conninfo} application_name=sql_lab")).await;
+        let admin = connect(&conninfo).await;
+        let pid: i32 = lab.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+        let row = admin
+            .query_one("SELECT usename, application_name, state, query FROM pg_stat_activity WHERE pid = $1", &[&pid])
+            .await
+            .unwrap();
+        let seen: (String, String, String, String) = (row.get(0), row.get(1), row.get(2), row.get(3));
+        assert_eq!(seen, ("squad".into(), "sql_lab".into(), "idle".into(), "SELECT pg_backend_pid()".into()));
+        let pids: Vec<i32> = admin
+            .query("SELECT pid FROM pg_stat_activity ORDER BY pid", &[])
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        assert_eq!(pids.len(), 2, "{pids:?}");
+
+        // How Apache Superset stops a query of SQL Lab, with the pid as a
+        // string literal.
+        let stop = format!("SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE pid = '{pid}'");
+        let canceller = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let state: String =
+                    admin.query_one("SELECT state FROM pg_stat_activity WHERE pid = $1", &[&pid]).await.unwrap().get(0);
+                if state == "active" {
+                    break;
+                }
+            }
+            let query: String =
+                admin.query_one("SELECT query FROM pg_stat_activity WHERE pid = $1", &[&pid]).await.unwrap().get(0);
+            assert_eq!(query, ENDLESS);
+            let ok: bool = admin.query_one(stop.as_str(), &[]).await.unwrap().get(0);
+            assert!(ok);
+        };
+        let started = Instant::now();
+        let (result, ()) = tokio::join!(lab.query_one(ENDLESS, &[]), canceller);
+        let err = result.unwrap_err();
+        assert_eq!(sqlstate(&err), Some("57014"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(30));
+        // Only the statement ends; the connection stays usable.
+        assert_eq!(lab.query_one("SELECT 7", &[]).await.unwrap().get::<_, i32>(0), 7);
+    });
+    server.shutdown();
+}
+
+#[test]
+fn pg_terminate_backend_closes_the_connection() {
+    let (server, addr) = start(ServerConfig::default());
+    runtime().block_on(async {
+        let conninfo = format!("host=127.0.0.1 port={} user=squad", addr.port());
+        let admin = connect(&conninfo).await;
+        let terminate =
+            |pid: i32| format!("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid = '{pid}'");
+
+        // A connection that is running a statement: the statement fails
+        // with 57P01 and the server closes the connection.
+        let (busy, busy_conn) = connect_watched(&conninfo).await;
+        let pid: i32 = busy.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+        let killer = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let ok: bool = admin.query_one(terminate(pid).as_str(), &[]).await.unwrap().get(0);
+            assert!(ok);
+        };
+        let (result, ()) = tokio::join!(busy.query_one(ENDLESS, &[]), killer);
+        let err = result.unwrap_err();
+        assert_eq!(sqlstate(&err), Some("57P01"), "{err}");
+        assert_eq!(
+            err.as_db_error().map(|e| (e.severity(), e.message())),
+            Some(("FATAL", "terminating connection due to administrator command"))
+        );
+        let _ = busy_conn.await.unwrap();
+        assert!(busy.is_closed());
+        assert!(busy.query_one("SELECT 1", &[]).await.is_err());
+
+        // An idle connection is closed at once, with the same error.
+        let (idle, idle_conn) = connect_watched(&conninfo).await;
+        let pid: i32 = idle.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+        let ok: bool = admin.query_one("SELECT pg_terminate_backend($1::int, 5000)", &[&pid]).await.unwrap().get(0);
+        assert!(ok, "the session should be gone within the timeout");
+        let err = tokio::time::timeout(Duration::from_secs(10), idle_conn).await.unwrap().unwrap().unwrap_err();
+        assert_eq!(sqlstate(&err), Some("57P01"), "{err}");
+        let left: i64 =
+            admin.query_one("SELECT count(*) FROM pg_stat_activity WHERE pid = $1", &[&pid]).await.unwrap().get(0);
+        assert_eq!(left, 0);
+
+        // Terminating oneself.
+        let (me, me_conn) = connect_watched(&conninfo).await;
+        let err = me.query_one("SELECT pg_terminate_backend(pg_backend_pid())", &[]).await.unwrap_err();
+        assert_eq!(sqlstate(&err), Some("57P01"), "{err}");
+        let _ = me_conn.await.unwrap();
+        assert!(me.is_closed());
+
+        // Unknown pids give false, and the other connections live on.
+        let ok: bool = admin.query_one("SELECT pg_terminate_backend(2147483647)", &[]).await.unwrap().get(0);
+        assert!(!ok);
+        assert_eq!(admin.query_one("SELECT 1", &[]).await.unwrap().get::<_, i32>(0), 1);
     });
     server.shutdown();
 }

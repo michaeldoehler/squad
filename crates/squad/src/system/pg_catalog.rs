@@ -643,23 +643,49 @@ pub(super) fn scan(name: &str, rel: &Rel, env: &Env, cx: &mut ExecCx) -> Vec<Row
                 out.push(row![rel; "oid" => oid, "spcname" => spcname, "spcowner" => OWNER_OID]);
             }
         }
-        "pg_stat_activity" => out.push(row![rel;
-            "datid" => DATABASE_OID,
-            "datname" => &env.database,
-            "pid" => cx.session.pid,
-            "usesysid" => OWNER_OID,
-            "usename" => &env.user,
-            "application_name" => cx.session.settings.get("application_name").cloned().unwrap_or_default(),
-            "backend_start" => Value::TimestampTz(cx.fn_ctx.txn_time),
-            "xact_start" => Value::TimestampTz(cx.fn_ctx.txn_time),
-            "query_start" => Value::TimestampTz(cx.fn_ctx.stmt_time),
-            "state_change" => Value::TimestampTz(cx.fn_ctx.stmt_time),
-            "state" => "active",
-            "query" => "",
-            "backend_type" => "client backend",
-        ]),
+        "pg_stat_activity" => {
+            let backends = cx.shared.backends.list();
+            if !backends.iter().any(|b| b.pid == cx.session.pid) {
+                // A session of the database's own background work.
+                out.push(row![rel;
+                    "datid" => DATABASE_OID,
+                    "datname" => &env.database,
+                    "pid" => cx.session.pid,
+                    "usesysid" => OWNER_OID,
+                    "usename" => &env.user,
+                    "application_name" => cx.session.settings.get("application_name").cloned().unwrap_or_default(),
+                    "backend_start" => Value::TimestampTz(cx.fn_ctx.txn_time),
+                    "xact_start" => Value::TimestampTz(cx.fn_ctx.txn_time),
+                    "query_start" => Value::TimestampTz(cx.fn_ctx.stmt_time),
+                    "state_change" => Value::TimestampTz(cx.fn_ctx.stmt_time),
+                    "state" => "active",
+                    "query" => "",
+                    "backend_type" => "client backend",
+                ]);
+            }
+            let ts = |t: Option<i64>| t.map_or(Value::Null, Value::TimestampTz);
+            for b in backends {
+                let a = b.activity.lock().clone();
+                out.push(row![rel;
+                    "datid" => DATABASE_OID,
+                    "datname" => &env.database,
+                    "pid" => b.pid,
+                    "usesysid" => OWNER_OID,
+                    "usename" => a.user,
+                    "application_name" => a.application_name,
+                    "backend_start" => Value::TimestampTz(b.backend_start),
+                    "xact_start" => ts(a.xact_start),
+                    "query_start" => ts(a.query_start),
+                    "state_change" => Value::TimestampTz(a.state_change),
+                    "state" => a.state,
+                    "query" => a.query,
+                    "backend_type" => "client backend",
+                ]);
+            }
+        }
         "pg_stat_database" => {
-            out.push(row![rel; "datid" => DATABASE_OID, "datname" => &env.database, "numbackends" => 1])
+            let n = cx.shared.backends.list().len().max(1) as i32;
+            out.push(row![rel; "datid" => DATABASE_OID, "datname" => &env.database, "numbackends" => n])
         }
         "pg_stat_user_tables" | "pg_stat_all_tables" | "pg_statio_user_tables" => {
             for t in cat.tables.values() {
