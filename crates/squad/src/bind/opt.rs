@@ -2,7 +2,7 @@
 //! access path selection, join method selection and sort elimination.
 
 use super::{Binder, Scope};
-use crate::expr::Expr;
+use crate::expr::{Expr, SessionFn};
 use crate::plan::{JoinKind, Plan, ScanPlan, SortKey};
 use crate::types::Type;
 use crate::Result;
@@ -148,6 +148,15 @@ impl<'a> Binder<'a> {
             Expr::EnumCast(_, t) => Type::Enum(t.name.clone()),
             Expr::Call(f, _) => f.ret.clone(),
             Expr::Coalesce(items) | Expr::MinMax(items, _) => self.type_of(items.first()?, input)?,
+            Expr::Session(
+                SessionFn::CurrentSetting
+                | SessionFn::CurrentUser
+                | SessionFn::CurrentSchema
+                | SessionFn::CurrentDatabase
+                | SessionFn::Version,
+                _,
+            ) => Type::Text,
+            Expr::Session(SessionFn::BackendPid, _) => Type::Int4,
             _ => return None,
         })
     }
@@ -265,16 +274,23 @@ impl<'a> Binder<'a> {
 
     fn push(&mut self, plan: Plan, mut preds: Vec<Expr>, types: &[Type]) -> Plan {
         match plan {
+            // A condition already in place (a row-level security policy)
+            // stays ahead of the pushed ones, so that they only see rows
+            // it lets through.
             Plan::Scan(mut scan) => {
+                let mut all = Vec::new();
                 if let Some(f) = scan.filter.take() {
-                    conjuncts(f, &mut preds);
+                    conjuncts(f, &mut all);
                 }
-                scan.filter = and_all(preds);
+                all.append(&mut preds);
+                scan.filter = and_all(all);
                 Plan::Scan(self.choose_access_path(scan, types))
             }
             Plan::Filter(input, f) => {
-                conjuncts(f, &mut preds);
-                self.push(*input, preds, types)
+                let mut all = Vec::new();
+                conjuncts(f, &mut all);
+                all.append(&mut preds);
+                self.push(*input, all, types)
             }
             plan @ Plan::NestedLoop { kind: JoinKind::Inner, lateral: false, index_join: false, .. }
                 if inner_join_leaves(&plan) >= 3 =>

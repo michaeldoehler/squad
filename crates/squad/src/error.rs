@@ -213,6 +213,11 @@ impl Notice {
         self.hint = Some(hint.into());
         self
     }
+
+    pub fn with_code(mut self, code: &'static str) -> Notice {
+        self.code = code;
+        self
+    }
 }
 
 impl fmt::Display for Notice {

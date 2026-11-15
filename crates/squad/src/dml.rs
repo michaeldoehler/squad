@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use squad_kv::{Isolation, LockMode};
 
+use crate::bind::RlsCheck;
 use crate::catalog::{object_prefix, FkAction, ForeignKey, Index, Table};
 use crate::encoding::{encode_key, encode_row};
 use crate::exec::{collect, decode_table_row, refresh_locked_row, row_key, ExecCx, Refreshed};
@@ -56,7 +57,13 @@ fn unique_violation(table: &Table, name: &str, cols: &[usize], row: &[Value], cx
         .with_detail(format!("Key ({})=({}) already exists.", col_names(table, cols), show_list(row, cols, cx)))
 }
 
-fn check_row(table: &Table, checks: &[(String, Expr)], row: &[Value], cx: &mut ExecCx) -> Result<()> {
+fn check_row(table: &Table, rls: &[RlsCheck], checks: &[(String, Expr)], row: &[Value], cx: &mut ExecCx) -> Result<()> {
+    // Row-level security comes first, as in PostgreSQL.
+    for check in rls {
+        if !check.expr.test(row, cx)? {
+            return Err(check.violation(table));
+        }
+    }
     for (i, col) in table.columns.iter().enumerate() {
         // Rows of columnar tables have no row id.
         if col.not_null && row[i].is_null() && !(col.hidden && table.columnar.is_some()) {
@@ -355,7 +362,7 @@ fn handle_incoming_fks(table: &Arc<Table>, old: &[Value], new: Option<&[Value]>,
                             _ => Value::Null,
                         };
                     }
-                    update_row(&child, &[], &row, updated, cx)?;
+                    update_row(&child, &[], &[], &row, updated, cx)?;
                 }
             }
         }
@@ -377,8 +384,15 @@ fn delete_row(table: &Arc<Table>, row: &[Value], cx: &mut ExecCx) -> Result<()> 
 
 /// Replaces `old` by `new`, maintaining indexes and constraints. The
 /// caller holds the exclusive lock on the old row.
-fn update_row(table: &Arc<Table>, checks: &[(String, Expr)], old: &[Value], new: Row, cx: &mut ExecCx) -> Result<()> {
-    check_row(table, checks, &new, cx)?;
+fn update_row(
+    table: &Arc<Table>,
+    rls: &[RlsCheck],
+    checks: &[(String, Expr)],
+    old: &[Value],
+    new: Row,
+    cx: &mut ExecCx,
+) -> Result<()> {
+    check_row(table, rls, checks, &new, cx)?;
     let old_key = row_key(table, old);
     let new_key = row_key(table, &new);
     let moved = old_key != new_key;
@@ -427,7 +441,7 @@ pub(crate) fn insert(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
 pub(crate) fn insert_columnar(plan: &InsertPlan, rows: Vec<Row>, cx: &mut ExecCx) -> Result<Vec<Row>> {
     let table = &plan.table;
     for row in &rows {
-        check_row(table, &plan.checks, row, cx)?;
+        check_row(table, &plan.rls_checks, &plan.checks, row, cx)?;
     }
     if rows.len() >= crate::columnar::BULK_INSERT_ROWS && plan.returning.is_none() {
         crate::columnar::bulk_insert(table, &rows, cx)?;
@@ -472,7 +486,7 @@ fn insert_stream(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
             None => source.next(cx)?,
         };
         let Some(row) = row else { break };
-        check_row(table, &plan.checks, &row, cx)?;
+        check_row(table, &plan.rls_checks, &plan.checks, &row, cx)?;
         let key = row_key(table, &row);
         match find_conflict(table, &row, &key, &key, false, cx)? {
             None => {
@@ -536,7 +550,8 @@ fn insert_stream(plan: &InsertPlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
                         for (col, e) in set {
                             updated[*col] = e.eval(&both, cx)?;
                         }
-                        update_row(table, &plan.checks, &existing, updated.clone(), cx)?;
+                        // ON CONFLICT DO UPDATE is refused where policies apply.
+                        update_row(table, &[], &plan.checks, &existing, updated.clone(), cx)?;
                         touched.insert(row_key(table, &updated));
                         cx.rows_affected += 1;
                         returning(&plan.returning, &updated, &mut out, cx)?;
@@ -619,7 +634,7 @@ pub(crate) fn update(plan: &UpdatePlan, cx: &mut ExecCx) -> Result<Vec<Row>> {
         changes.push((src, old, new));
     }
     for (mut src, old, new) in changes {
-        update_row(table, &plan.checks, &old, new.clone(), cx)?;
+        update_row(table, &plan.rls_checks, &plan.checks, &old, new.clone(), cx)?;
         cx.rows_affected += 1;
         if plan.returning.is_some() {
             src.splice(..width, new);

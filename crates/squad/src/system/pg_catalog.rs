@@ -126,8 +126,8 @@ fn class_row(
         "relhasrules" => kind == 'v',
         "relhastriggers" => table.is_some_and(|t| has_fk_triggers(env, t)),
         "relhassubclass" => false,
-        "relrowsecurity" => false,
-        "relforcerowsecurity" => false,
+        "relrowsecurity" => table.is_some_and(|t| t.row_security),
+        "relforcerowsecurity" => table.is_some_and(|t| t.force_row_security),
         "relispopulated" => true,
         "relreplident" => if kind == 'r' { 'd' } else { 'n' },
         "relispartition" => false,
@@ -183,7 +183,7 @@ fn user_type_row(
     ]
 }
 
-fn role_row(rel: &Rel, env: &Env) -> Row {
+fn role_row(rel: &Rel, oid: i64, name: &str, privileged: bool) -> Row {
     // The union of the columns of pg_roles, pg_authid, pg_user and
     // pg_shadow; each relation picks the ones it has.
     let has = |c: &str| rel.cols.iter().any(|x| x.0 == c);
@@ -193,10 +193,12 @@ fn role_row(rel: &Rel, env: &Env) -> Row {
             r[rel.pos(c)] = v;
         }
     };
-    set("oid", Value::Int8(OWNER_OID));
-    set("usesysid", Value::Int8(OWNER_OID));
-    set("rolname", Value::Text(env.user.clone()));
-    set("usename", Value::Text(env.user.clone()));
+    set("oid", Value::Int8(oid));
+    set("usesysid", Value::Int8(oid));
+    set("rolname", Value::Text(name.to_string()));
+    set("usename", Value::Text(name.to_string()));
+    set("rolinherit", Value::Bool(true));
+    set("rolcanlogin", Value::Bool(true));
     for c in [
         "rolsuper",
         "rolinherit",
@@ -210,12 +212,26 @@ fn role_row(rel: &Rel, env: &Env) -> Row {
         "userepl",
         "usebypassrls",
     ] {
-        set(c, Value::Bool(true));
+        if c != "rolinherit" && c != "rolcanlogin" {
+            set(c, Value::Bool(privileged));
+        }
     }
     set("rolconnlimit", Value::Int4(-1));
     set("rolpassword", Value::Text("********".into()));
     set("passwd", Value::Text("********".into()));
     r
+}
+
+/// A policy expression as `pg_get_expr` shows it: PostgreSQL puts an
+/// operator expression in parentheses; a bare column or constant stays as
+/// it is.
+fn policy_expr_text(sql: &str) -> String {
+    let simple = sql.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '"' || c == '.');
+    if simple {
+        sql.to_string()
+    } else {
+        format!("({sql})")
+    }
 }
 
 pub(super) fn scan(name: &str, rel: &Rel, env: &Env, cx: &mut ExecCx) -> Vec<Row> {
@@ -419,7 +435,49 @@ pub(super) fn scan(name: &str, rel: &Rel, env: &Env, cx: &mut ExecCx) -> Vec<Row
             "datcollate" => "C",
             "datctype" => "C",
         ]),
-        "pg_roles" | "pg_authid" | "pg_user" | "pg_shadow" => out.push(role_row(rel, env)),
+        "pg_roles" | "pg_authid" | "pg_user" | "pg_shadow" => {
+            for (oid, name) in env.roles() {
+                out.push(role_row(rel, oid, &name, oid == OWNER_OID && env.bypass_rls));
+            }
+        }
+        "pg_policy" => {
+            for t in cat.tables.values() {
+                for p in &t.policies {
+                    let roles: Vec<i64> = if p.roles.is_empty() {
+                        vec![0]
+                    } else {
+                        p.roles.iter().filter_map(|r| env.role_oid(r)).collect()
+                    };
+                    out.push(row![rel;
+                        "oid" => oid_of(p.id),
+                        "polname" => &p.name,
+                        "polrelid" => oid_of(t.id),
+                        "polcmd" => p.command.code(),
+                        "polpermissive" => p.permissive,
+                        "polroles" => roles,
+                        "polqual" => p.using.as_deref().map_or(Value::Null, |e| Value::Text(policy_expr_text(e))),
+                        "polwithcheck" => p.check.as_deref().map_or(Value::Null, |e| Value::Text(policy_expr_text(e))),
+                    ]);
+                }
+            }
+        }
+        "pg_policies" => {
+            for t in cat.tables.values() {
+                for p in &t.policies {
+                    let roles = if p.roles.is_empty() { vec!["public".to_string()] } else { p.roles.clone() };
+                    out.push(row![rel;
+                        "schemaname" => &t.schema,
+                        "tablename" => &t.name,
+                        "policyname" => &p.name,
+                        "permissive" => if p.permissive { "PERMISSIVE" } else { "RESTRICTIVE" },
+                        "roles" => roles,
+                        "cmd" => p.command.name(),
+                        "qual" => p.using.as_deref().map_or(Value::Null, |e| Value::Text(policy_expr_text(e))),
+                        "with_check" => p.check.as_deref().map_or(Value::Null, |e| Value::Text(policy_expr_text(e))),
+                    ]);
+                }
+            }
+        }
         "pg_settings" => {
             let mut names: Vec<String> = SETTINGS.iter().map(|s| s.to_string()).collect();
             names.extend(cx.session.settings.keys().filter(|k| !SETTINGS.contains(&k.as_str())).cloned());

@@ -23,7 +23,7 @@ use crate::{sqlstate, Error, Notice, Result};
 
 const ROWID_COLUMN: &str = "__rowid";
 
-fn done(tag: &str) -> Result<QueryResult> {
+pub(crate) fn done(tag: &str) -> Result<QueryResult> {
     Ok(QueryResult { tag: tag.to_string(), ..Default::default() })
 }
 
@@ -78,7 +78,10 @@ pub(crate) fn show_setting(state: &SessionState, name: &str) -> Result<String> {
         "server_version" => crate::SERVER_VERSION.to_string(),
         "server_version_num" => crate::SERVER_VERSION_NUM.to_string(),
         "server_encoding" | "client_encoding" => "UTF8".to_string(),
-        "standard_conforming_strings" | "integer_datetimes" | "is_superuser" => "on".to_string(),
+        "standard_conforming_strings" | "integer_datetimes" => "on".to_string(),
+        "is_superuser" => if state.bypass_rls { "on" } else { "off" }.to_string(),
+        "row_security" => if state.row_security { "on" } else { "off" }.to_string(),
+        "role" => "none".to_string(),
         "datestyle" => "ISO, MDY".to_string(),
         "intervalstyle" => "postgres".to_string(),
         "max_identifier_length" => "63".to_string(),
@@ -88,7 +91,9 @@ pub(crate) fn show_setting(state: &SessionState, name: &str) -> Result<String> {
         "extra_float_digits" => "1".to_string(),
         "client_min_messages" => "notice".to_string(),
         "bytea_output" => "hex".to_string(),
-        "transaction_read_only" | "default_transaction_read_only" => "off".to_string(),
+        "transaction_read_only" | "default_transaction_read_only" => {
+            if state.default_read_only || state.read_only_login { "on" } else { "off" }.to_string()
+        }
         "max_connections" => "100".to_string(),
         "lc_collate" | "lc_ctype" => "C".to_string(),
         "session_authorization" => state.user.clone(),
@@ -131,6 +136,38 @@ fn parse_isolation(value: &str) -> Result<Isolation> {
     }
 }
 
+/// PostgreSQL's spellings of a Boolean setting.
+pub(crate) fn truthy(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" | "t" | "y" => Some(true),
+        "off" | "false" | "no" | "0" | "f" | "n" => Some(false),
+        _ => None,
+    }
+}
+
+fn bool_setting(name: &str, value: &str) -> Result<bool> {
+    truthy(value).ok_or_else(|| {
+        Error::new(sqlstate::INVALID_PARAMETER_VALUE, format!("parameter \"{name}\" requires a Boolean value"))
+    })
+}
+
+/// A custom setting such as `app.current_tenant`: any name with a dot.
+/// Once set, it exists for the rest of the session; resetting it makes
+/// it empty, as for PostgreSQL's placeholder variables.
+fn is_custom(name: &str) -> bool {
+    name.contains('.')
+}
+
+/// Settings that `SET` and `set_config` refuse whatever the value.
+pub(crate) fn check_settable(_state: &SessionState, name: &str) -> Result<()> {
+    match name.to_ascii_lowercase().as_str() {
+        "server_version" | "server_version_num" | "server_encoding" | "integer_datetimes" | "is_superuser" => {
+            Err(Error::new("55P02", format!("parameter \"{name}\" cannot be changed")))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Applies `SET name = value`; `None` resets to the default.
 pub(crate) fn apply_setting(state: &mut SessionState, name: &str, value: Option<&str>) -> Result<()> {
     let lower = name.to_ascii_lowercase();
@@ -167,6 +204,10 @@ pub(crate) fn apply_setting(state: &mut SessionState, name: &str, value: Option<
         "default_transaction_isolation" => {
             state.default_isolation = value.map(parse_isolation).transpose()?.unwrap_or_default();
         }
+        "default_transaction_read_only" => {
+            state.default_read_only = value.map(|v| bool_setting(name, v)).transpose()?.unwrap_or(false);
+        }
+        "row_security" => state.row_security = value.map(|v| bool_setting(name, v)).transpose()?.unwrap_or(true),
         "client_encoding" => match value {
             Some(v) if !matches!(v.to_ascii_uppercase().as_str(), "UTF8" | "UTF-8" | "UNICODE" | "DEFAULT") => {
                 return Err(Error::new(
@@ -176,12 +217,26 @@ pub(crate) fn apply_setting(state: &mut SessionState, name: &str, value: Option<
             }
             _ => {}
         },
+        "role" | "session_authorization" => {
+            // There are no roles to switch to: the session runs as its
+            // login, and only "switching" to the login itself is accepted.
+            if value.is_some_and(|v| v != state.user && !v.eq_ignore_ascii_case("none")) {
+                return Err(Error::new(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    format!("squad has no roles; the session cannot switch from login \"{}\"", state.user),
+                )
+                .with_hint("Connect with another login instead."));
+            }
+        }
         "server_version" | "server_version_num" | "server_encoding" | "integer_datetimes" | "is_superuser" => {
-            return Err(Error::new("55P02", format!("parameter \"{name}\" cannot be changed")))
+            check_settable(state, name)?;
         }
         _ => match value {
             Some(v) => {
                 state.settings.insert(lower, v.to_string());
+            }
+            None if is_custom(&lower) => {
+                state.settings.insert(lower, String::new());
             }
             None => {
                 state.settings.remove(&lower);
@@ -189,6 +244,21 @@ pub(crate) fn apply_setting(state: &mut SessionState, name: &str, value: Option<
         },
     }
     Ok(())
+}
+
+/// `RESET ALL`: every setting back to its default.
+fn reset_all(state: &mut SessionState) {
+    state.settings.retain(|k, _| is_custom(k));
+    for v in state.settings.values_mut() {
+        v.clear();
+    }
+    state.search_path = vec!["public".to_string()];
+    state.tz = chrono_tz::UTC;
+    state.lock_timeout = None;
+    state.statement_timeout = None;
+    state.default_isolation = Isolation::default();
+    state.default_read_only = false;
+    state.row_security = true;
 }
 
 fn const_text(n: &pb::Node) -> Option<String> {
@@ -561,6 +631,9 @@ fn create_table(sess: &mut Session, stmt: &pb::CreateStmt) -> Result<QueryResult
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             columnar: None,
+            row_security: false,
+            force_row_security: false,
+            policies: Vec::new(),
         };
         let mut specs = Vec::new();
         let mut table_constraints: Vec<pb::Constraint> = Vec::new();
@@ -809,7 +882,7 @@ fn find_table(catalog: &Catalog, rv: &pb::RangeVar, path: &[String]) -> Result<A
     catalog.table(schema, name, path).cloned().ok_or_else(|| undefined_table(name))
 }
 
-fn put_table(catalog: &mut Catalog, table: Table) {
+pub(crate) fn put_table(catalog: &mut Catalog, table: Table) {
     catalog.tables.insert((table.schema.clone(), table.name.clone()), Arc::new(table));
 }
 
@@ -823,8 +896,9 @@ fn create_index(sess: &mut Session, stmt: &pb::IndexStmt) -> Result<QueryResult>
     }
     let path = sess.state.search_path.clone();
     let wait = WaitPolicy::Wait(sess.state.lock_timeout);
-    let built = sess.alter_catalog(|catalog, txn, _, _| {
+    let built = sess.alter_catalog(|catalog, txn, _, state| {
         let table = find_table(catalog, rv, &path)?;
+        crate::policy::require_owner_if_protected(state, &table)?;
         if table.columnar.is_some() {
             return Err(feature("indexes on columnar tables"));
         }
@@ -944,6 +1018,7 @@ fn drop_objects(sess: &mut Session, stmt: &pb::DropStmt) -> Result<QueryResult> 
         O::ObjectView => "DROP VIEW",
         O::ObjectType => "DROP TYPE",
         O::ObjectSchema => "DROP SCHEMA",
+        O::ObjectPolicy => "DROP POLICY",
         O::ObjectExtension => return done("DROP EXTENSION"),
         other => return Err(feature(&format!("DROP for {other:?}"))),
     };
@@ -957,9 +1032,13 @@ fn drop_objects(sess: &mut Session, stmt: &pb::DropStmt) -> Result<QueryResult> 
         });
     }
     let mut dropped_objects = Vec::new();
-    let resets = sess.alter_catalog(|catalog, txn, _, _| {
+    let resets = sess.alter_catalog(|catalog, txn, _, state| {
         let mut resets = Vec::new();
         for parts in &names {
+            if kind == O::ObjectPolicy {
+                crate::policy::drop_policy(catalog, state, parts, &path, stmt.missing_ok)?;
+                continue;
+            }
             let (schema, name) = qualified(parts);
             let missing = |what: &str| -> Result<()> {
                 if stmt.missing_ok {
@@ -981,6 +1060,7 @@ fn drop_objects(sess: &mut Session, stmt: &pb::DropStmt) -> Result<QueryResult> 
                         missing("table")?;
                         continue;
                     };
+                    crate::policy::require_owner_if_protected(state, &table)?;
                     Session::lock_table_exclusive(txn, table.id, wait)?;
                     let dependents: Vec<(Arc<Table>, ForeignKey)> =
                         catalog.referencing(table.id).into_iter().filter(|(t, _)| t.id != table.id).collect();
@@ -1015,6 +1095,7 @@ fn drop_objects(sess: &mut Session, stmt: &pb::DropStmt) -> Result<QueryResult> 
                         missing("index")?;
                         continue;
                     };
+                    crate::policy::require_owner_if_protected(state, &table)?;
                     let index = &table.indexes[pos];
                     if index.constraint {
                         return Err(Error::new(
@@ -1100,6 +1181,9 @@ fn drop_objects(sess: &mut Session, stmt: &pb::DropStmt) -> Result<QueryResult> 
                             format!("cannot drop schema {name} because other objects depend on it"),
                         )
                         .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
+                    }
+                    for t in &tables {
+                        crate::policy::require_owner_if_protected(state, t)?;
                     }
                     for t in tables {
                         Session::lock_table_exclusive(txn, t.id, wait)?;
@@ -1301,11 +1385,61 @@ fn alter_table_cmd(sess: &mut Session, rv: &pb::RangeVar, cmd: &pb::AlterTableCm
     let cascade = cmd.behavior == pb::DropBehavior::DropCascade as i32;
 
     // Lock the table and read its current definition and rows.
-    let table = sess.alter_catalog(|catalog, txn, _, _| {
+    let table = sess.alter_catalog(|catalog, txn, _, state| {
         let table = find_table(catalog, rv, path)?;
+        crate::policy::require_owner_if_protected(state, &table)?;
         Session::lock_table_exclusive(txn, table.id, wait)?;
         Ok(table)
     })?;
+    let row_security = match kind {
+        A::AtEnableRowSecurity => Some((Some(true), None)),
+        A::AtDisableRowSecurity => Some((Some(false), None)),
+        A::AtForceRowSecurity => Some((None, Some(true))),
+        A::AtNoForceRowSecurity => Some((None, Some(false))),
+        _ => None,
+    };
+    if let Some((enable, force)) = row_security {
+        return sess.alter_catalog(|catalog, _, _, state| {
+            crate::policy::set_row_security(catalog, state, &table, enable, force)
+        });
+    }
+    // Columns that policies use cannot change type, nor be dropped
+    // unless the policies go with them (CASCADE).
+    let table = match crate::policy::policies_using_column(&table, &cmd.name).first() {
+        Some(p) if kind == A::AtAlterColumnType => {
+            return Err(Error::new(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot alter type of a column used in a policy definition",
+            )
+            .with_detail(format!("policy {} on table {} depends on column \"{}\"", p.name, table.name, cmd.name)));
+        }
+        Some(p) if kind == A::AtDropColumn && !cascade => {
+            return Err(Error::new(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                format!("cannot drop column {} of table {} because other objects depend on it", cmd.name, table.name),
+            )
+            .with_detail(format!(
+                "policy {} on table {} depends on column {} of table {}",
+                p.name, table.name, cmd.name, table.name
+            ))
+            .with_hint("Use DROP ... CASCADE to drop the dependent objects too."));
+        }
+        Some(_) if kind == A::AtDropColumn => {
+            let doomed: Vec<String> =
+                crate::policy::policies_using_column(&table, &cmd.name).iter().map(|p| p.name.clone()).collect();
+            for name in &doomed {
+                sess.notice(Notice::info(format!("drop cascades to policy {name} on table {}", table.name)));
+            }
+            sess.alter_catalog(|catalog, _, _, _| {
+                let mut t = (*table).clone();
+                t.policies.retain(|p| !doomed.contains(&p.name));
+                let t = Arc::new(t);
+                catalog.tables.insert((t.schema.clone(), t.name.clone()), t.clone());
+                Ok(t)
+            })?
+        }
+        _ => table,
+    };
     if table.columnar.is_some() {
         match kind {
             A::AtAddColumn | A::AtDropColumn => return alter_columnar(sess, &table, kind, cmd, path),
@@ -1317,8 +1451,6 @@ fn alter_table_cmd(sess: &mut Session, rv: &pb::RangeVar, cmd: &pb::AlterTableCm
             | A::AtClusterOn
             | A::AtSetLogged
             | A::AtSetUnLogged
-            | A::AtEnableRowSecurity
-            | A::AtDisableRowSecurity
             | A::AtSetStatistics
             | A::AtSetStorage
             | A::AtReplicaIdentity
@@ -1821,16 +1953,11 @@ fn alter_table_cmd(sess: &mut Session, rv: &pb::RangeVar, cmd: &pb::AlterTableCm
             sess.notice(Notice::info("squad has no object owners; ALTER ... OWNER TO has no effect"));
             Ok(())
         }
-        A::AtEnableRowSecurity => {
-            sess.notice(Notice::warning("squad has no row-level security; ENABLE ROW LEVEL SECURITY has no effect"));
-            Ok(())
-        }
         A::AtSetRelOptions
         | A::AtResetRelOptions
         | A::AtClusterOn
         | A::AtSetLogged
         | A::AtSetUnLogged
-        | A::AtDisableRowSecurity
         | A::AtSetStatistics
         | A::AtSetStorage
         | A::AtReplicaIdentity
@@ -1877,10 +2004,21 @@ fn rename(sess: &mut Session, stmt: &pb::RenameStmt) -> Result<QueryResult> {
         O::ObjectView => "ALTER VIEW",
         O::ObjectSchema => "ALTER SCHEMA",
         O::ObjectType => "ALTER TYPE",
+        O::ObjectPolicy => "ALTER POLICY",
         _ => "ALTER TABLE",
     };
-    sess.alter_catalog(|catalog, txn, _, _| {
+    sess.alter_catalog(|catalog, txn, _, state| {
         let rv = stmt.relation.as_ref();
+        // Renaming a table, its columns, indexes or constraints.
+        if let Some(t) = rv.and_then(|rv| {
+            let (schema, name) = range_var_name(rv);
+            match kind {
+                O::ObjectIndex => catalog.index(schema, name, &path).map(|(t, _)| t.clone()),
+                _ => catalog.table(schema, name, &path).cloned(),
+            }
+        }) {
+            crate::policy::require_owner_if_protected(state, &t)?;
+        }
         let missing = |name: &str| -> Result<()> {
             if stmt.missing_ok {
                 Ok(())
@@ -1898,6 +2036,13 @@ fn rename(sess: &mut Session, stmt: &pb::RenameStmt) -> Result<QueryResult> {
                     Session::lock_table_exclusive(txn, t.id, wait)?;
                     if catalog.relation_name_taken(&t.schema, &new) {
                         return Err(duplicate_relation(&new));
+                    }
+                    if let Some(p) = crate::policy::policies_using_column(&t, &t.name).first() {
+                        return Err(Error::new(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "cannot rename a table whose name is used in a policy definition",
+                        )
+                        .with_detail(format!("policy {} on table {} refers to the table by name", p.name, t.name)));
                     }
                     catalog.tables.remove(&(t.schema.clone(), t.name.clone()));
                     let mut t = (*t).clone();
@@ -1927,6 +2072,17 @@ fn rename(sess: &mut Session, stmt: &pb::RenameStmt) -> Result<QueryResult> {
                         sqlstate::DUPLICATE_COLUMN,
                         format!("column \"{new}\" of relation \"{}\" already exists", t.name),
                     ));
+                }
+                if let Some(p) = crate::policy::policies_using_column(&t, &stmt.subname).first() {
+                    return Err(Error::new(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot rename a column used in a policy definition",
+                    )
+                    .with_detail(format!(
+                        "policy {} on table {} depends on column \"{}\"",
+                        p.name, t.name, stmt.subname
+                    ))
+                    .with_hint("Drop the policy, rename the column and create the policy again."));
                 }
                 let mut t = (*t).clone();
                 t.columns[idx].name = new.clone();
@@ -1999,6 +2155,10 @@ fn rename(sess: &mut Session, stmt: &pb::RenameStmt) -> Result<QueryResult> {
                     ));
                 }
                 put_table(catalog, t);
+            }
+            O::ObjectPolicy => {
+                let rv = rv.ok_or_else(|| Error::internal("ALTER POLICY without table"))?;
+                crate::policy::rename_policy(catalog, state, rv, &path, &stmt.subname, &new)?;
             }
             other => return Err(feature(&format!("RENAME for {other:?}"))),
         }
@@ -2259,6 +2419,9 @@ fn truncate(sess: &mut Session, stmt: &pb::TruncateStmt) -> Result<QueryResult> 
         }
         i += 1;
     }
+    for table in &tables {
+        crate::policy::require_owner_if_protected(&sess.state, table)?;
+    }
     sess.start_statement()?;
     let shared = sess.shared.clone();
     let t = sess.txn.as_mut().unwrap();
@@ -2324,6 +2487,9 @@ fn create_table_as(sess: &mut Session, stmt: &pb::CreateTableAsStmt) -> Result<Q
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             columnar: None,
+            row_security: false,
+            force_row_security: false,
+            policies: Vec::new(),
         };
         let qualified = quote_qualified(&schema, name);
         put_table(catalog, table);
@@ -2352,19 +2518,17 @@ fn transaction(sess: &mut Session, stmt: &pb::TransactionStmt) -> Result<QueryRe
     match K::try_from(stmt.kind).unwrap_or(K::Undefined) {
         K::TransStmtBegin | K::TransStmtStart => {
             let mut isolation = None;
-            let mut read_only = false;
+            let mut read_only = None;
             for (name, arg) in def_elems(&stmt.options) {
                 let value = arg.and_then(const_text).unwrap_or_default();
                 match name {
                     "transaction_isolation" => isolation = Some(parse_isolation(&value)?),
                     "transaction_read_only" => {
-                        read_only = matches!(value.as_str(), "1" | "on" | "true");
-                        if !read_only && sess.shared.in_recovery() {
-                            return Err(Error::new(
-                                sqlstate::READ_ONLY_SQL_TRANSACTION,
-                                "cannot set transaction read-write mode on a read replica",
-                            ));
+                        let ro = matches!(value.as_str(), "1" | "on" | "true");
+                        if !ro && sess.state.forced_read_only(&sess.shared) {
+                            return Err(read_write_refused(sess));
                         }
+                        read_only = Some(ro);
                     }
                     _ => {}
                 }
@@ -2378,14 +2542,13 @@ fn transaction(sess: &mut Session, stmt: &pb::TransactionStmt) -> Result<QueryRe
                     t.explicit = true;
                     t.batch = false;
                     if isolation.is_some_and(|i| i != t.txn.isolation()) && !t.txn.has_writes() {
-                        sess.rollback();
-                        sess.begin(isolation, true)?;
+                        sess.restart_transaction(isolation, true)?;
                     }
                 }
                 None => sess.begin(isolation, true)?,
             }
-            if let Some(t) = &mut sess.txn {
-                t.txn.set_read_only(read_only || sess.shared.in_recovery());
+            if let (Some(ro), Some(t)) = (read_only, &mut sess.txn) {
+                t.txn.set_read_only(ro);
             }
             done("BEGIN")
         }
@@ -2423,46 +2586,104 @@ fn transaction(sess: &mut Session, stmt: &pb::TransactionStmt) -> Result<QueryRe
     }
 }
 
+/// `SET TRANSACTION READ ONLY / READ WRITE` and `SET transaction_read_only`.
+fn set_transaction_read_only(sess: &mut Session, read_only: bool) -> Result<()> {
+    if !read_only && sess.state.forced_read_only(&sess.shared) {
+        return Err(read_write_refused(sess));
+    }
+    if let Some(t) = &mut sess.txn {
+        t.txn.set_read_only(read_only);
+    }
+    Ok(())
+}
+
+fn read_write_refused(sess: &Session) -> Error {
+    let msg = if sess.shared.in_recovery() {
+        "cannot set transaction read-write mode on a read replica".to_string()
+    } else {
+        format!("cannot set transaction read-write mode: login \"{}\" is read-only", sess.state.user)
+    };
+    Error::new(sqlstate::READ_ONLY_SQL_TRANSACTION, msg)
+}
+
+/// `SET [LOCAL] transaction_isolation`, `SET TRANSACTION ISOLATION LEVEL`.
+fn set_transaction_isolation(sess: &mut Session, iso: Isolation) -> Result<()> {
+    let Some(t) = &sess.txn else { return Ok(()) };
+    if t.txn.isolation() == iso {
+        return Ok(());
+    }
+    if t.txn.has_writes() {
+        return Err(Error::new(
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+            "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+        ));
+    }
+    let (explicit, read_only) = (t.explicit, t.txn.is_read_only());
+    sess.restart_transaction(Some(iso), explicit)?;
+    if let Some(t) = &mut sess.txn {
+        t.txn.set_read_only(read_only);
+    }
+    Ok(())
+}
+
 fn set_variable(sess: &mut Session, stmt: &pb::VariableSetStmt) -> Result<QueryResult> {
     use pb::VariableSetKind as K;
     let kind = K::try_from(stmt.kind).unwrap_or(K::Undefined);
     let values: Vec<String> = stmt.args.iter().filter_map(const_text).collect();
+    let in_txn = sess.txn.is_some();
+    let local = stmt.is_local;
+    if local && !in_txn && kind != K::VarSetMulti {
+        sess.notice(
+            Notice::warning("SET LOCAL can only be used in transaction blocks")
+                .with_code(sqlstate::NO_ACTIVE_SQL_TRANSACTION),
+        );
+        // The name is known from now on, empty.
+        if is_custom(&stmt.name) {
+            sess.state.settings.entry(stmt.name.to_ascii_lowercase()).or_default();
+        }
+        return done("SET");
+    }
     match kind {
         K::VarSetValue | K::VarSetCurrent => {
-            let value = if stmt.name == "search_path" {
-                values.join(", ")
-            } else {
-                values.first().cloned().unwrap_or_default()
-            };
-            if stmt.name.eq_ignore_ascii_case("transaction_isolation") {
-                // SET transaction_isolation acts on the current block.
-                let iso = parse_isolation(&value)?;
-                if sess.txn.as_ref().is_some_and(|t| t.txn.isolation() != iso && t.txn.has_writes()) {
-                    return Err(Error::new(
-                        sqlstate::ACTIVE_SQL_TRANSACTION,
-                        "SET TRANSACTION ISOLATION LEVEL must be called before any query",
-                    ));
-                }
-                if sess.txn.as_ref().is_some_and(|t| t.explicit) {
-                    let explicit = true;
-                    sess.rollback();
-                    sess.begin(Some(iso), explicit)?;
-                }
-                return done("SET");
+            let lower = stmt.name.to_ascii_lowercase();
+            if is_custom(&lower) && values.len() > 1 {
+                return Err(Error::new(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    format!("SET {} takes only one argument", stmt.name),
+                ));
             }
-            apply_setting(&mut sess.state, &stmt.name, Some(&value))?;
+            let value =
+                if lower == "search_path" { values.join(", ") } else { values.first().cloned().unwrap_or_default() };
+            match lower.as_str() {
+                // These act on the current transaction.
+                "transaction_isolation" => {
+                    set_transaction_isolation(sess, parse_isolation(&value)?)?;
+                    return done("SET");
+                }
+                "transaction_read_only" => {
+                    set_transaction_read_only(sess, bool_setting(&stmt.name, &value)?)?;
+                    return done("SET");
+                }
+                _ => {}
+            }
+            check_settable(&sess.state, &stmt.name)?;
+            let name = stmt.name.clone();
+            sess.state.change_settings(in_txn, local, &mut |state| apply_setting(state, &name, Some(&value)))?;
             done("SET")
         }
         K::VarSetDefault | K::VarReset => {
-            apply_setting(&mut sess.state, &stmt.name, None)?;
+            if !matches!(stmt.name.to_ascii_lowercase().as_str(), "transaction_isolation" | "transaction_read_only") {
+                check_settable(&sess.state, &stmt.name)?;
+                let name = stmt.name.clone();
+                sess.state.change_settings(in_txn, local, &mut |state| apply_setting(state, &name, None))?;
+            }
             done(if kind == K::VarReset { "RESET" } else { "SET" })
         }
         K::VarResetAll => {
-            sess.state.settings.clear();
-            sess.state.search_path = vec!["public".to_string()];
-            sess.state.tz = chrono_tz::UTC;
-            sess.state.lock_timeout = None;
-            sess.state.statement_timeout = None;
+            sess.state.change_settings(in_txn, false, &mut |state| {
+                reset_all(state);
+                Ok(())
+            })?;
             done("RESET")
         }
         K::VarSetMulti => {
@@ -2474,31 +2695,23 @@ fn set_variable(sess: &mut Session, stmt: &pb::VariableSetStmt) -> Result<QueryR
                     "transaction_isolation" => {
                         let iso = parse_isolation(&value)?;
                         if session_wide {
-                            sess.state.default_isolation = iso;
-                        } else if let Some(t) = &sess.txn {
-                            if t.txn.isolation() != iso {
-                                if t.txn.has_writes() {
-                                    return Err(Error::new(
-                                        sqlstate::ACTIVE_SQL_TRANSACTION,
-                                        "SET TRANSACTION ISOLATION LEVEL must be called before any query",
-                                    ));
-                                }
-                                let explicit = t.explicit;
-                                sess.rollback();
-                                sess.begin(Some(iso), explicit)?;
-                            }
+                            sess.state.change_settings(in_txn, false, &mut |state| {
+                                state.default_isolation = iso;
+                                Ok(())
+                            })?;
+                        } else {
+                            set_transaction_isolation(sess, iso)?;
                         }
                     }
                     "transaction_read_only" => {
                         let read_only = matches!(value.as_str(), "1" | "on" | "true");
-                        if !read_only && sess.shared.in_recovery() {
-                            return Err(Error::new(
-                                sqlstate::READ_ONLY_SQL_TRANSACTION,
-                                "cannot set transaction read-write mode on a read replica",
-                            ));
-                        }
-                        if let Some(t) = &mut sess.txn {
-                            t.txn.set_read_only(read_only);
+                        if session_wide {
+                            sess.state.change_settings(in_txn, false, &mut |state| {
+                                state.default_read_only = read_only;
+                                Ok(())
+                            })?;
+                        } else {
+                            set_transaction_read_only(sess, read_only)?;
                         }
                     }
                     _ => {}
@@ -2580,10 +2793,10 @@ pub(crate) fn run_utility(sess: &mut Session, stmt: &N, _params: &[Value]) -> Re
                     Isolation::Serializable => "serializable".to_string(),
                 }
             } else if s.name.eq_ignore_ascii_case("transaction_read_only") {
-                // The open transaction's mode; a replica is always read-only.
+                // The open transaction's mode, or the one the next gets.
                 let read_only = match &sess.txn {
                     Some(t) if t.explicit => t.txn.is_read_only(),
-                    _ => sess.shared.in_recovery(),
+                    _ => sess.state.forced_read_only(&sess.shared) || sess.state.default_read_only,
                 };
                 if read_only { "on" } else { "off" }.to_string()
             } else {
@@ -2662,8 +2875,14 @@ pub(crate) fn run_utility(sess: &mut Session, stmt: &N, _params: &[Value]) -> Re
             done(if s.isall { "DEALLOCATE ALL" } else { "DEALLOCATE" })
         }
         N::DiscardStmt(_) => {
+            if sess.txn.as_ref().is_some_and(|t| t.explicit) {
+                return Err(Error::new(
+                    sqlstate::ACTIVE_SQL_TRANSACTION,
+                    "DISCARD ALL cannot run inside a transaction block",
+                ));
+            }
             sess.named.clear();
-            sess.state.settings.clear();
+            reset_all(&mut sess.state);
             sess.state.currval.clear();
             sess.state.lastval = None;
             done("DISCARD ALL")
@@ -2760,6 +2979,8 @@ pub(crate) fn run_utility(sess: &mut Session, stmt: &N, _params: &[Value]) -> Re
         N::AlterRoleStmt(_) | N::AlterRoleSetStmt(_) => no_effect(sess, "ALTER ROLE", roles_notice("ALTER ROLE")),
         N::DropRoleStmt(_) => no_effect(sess, "DROP ROLE", roles_notice("DROP ROLE")),
         N::LockStmt(s) => lock_tables(sess, s),
+        N::CreatePolicyStmt(s) => crate::policy::create_policy(sess, s),
+        N::AlterPolicyStmt(s) => crate::policy::alter_policy(sess, s),
         N::ConstraintsSetStmt(s) => {
             if s.deferred {
                 // DEFERRABLE is accepted, but every constraint is checked

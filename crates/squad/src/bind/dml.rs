@@ -6,8 +6,8 @@ use pg_query::protobuf::{self as pb, node::Node as N};
 
 use super::expr::Typed;
 use super::query::OutputColumn;
-use super::{node, parse_expr, range_var_name, Binder, DeclaredType, Scope};
-use crate::catalog::{Column, Relation, Table};
+use super::{node, parse_expr, range_var_name, reads_target, Binder, DeclaredType, Scope};
+use crate::catalog::{Column, PolicyCommand, Relation, Table};
 use crate::expr::{Expr, SessionFn};
 use crate::plan::{DeletePlan, InsertPlan, JoinKind, OnConflict, Plan, ScanPlan, UpdatePlan};
 use crate::types::{Type, Value};
@@ -262,7 +262,18 @@ impl<'a> Binder<'a> {
         };
         let (returning, out) = self.bind_returning(&ins.returning_clause, &scope)?;
         let checks = self.bind_checks(&table)?;
-        Ok((Plan::Insert(Box::new(InsertPlan { table, source, on_conflict, checks, returning })), out))
+        let mut rls_checks = Vec::new();
+        if self.rls_applies(&table)? {
+            if matches!(on_conflict, Some(OnConflict::Update { .. })) {
+                return Err(Error::unsupported("INSERT ... ON CONFLICT DO UPDATE on a table with row-level security"));
+            }
+            rls_checks = self.rls_checks(&table, PolicyCommand::Insert, false)?;
+            // Rows returned must also be visible: SELECT policies.
+            if returning.is_some() {
+                rls_checks.extend(self.rls_checks(&table, PolicyCommand::Select, true)?);
+            }
+        }
+        Ok((Plan::Insert(Box::new(InsertPlan { table, source, on_conflict, checks, rls_checks, returning })), out))
     }
 
     fn bind_on_conflict(&mut self, oc: &pb::OnConflictClause, table: &Arc<Table>, scope: &Scope) -> Result<OnConflict> {
@@ -368,9 +379,9 @@ impl<'a> Binder<'a> {
         Ok(set)
     }
 
-    /// Scan of the target table joined with the extra FROM / USING items
-    /// and filtered by WHERE. Returns the plan, its scope and the bound
-    /// predicate.
+    /// Scan of the target table joined with the extra FROM / USING items,
+    /// with the WHERE clause bound but not yet applied. Returns the plan,
+    /// its scope and the bound predicate.
     fn bind_modify_source(
         &mut self,
         table: &Arc<Table>,
@@ -404,8 +415,38 @@ impl<'a> Binder<'a> {
             }
             None => None,
         };
-        let plan = self.push_filter(plan, pred.clone(), &scope.types())?;
         Ok((plan, scope, pred))
+    }
+
+    /// The condition on the source rows of an UPDATE or DELETE: the
+    /// policies of the target table, then the WHERE clause. `reads` are
+    /// the other expressions over the source row (SET, RETURNING): if
+    /// they or the WHERE clause read the table, or there is a RETURNING
+    /// clause, the SELECT policies apply too, as in PostgreSQL. Returns
+    /// the condition (also re-checked on rows changed concurrently) and
+    /// whether the SELECT policies apply.
+    fn modify_condition(
+        &mut self,
+        table: &Arc<Table>,
+        command: PolicyCommand,
+        pred: Option<Expr>,
+        reads: &[&Expr],
+        returning: bool,
+    ) -> Result<(Option<Expr>, bool)> {
+        let mut conds = Vec::new();
+        let mut selects = false;
+        if self.rls_applies(table)? {
+            let width = table.columns.len();
+            let mut all: Vec<&Expr> = reads.to_vec();
+            all.extend(pred.as_ref());
+            selects = returning || reads_target(&all, width);
+            if selects {
+                conds.push(self.rls_using(table, PolicyCommand::Select)?);
+            }
+            conds.push(self.rls_using(table, command)?);
+        }
+        conds.extend(pred);
+        Ok((super::opt::and_all(conds), selects))
     }
 
     fn bind_update(&mut self, upd: &pb::UpdateStmt) -> Result<(Plan, Vec<OutputColumn>)> {
@@ -413,18 +454,33 @@ impl<'a> Binder<'a> {
         if table.columnar.is_some() {
             return Err(Error::unsupported("UPDATE on columnar tables"));
         }
-        let (source, scope, recheck) = self.bind_modify_source(&table, &alias, &upd.from_clause, &upd.where_clause)?;
+        let (source, scope, pred) = self.bind_modify_source(&table, &alias, &upd.from_clause, &upd.where_clause)?;
         self.clause = "UPDATE";
         let set = self.bind_set_list(&upd.target_list, &table, &scope)?;
         let (returning, out) = self.bind_returning(&upd.returning_clause, &scope)?;
         let checks = self.bind_checks(&table)?;
-        Ok((Plan::Update(Box::new(UpdatePlan { table, source, set, recheck, checks, returning })), out))
+        let mut reads: Vec<&Expr> = set.iter().map(|(_, e)| e).collect();
+        reads.extend(returning.iter().flatten());
+        let (recheck, selects) =
+            self.modify_condition(&table, PolicyCommand::Update, pred, &reads, returning.is_some())?;
+        let source = self.push_filter(source, recheck.clone(), &scope.types())?;
+        let mut rls_checks = Vec::new();
+        if self.rls_applies(&table)? {
+            rls_checks = self.rls_checks(&table, PolicyCommand::Update, false)?;
+            if selects {
+                rls_checks.extend(self.rls_checks(&table, PolicyCommand::Select, true)?);
+            }
+        }
+        Ok((Plan::Update(Box::new(UpdatePlan { table, source, set, recheck, checks, rls_checks, returning })), out))
     }
 
     fn bind_delete(&mut self, del: &pb::DeleteStmt) -> Result<(Plan, Vec<OutputColumn>)> {
         let (table, alias) = self.target_table(&del.relation)?;
-        let (source, scope, recheck) = self.bind_modify_source(&table, &alias, &del.using_clause, &del.where_clause)?;
+        let (source, scope, pred) = self.bind_modify_source(&table, &alias, &del.using_clause, &del.where_clause)?;
         let (returning, out) = self.bind_returning(&del.returning_clause, &scope)?;
+        let reads: Vec<&Expr> = returning.iter().flatten().collect();
+        let (recheck, _) = self.modify_condition(&table, PolicyCommand::Delete, pred, &reads, returning.is_some())?;
+        let source = self.push_filter(source, recheck.clone(), &scope.types())?;
         Ok((Plan::Delete(Box::new(DeletePlan { table, source, recheck, returning })), out))
     }
 

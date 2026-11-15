@@ -5,6 +5,7 @@ mod dml;
 mod expr;
 mod opt;
 mod query;
+mod rls;
 
 use std::sync::Arc;
 
@@ -18,6 +19,8 @@ use crate::value;
 use crate::{sqlstate, Error, Result};
 
 pub use query::OutputColumn;
+pub(crate) use rls::reads_target;
+pub use rls::{RlsCheck, RowSecurityUser};
 
 pub(crate) use expr::node_kind;
 
@@ -176,6 +179,11 @@ pub struct Binder<'a> {
     /// Tables referenced by the statement, for plan cache invalidation and
     /// table locks.
     pub tables_used: Vec<u32>,
+    /// The login the statement is bound for. `None` binds without
+    /// row-level security (definitions, internal statements).
+    pub rls: Option<RowSecurityUser>,
+    /// Tables whose policy expressions are being bound, to detect cycles.
+    rls_stack: Vec<u32>,
 }
 
 pub(crate) fn node(n: &pb::Node) -> Result<&N> {
@@ -290,6 +298,8 @@ impl<'a> Binder<'a> {
             clause: "SELECT",
             view_stack: Vec::new(),
             tables_used: Vec::new(),
+            rls: None,
+            rls_stack: Vec::new(),
         }
     }
 

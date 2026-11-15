@@ -41,6 +41,7 @@ pub mod exec;
 mod explain;
 pub mod expr;
 pub mod plan;
+mod policy;
 mod replica;
 pub mod session;
 mod system;
@@ -53,7 +54,7 @@ pub use columnar::ColumnarConfig;
 pub use convert::{FromSql, ToSql};
 pub use error::{sqlstate, Error, Notice, Result, Severity};
 pub use replica::{ReplicaConfig, ReplicationRole, ReplicationStatus};
-pub use session::{CancelHandle, QueryResult, Session, TxnStatus};
+pub use session::{CancelHandle, Login, QueryResult, Session, TxnStatus};
 pub use squad_storage::{RemoteConfig, RemoteStats, RemoteSync, SyncMode, VerifyReport};
 
 /// Object stores for [`Config::remote`]: local directories, memory and

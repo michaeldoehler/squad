@@ -116,11 +116,6 @@ fn statements_without_effect_report_a_notice() {
             "squad has no privileges; ALTER DEFAULT PRIVILEGES has no effect",
         ),
         ("ALTER TABLE t OWNER TO app", notice, "squad has no object owners; ALTER ... OWNER TO has no effect"),
-        (
-            "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
-            warning,
-            "squad has no row-level security; ENABLE ROW LEVEL SECURITY has no effect",
-        ),
         ("COMMENT ON TABLE t IS 'x'", notice, "squad does not store comments; COMMENT has no effect"),
         (
             "CREATE EXTENSION IF NOT EXISTS pgcrypto",
@@ -139,7 +134,13 @@ fn statements_without_effect_report_a_notice() {
         assert_eq!(got[0].code, if severity == warning { "01000" } else { "00000" }, "{sql}");
     }
     // Statements that do what PostgreSQL does raise nothing.
-    for sql in ["SET CONSTRAINTS ALL IMMEDIATE", "REINDEX TABLE t", "SELECT 1", "INSERT INTO t VALUES (1)"] {
+    for sql in [
+        "SET CONSTRAINTS ALL IMMEDIATE",
+        "REINDEX TABLE t",
+        "SELECT 1",
+        "INSERT INTO t VALUES (1)",
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+    ] {
         assert!(notices(sql).is_empty(), "{sql}");
     }
     // Notices are reported once, with their own statement.

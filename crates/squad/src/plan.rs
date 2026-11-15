@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::bind::RlsCheck;
 use crate::catalog::{Index, Table};
 use crate::expr::Expr;
 use crate::types::Type;
@@ -231,6 +232,8 @@ pub struct InsertPlan {
     pub on_conflict: Option<OnConflict>,
     /// CHECK constraints `(name, predicate over the table row)`.
     pub checks: Vec<(String, Expr)>,
+    /// Row-level security: conditions every inserted row must meet.
+    pub rls_checks: Vec<RlsCheck>,
     /// Over the inserted (or updated) table row.
     pub returning: Option<Vec<Expr>>,
 }
@@ -246,6 +249,8 @@ pub struct UpdatePlan {
     /// changed concurrently (Read Committed).
     pub recheck: Option<Expr>,
     pub checks: Vec<(String, Expr)>,
+    /// Row-level security: conditions every new row version must meet.
+    pub rls_checks: Vec<RlsCheck>,
     /// Over `new table row ++ extra columns`.
     pub returning: Option<Vec<Expr>>,
 }

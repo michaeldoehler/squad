@@ -1,0 +1,460 @@
+-- Row-level security, as the owner of the tables. In PostgreSQL the
+-- expected output must come from a role that is not a superuser and owns
+-- the tables (run scripts/regress-expected.sh with PGUSER set to such a
+-- role): superusers bypass every policy, owners only those of tables
+-- without FORCE ROW LEVEL SECURITY. squad's default login is treated as
+-- the owner.
+CREATE TABLE docs (id int PRIMARY KEY, tenant text NOT NULL, body text);
+INSERT INTO docs VALUES (1, 'acme', 'a1'), (2, 'globex', 'g1'), (3, 'acme', 'a2'), (4, 'initech', 'i1');
+CREATE TABLE notes (doc_id int, note text);
+INSERT INTO notes VALUES (1, 'n1'), (2, 'n2'), (3, 'n3'), (5, 'n5');
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname IN ('docs', 'notes') ORDER BY 1;
+relname|relrowsecurity|relforcerowsecurity
+docs|t|f
+notes|f|f
+(2 rows)
+-- the owner bypasses the policies unless they are forced
+SELECT count(*) FROM docs;
+count
+4
+(1 row)
+ALTER TABLE docs FORCE ROW LEVEL SECURITY;
+SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'docs';
+relname|relrowsecurity|relforcerowsecurity
+docs|t|t
+(1 row)
+-- without a policy nothing is visible or writable
+SELECT count(*) FROM docs;
+count
+0
+(1 row)
+INSERT INTO docs VALUES (5, 'acme', 'x');
+ERROR:  42501
+UPDATE docs SET body = 'x';
+DELETE FROM docs;
+-- one policy for all commands
+CREATE POLICY tenant_isolation ON docs USING (tenant = current_setting('app.tenant', true));
+SELECT * FROM docs ORDER BY id;
+id|tenant|body
+(0 rows)
+SET app.tenant = 'acme';
+SELECT * FROM docs ORDER BY id;
+id|tenant|body
+1|acme|a1
+3|acme|a2
+(2 rows)
+SELECT * FROM docs WHERE id = 2;
+id|tenant|body
+(0 rows)
+SELECT * FROM docs WHERE id IN (1, 2) ORDER BY id;
+id|tenant|body
+1|acme|a1
+(1 row)
+SELECT tenant, count(*) FROM docs GROUP BY tenant ORDER BY tenant;
+tenant|count
+acme|2
+(1 row)
+SELECT min(id), max(id), count(body) FROM docs;
+min|max|count
+1|3|2
+(1 row)
+SET app.tenant = 'globex';
+SELECT * FROM docs ORDER BY id;
+id|tenant|body
+2|globex|g1
+(1 row)
+RESET app.tenant;
+SELECT * FROM docs ORDER BY id;
+id|tenant|body
+(0 rows)
+SELECT set_config('app.tenant', 'initech', false);
+set_config
+initech
+(1 row)
+SELECT * FROM docs ORDER BY id;
+id|tenant|body
+4|initech|i1
+(1 row)
+BEGIN;
+SET LOCAL app.tenant = 'acme';
+SELECT id FROM docs ORDER BY id;
+id
+1
+3
+(2 rows)
+COMMIT;
+SELECT id FROM docs ORDER BY id;
+id
+4
+(1 row)
+SET app.tenant = 'acme';
+-- conditions of the query never see rows the policy hides
+SELECT id FROM docs WHERE 1 / (CASE WHEN tenant = 'acme' THEN 1 ELSE 0 END) = 1 ORDER BY id;
+id
+1
+3
+(2 rows)
+-- joins and subqueries
+SELECT d.id, n.note FROM docs d JOIN notes n ON n.doc_id = d.id ORDER BY d.id;
+id|note
+1|n1
+3|n3
+(2 rows)
+SELECT n.doc_id, d.body FROM notes n LEFT JOIN docs d ON d.id = n.doc_id ORDER BY n.doc_id;
+doc_id|body
+1|a1
+2|NULL
+3|a2
+5|NULL
+(4 rows)
+SELECT note FROM notes WHERE doc_id IN (SELECT id FROM docs) ORDER BY note;
+note
+n1
+n3
+(2 rows)
+SELECT note FROM notes n WHERE NOT EXISTS (SELECT 1 FROM docs d WHERE d.id = n.doc_id) ORDER BY note;
+note
+n2
+n5
+(2 rows)
+SELECT (SELECT count(*) FROM docs) AS visible, (SELECT count(*) FROM notes) AS notes;
+visible|notes
+2|4
+(1 row)
+WITH t AS (SELECT * FROM docs) SELECT count(*) FROM t;
+count
+2
+(1 row)
+SELECT count(*) FROM (SELECT * FROM docs UNION ALL SELECT * FROM docs) u;
+count
+4
+(1 row)
+SELECT a.id, b.id FROM docs a, docs b WHERE a.id < b.id ORDER BY 1, 2;
+id|id
+1|3
+(1 row)
+-- views apply the policies of the tables they read
+CREATE VIEW doc_bodies AS SELECT id, body FROM docs;
+SELECT * FROM doc_bodies ORDER BY id;
+id|body
+1|a1
+3|a2
+(2 rows)
+SET app.tenant = 'globex';
+SELECT * FROM doc_bodies ORDER BY id;
+id|body
+2|g1
+(1 row)
+SET app.tenant = 'acme';
+-- prepared statements read the setting when they run
+PREPARE visible AS SELECT id FROM docs ORDER BY id;
+PREPARE by_id(int) AS SELECT body FROM docs WHERE id = $1;
+EXECUTE visible;
+id
+1
+3
+(2 rows)
+EXECUTE by_id(1);
+body
+a1
+(1 row)
+EXECUTE by_id(2);
+body
+(0 rows)
+SET app.tenant = 'globex';
+EXECUTE visible;
+id
+2
+(1 row)
+EXECUTE by_id(1);
+body
+(0 rows)
+EXECUTE by_id(2);
+body
+g1
+(1 row)
+SET app.tenant = 'acme';
+-- writes: USING decides which rows are changed, and new rows must pass it
+INSERT INTO docs VALUES (5, 'acme', 'a3');
+INSERT INTO docs VALUES (6, 'globex', 'g2');
+ERROR:  42501
+INSERT INTO docs VALUES (6, NULL, 'g2');
+ERROR:  42501
+INSERT INTO docs SELECT 7, 'acme', 'a4';
+UPDATE docs SET body = body || '!' WHERE id IN (1, 2);
+UPDATE docs SET tenant = 'globex' WHERE id = 1;
+ERROR:  42501
+DELETE FROM docs WHERE id = 2;
+DELETE FROM docs WHERE id = 7 RETURNING id, body;
+id|body
+7|a4
+(1 row)
+UPDATE docs SET body = 'u' WHERE id = 5 RETURNING id, tenant, body;
+id|tenant|body
+5|acme|u
+(1 row)
+INSERT INTO docs VALUES (1, 'acme', 'dup') ON CONFLICT DO NOTHING;
+INSERT INTO docs VALUES (8, 'acme', 'a8') ON CONFLICT (id) DO NOTHING;
+SET app.tenant = 'globex';
+SELECT * FROM docs ORDER BY id;
+id|tenant|body
+2|globex|g1
+(1 row)
+SET app.tenant = 'acme';
+SELECT * FROM docs ORDER BY id;
+id|tenant|body
+1|acme|a1!
+3|acme|a2
+5|acme|u
+8|acme|a8
+(4 rows)
+-- separate policies per command
+DROP POLICY tenant_isolation ON docs;
+CREATE POLICY sel ON docs FOR SELECT USING (tenant = current_setting('app.tenant') OR tenant = 'initech');
+CREATE POLICY ins ON docs FOR INSERT WITH CHECK (tenant = current_setting('app.tenant'));
+CREATE POLICY upd ON docs FOR UPDATE USING (tenant = current_setting('app.tenant')) WITH CHECK (body IS NOT NULL);
+CREATE POLICY del ON docs FOR DELETE USING (id > 4);
+SELECT * FROM docs ORDER BY id;
+id|tenant|body
+1|acme|a1!
+3|acme|a2
+4|initech|i1
+5|acme|u
+8|acme|a8
+(5 rows)
+INSERT INTO docs VALUES (9, 'acme', 'a9');
+INSERT INTO docs VALUES (10, 'initech', 'i2');
+ERROR:  42501
+UPDATE docs SET body = 'upd' WHERE tenant = 'initech';
+UPDATE docs SET body = NULL WHERE id = 1;
+ERROR:  42501
+UPDATE docs SET body = 'ok' WHERE id = 1;
+UPDATE docs SET tenant = 'globex' WHERE id = 1;
+ERROR:  42501
+UPDATE docs SET body = 'moved' WHERE id = 1 RETURNING id;
+id
+1
+(1 row)
+SET app.tenant = 'acme';
+DELETE FROM docs WHERE id < 4;
+DELETE FROM docs WHERE id = 9;
+SELECT * FROM docs ORDER BY id;
+id|tenant|body
+1|acme|moved
+3|acme|a2
+4|initech|i1
+5|acme|u
+8|acme|a8
+(5 rows)
+-- INSERT ... RETURNING also needs the SELECT policies
+DROP POLICY ins ON docs;
+CREATE POLICY ins ON docs FOR INSERT WITH CHECK (true);
+INSERT INTO docs VALUES (11, 'globex', 'g3');
+INSERT INTO docs VALUES (12, 'globex', 'g4') RETURNING id;
+ERROR:  42501
+INSERT INTO docs VALUES (12, 'acme', 'a12') RETURNING id;
+id
+12
+(1 row)
+-- SELECT ... FOR UPDATE needs the UPDATE policies
+SELECT id FROM docs ORDER BY id FOR UPDATE;
+id
+1
+3
+5
+8
+12
+(5 rows)
+-- restrictive policies narrow the permissive ones
+CREATE POLICY no_drafts ON docs AS RESTRICTIVE USING (body NOT LIKE 'draft%');
+INSERT INTO docs VALUES (13, 'acme', 'draft 1');
+ERROR:  42501
+INSERT INTO docs VALUES (13, 'acme', 'final 1');
+UPDATE docs SET body = 'draft 2' WHERE id = 1;
+ERROR:  42501
+SELECT * FROM docs ORDER BY id;
+id|tenant|body
+1|acme|moved
+3|acme|a2
+4|initech|i1
+5|acme|u
+8|acme|a8
+12|acme|a12
+13|acme|final 1
+(7 rows)
+-- restrictive policies alone allow nothing
+DROP POLICY sel ON docs;
+SELECT count(*) FROM docs;
+count
+0
+(1 row)
+CREATE POLICY sel ON docs FOR SELECT USING (true);
+SELECT count(*) FROM docs;
+count
+9
+(1 row)
+-- policies for other roles do not apply; CURRENT_USER does
+DROP POLICY sel ON docs;
+CREATE POLICY sel ON docs FOR SELECT TO pg_monitor USING (true);
+SELECT count(*) FROM docs;
+count
+0
+(1 row)
+ALTER POLICY sel ON docs TO CURRENT_USER;
+SELECT count(*) FROM docs;
+count
+9
+(1 row)
+ALTER POLICY sel ON docs TO PUBLIC;
+ALTER POLICY sel ON docs USING (id < 5);
+SELECT id FROM docs ORDER BY id;
+id
+1
+2
+3
+4
+(4 rows)
+ALTER POLICY sel ON docs RENAME TO sel_low;
+ALTER POLICY sel_low ON docs RENAME TO ins;
+ERROR:  42710
+ALTER POLICY nope ON docs RENAME TO other;
+ERROR:  42704
+ALTER POLICY nope ON docs USING (true);
+ERROR:  42704
+SELECT tablename, policyname, permissive, roles, cmd FROM pg_policies ORDER BY policyname;
+tablename|policyname|permissive|roles|cmd
+docs|del|PERMISSIVE|{public}|DELETE
+docs|ins|PERMISSIVE|{public}|INSERT
+docs|no_drafts|RESTRICTIVE|{public}|ALL
+docs|sel_low|PERMISSIVE|{public}|SELECT
+docs|upd|PERMISSIVE|{public}|UPDATE
+(5 rows)
+SELECT polname, polcmd, polpermissive FROM pg_policy ORDER BY polname;
+polname|polcmd|polpermissive
+del|d|t
+ins|a|t
+no_drafts|*|f
+sel_low|r|t
+upd|w|t
+(5 rows)
+-- errors in policy definitions
+CREATE POLICY ins ON docs USING (true);
+ERROR:  42710
+CREATE POLICY p ON docs FOR SELECT USING (true) WITH CHECK (true);
+ERROR:  42601
+CREATE POLICY p ON docs FOR DELETE WITH CHECK (true);
+ERROR:  42601
+CREATE POLICY p ON docs FOR INSERT USING (true);
+ERROR:  42601
+CREATE POLICY p ON docs USING (id);
+ERROR:  42804
+CREATE POLICY p ON docs USING (count(*) > 0);
+ERROR:  42803
+CREATE POLICY p ON docs USING (nope = 1);
+ERROR:  42703
+CREATE POLICY p ON nope USING (true);
+ERROR:  42P01
+CREATE POLICY p ON doc_bodies USING (true);
+ERROR:  42809
+CREATE POLICY p ON pg_class USING (true);
+ERROR:  42501
+ALTER POLICY upd ON docs FOR SELECT;
+ERROR:  42601
+ALTER POLICY del ON docs WITH CHECK (true);
+ERROR:  42601
+DROP POLICY nope ON docs;
+ERROR:  42704
+DROP POLICY IF EXISTS nope ON docs;
+DROP POLICY IF EXISTS nope ON no_table;
+DROP POLICY nope ON no_table;
+ERROR:  42P01
+-- columns used by policies
+ALTER TABLE docs DROP COLUMN body;
+ERROR:  2BP01
+ALTER TABLE docs ALTER COLUMN body TYPE varchar(100);
+ERROR:  0A000
+-- row_security = off fails instead of filtering
+SET row_security = off;
+SELECT count(*) FROM docs;
+ERROR:  42501
+SELECT count(*) FROM notes;
+count
+4
+(1 row)
+RESET row_security;
+SELECT count(*) FROM docs;
+count
+4
+(1 row)
+-- policies that refer to tables with policies of their own
+CREATE TABLE a (x int);
+CREATE TABLE b (x int);
+INSERT INTO a VALUES (1), (2);
+INSERT INTO b VALUES (1);
+ALTER TABLE a ENABLE ROW LEVEL SECURITY;
+ALTER TABLE a FORCE ROW LEVEL SECURITY;
+CREATE POLICY pa ON a USING (x IN (SELECT x FROM b));
+SELECT * FROM a;
+x
+1
+(1 row)
+ALTER TABLE b ENABLE ROW LEVEL SECURITY;
+ALTER TABLE b FORCE ROW LEVEL SECURITY;
+CREATE POLICY pb ON b USING (x IN (SELECT x FROM a));
+SELECT * FROM a;
+ERROR:  42P17
+DROP POLICY pb ON b;
+CREATE POLICY pb ON b USING (true);
+SELECT * FROM a;
+x
+1
+(1 row)
+-- transactional DDL
+BEGIN;
+DROP POLICY pa ON a;
+SELECT count(*) FROM a;
+count
+0
+(1 row)
+ROLLBACK;
+SELECT count(*) FROM a;
+count
+1
+(1 row)
+BEGIN;
+ALTER TABLE a DISABLE ROW LEVEL SECURITY;
+SELECT count(*) FROM a;
+count
+2
+(1 row)
+ROLLBACK;
+SELECT count(*) FROM a;
+count
+1
+(1 row)
+-- without FORCE the owner sees everything again; disabling keeps the policies
+ALTER TABLE docs NO FORCE ROW LEVEL SECURITY;
+SELECT count(*) FROM docs;
+count
+9
+(1 row)
+ALTER TABLE docs FORCE ROW LEVEL SECURITY;
+ALTER TABLE docs DISABLE ROW LEVEL SECURITY;
+SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'docs';
+relrowsecurity|relforcerowsecurity
+f|t
+(1 row)
+SELECT count(*) FROM docs;
+count
+9
+(1 row)
+SELECT count(*) FROM pg_policies WHERE tablename = 'docs';
+count
+5
+(1 row)
+DROP TABLE docs CASCADE;
+SELECT count(*) FROM pg_policies WHERE tablename = 'docs';
+count
+0
+(1 row)

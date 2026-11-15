@@ -339,10 +339,48 @@ impl Drop for CloseGuard {
     }
 }
 
+/// Who a session runs as, and what that login may do.
+///
+/// squad has no SQL roles. The login name is what `current_user` and
+/// `session_user` return and what `CREATE POLICY ... TO name` matches.
+/// [`Login::default`] is the embedded API's connection: user `squad`,
+/// treated as the owner of every table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Login {
+    pub user: String,
+    /// Not subject to row-level security, like the owner of a table in
+    /// PostgreSQL: policies apply only to tables with `FORCE ROW LEVEL
+    /// SECURITY`. Without it, the login is subject to the policies of
+    /// every table with row-level security enabled and may not change
+    /// those tables or their policies.
+    pub bypass_rls: bool,
+    /// Every transaction is read-only (SQLSTATE `25006` for writes and
+    /// DDL), and cannot be made read-write.
+    pub read_only: bool,
+}
+
+impl Default for Login {
+    fn default() -> Login {
+        Login { user: "squad".to_string(), bypass_rls: true, read_only: false }
+    }
+}
+
+impl Login {
+    /// A login named `user` with the default attributes.
+    pub fn new(user: impl Into<String>) -> Login {
+        Login { user: user.into(), ..Login::default() }
+    }
+}
+
 /// Per-session settings and state.
 pub struct SessionState {
     pub search_path: Vec<String>,
+    /// The login name (`current_user`, `session_user`).
     pub user: String,
+    /// See [`Login::bypass_rls`].
+    pub bypass_rls: bool,
+    /// See [`Login::read_only`].
+    pub read_only_login: bool,
     pub settings: HashMap<String, String>,
     pub tz: chrono_tz::Tz,
     pub lock_timeout: Option<Duration>,
@@ -351,10 +389,172 @@ pub struct SessionState {
     pub currval: HashMap<u32, i64>,
     pub lastval: Option<i64>,
     pub default_isolation: Isolation,
+    /// `default_transaction_read_only`.
+    pub default_read_only: bool,
+    /// `row_security`: when off, a query that row-level security would
+    /// filter fails instead (SQLSTATE 42501).
+    pub row_security: bool,
     pub pid: i32,
     pub(crate) cancel: CancelHandle,
     /// Notices raised by the running statement.
     pub(crate) notices: Vec<crate::Notice>,
+    /// Setting changes made by the open transaction.
+    pub(crate) guc_txn: GucTxn,
+}
+
+/// The settings that `SET`, `SET LOCAL`, `RESET` and `set_config` change,
+/// as one value that a transaction can save and restore.
+#[derive(Clone)]
+pub(crate) struct Gucs {
+    search_path: Vec<String>,
+    settings: HashMap<String, String>,
+    tz: chrono_tz::Tz,
+    lock_timeout: Option<Duration>,
+    statement_timeout: Option<Duration>,
+    default_isolation: Isolation,
+    default_read_only: bool,
+    row_security: bool,
+}
+
+/// What a transaction changed in the settings. As in PostgreSQL, `SET`
+/// inside a transaction is undone if it rolls back, and `SET LOCAL` lasts
+/// until the transaction ends either way. Both stay `None` until the
+/// transaction changes a setting.
+#[derive(Default)]
+pub(crate) struct GucTxn {
+    /// The settings when the transaction started; restored by rollback.
+    start: Option<Gucs>,
+    /// The settings as they will be after commit: the `SET LOCAL` changes
+    /// left out.
+    session: Option<Gucs>,
+}
+
+impl SessionState {
+    pub(crate) fn gucs(&self) -> Gucs {
+        Gucs {
+            search_path: self.search_path.clone(),
+            settings: self.settings.clone(),
+            tz: self.tz,
+            lock_timeout: self.lock_timeout,
+            statement_timeout: self.statement_timeout,
+            default_isolation: self.default_isolation,
+            default_read_only: self.default_read_only,
+            row_security: self.row_security,
+        }
+    }
+
+    fn set_gucs(&mut self, g: Gucs) {
+        self.search_path = g.search_path;
+        self.settings = g.settings;
+        self.tz = g.tz;
+        self.lock_timeout = g.lock_timeout;
+        self.statement_timeout = g.statement_timeout;
+        self.default_isolation = g.default_isolation;
+        self.default_read_only = g.default_read_only;
+        self.row_security = g.row_security;
+    }
+
+    /// Changes settings with `f`. Inside a transaction (`in_txn`), the
+    /// change is recorded so that rollback undoes it, and a `local` one
+    /// is also undone by commit. Outside a transaction, a `local` change
+    /// has no effect.
+    pub(crate) fn change_settings(
+        &mut self,
+        in_txn: bool,
+        local: bool,
+        f: &mut dyn FnMut(&mut SessionState) -> Result<()>,
+    ) -> Result<()> {
+        if !in_txn {
+            return if local { Ok(()) } else { f(self) };
+        }
+        if self.guc_txn.start.is_none() {
+            let g = self.gucs();
+            self.guc_txn.start = Some(g.clone());
+            self.guc_txn.session = Some(g);
+        }
+        if !local {
+            // The same change, applied to the values commit will keep.
+            let current = self.gucs();
+            let session = self.guc_txn.session.take().expect("set with start");
+            self.set_gucs(session.clone());
+            let applied = f(self);
+            let changed = self.gucs();
+            self.set_gucs(current);
+            match applied {
+                Ok(()) => self.guc_txn.session = Some(changed),
+                Err(e) => {
+                    self.guc_txn.session = Some(session);
+                    return Err(e);
+                }
+            }
+        }
+        f(self)
+    }
+
+    /// The transaction ended: keep its session-level changes on commit,
+    /// undo all of them on rollback.
+    fn end_settings(&mut self, commit: bool) {
+        let GucTxn { start, session } = std::mem::take(&mut self.guc_txn);
+        let keep = if commit { session } else { start };
+        if let Some(g) = keep {
+            let before = std::mem::take(&mut self.settings);
+            self.set_gucs(g);
+            self.keep_placeholders(&before);
+        }
+    }
+
+    /// A custom setting, once set, exists for the rest of the session,
+    /// even if the transaction that set it rolls back or set it locally:
+    /// it is then empty (PostgreSQL's placeholder variables).
+    fn keep_placeholders(&mut self, before: &HashMap<String, String>) {
+        for k in before.keys().filter(|k| k.contains('.')) {
+            self.settings.entry(k.clone()).or_default();
+        }
+    }
+
+    /// State to restore on `ROLLBACK TO` a savepoint taken now.
+    fn settings_mark(&self) -> Option<(Gucs, Gucs)> {
+        let session = self.guc_txn.session.clone()?;
+        Some((self.gucs(), session))
+    }
+
+    fn rollback_settings_to(&mut self, mark: &Option<(Gucs, Gucs)>) {
+        let before = self.settings.clone();
+        self.rollback_settings_to_mark(mark);
+        self.keep_placeholders(&before);
+        if let Some(session) = &mut self.guc_txn.session {
+            for k in before.keys().filter(|k| k.contains('.')) {
+                session.settings.entry(k.clone()).or_default();
+            }
+        }
+    }
+
+    fn rollback_settings_to_mark(&mut self, mark: &Option<(Gucs, Gucs)>) {
+        match mark {
+            Some((effective, session)) => {
+                self.set_gucs(effective.clone());
+                self.guc_txn.session = Some(session.clone());
+            }
+            // Nothing had changed when the savepoint was taken.
+            None => {
+                if let Some(start) = self.guc_txn.start.clone() {
+                    self.set_gucs(start.clone());
+                    self.guc_txn.session = Some(start);
+                }
+            }
+        }
+    }
+
+    /// The login this session runs as.
+    pub fn login(&self) -> Login {
+        Login { user: self.user.clone(), bypass_rls: self.bypass_rls, read_only: self.read_only_login }
+    }
+
+    /// Transactions that are started now are read-only whatever they ask
+    /// for: on a replica and for a read-only login.
+    pub(crate) fn forced_read_only(&self, shared: &Shared) -> bool {
+        self.read_only_login || shared.in_recovery()
+    }
 }
 
 /// Asks the statement running on a session to stop, from another thread.
@@ -420,13 +620,43 @@ pub struct Prepared {
     pub(crate) kind: Kind,
     /// Catalog version the plan was built against.
     pub(crate) catalog_version: u64,
-    search_path: Vec<String>,
+    /// What the plan was made for besides the catalog.
+    context: PlanContext,
 }
 
 impl Prepared {
     /// True for statements that return rows.
     pub fn returns_rows(&self) -> bool {
         !self.columns.is_empty()
+    }
+}
+
+/// What a plan depends on besides SQL text and catalog: names resolve
+/// through the search path, and row-level security depends on the login
+/// and on `row_security`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct PlanContext {
+    search_path: Vec<String>,
+    user: String,
+    bypass_rls: bool,
+    row_security: bool,
+}
+
+impl PlanContext {
+    fn of(state: &SessionState) -> PlanContext {
+        PlanContext {
+            search_path: state.search_path.clone(),
+            user: state.user.clone(),
+            bypass_rls: state.bypass_rls,
+            row_security: state.row_security,
+        }
+    }
+
+    fn matches(&self, state: &SessionState) -> bool {
+        self.search_path == state.search_path
+            && self.user == state.user
+            && self.bypass_rls == state.bypass_rls
+            && self.row_security == state.row_security
     }
 }
 
@@ -475,6 +705,8 @@ pub(crate) struct Savepoint {
     mark: usize,
     catalog: Arc<Catalog>,
     dirty: bool,
+    /// The settings to go back to (see [`SessionState::settings_mark`]).
+    settings: Option<(Gucs, Gucs)>,
 }
 
 /// Transaction status as reported in the wire protocol's ReadyForQuery.
@@ -530,6 +762,8 @@ impl Session {
             state: SessionState {
                 search_path: vec!["public".to_string()],
                 user: "squad".to_string(),
+                bypass_rls: true,
+                read_only_login: false,
                 settings: HashMap::new(),
                 tz: chrono_tz::UTC,
                 lock_timeout: None,
@@ -537,9 +771,12 @@ impl Session {
                 currval: HashMap::new(),
                 lastval: None,
                 default_isolation: Isolation::ReadCommitted,
+                default_read_only: false,
+                row_security: true,
                 pid,
                 cancel: CancelHandle::default(),
                 notices: Vec::new(),
+                guc_txn: GucTxn::default(),
             },
             txn: None,
             named: HashMap::new(),
@@ -560,6 +797,53 @@ impl Session {
 
     pub fn state_mut(&mut self) -> &mut SessionState {
         &mut self.state
+    }
+
+    /// Makes the session run as `login`: its name is `current_user`, and
+    /// its attributes decide whether row-level security applies and
+    /// whether it may write. Takes effect with the next transaction.
+    pub fn set_login(&mut self, login: Login) {
+        self.state.user = login.user;
+        self.state.bypass_rls = login.bypass_rls;
+        self.state.read_only_login = login.read_only;
+    }
+
+    /// The login this session runs as.
+    pub fn login(&self) -> Login {
+        self.state.login()
+    }
+
+    /// True if the next statement runs read-only: the open transaction is
+    /// read-only, or a new one would be.
+    pub fn is_read_only(&self) -> bool {
+        match &self.txn {
+            Some(t) => t.txn.is_read_only(),
+            None => self.state.forced_read_only(&self.shared) || self.state.default_read_only,
+        }
+    }
+
+    /// True if row-level security policies of `table` (a possibly
+    /// qualified, possibly quoted name) apply to this session. `COPY FROM`
+    /// is refused for such tables, as in PostgreSQL.
+    pub fn row_security_applies(&self, table: &str) -> bool {
+        let (schema, name) = split_qualified(table);
+        let catalog = self.catalog();
+        catalog
+            .table(schema.as_deref(), &name, &self.state.search_path)
+            .is_some_and(|t| t.row_security && (!self.state.bypass_rls || t.force_row_security))
+    }
+
+    /// Key of the shared plan cache: the SQL text and what the plan
+    /// depends on besides the catalog (see [`PlanContext`]).
+    fn cache_key(&self, sql: &str) -> String {
+        format!(
+            "{}\u{0}{}\u{0}{}{}\u{0}{}",
+            self.state.search_path.join(","),
+            self.state.user,
+            u8::from(self.state.bypass_rls),
+            u8::from(self.state.row_security),
+            sql
+        )
     }
 
     /// A handle with which another thread can cancel the statement this
@@ -647,7 +931,7 @@ impl Session {
             tag: Tag::Other(""),
             kind: Kind::Empty,
             catalog_version: 0,
-            search_path: Vec::new(),
+            context: PlanContext::default(),
         }
     }
 
@@ -677,6 +961,11 @@ impl Session {
         }
         let catalog = self.catalog();
         let mut binder = Binder::new(&catalog, &self.state.search_path, param_types.to_vec());
+        binder.rls = Some(crate::bind::RowSecurityUser {
+            user: self.state.user.clone(),
+            bypass_rls: self.state.bypass_rls,
+            row_security: self.state.row_security,
+        });
         let finish_params = |b: &Binder| -> Vec<Type> {
             b.param_types.iter().map(|t| t.clone().filter(|t| *t != Type::Unknown).unwrap_or(Type::Text)).collect()
         };
@@ -719,7 +1008,7 @@ impl Session {
             tag,
             kind,
             catalog_version: catalog.version,
-            search_path: self.state.search_path.clone(),
+            context: PlanContext::of(&self.state),
         })
     }
 
@@ -729,7 +1018,7 @@ impl Session {
         if self.txn.as_ref().is_some_and(|t| t.dirty) {
             return None;
         }
-        let key = format!("{}\u{0}{}", self.state.search_path.join(","), sql);
+        let key = self.cache_key(sql);
         let hit = self.shared.plan_cache.lock().get(&key).cloned()?;
         (hit.catalog_version == self.catalog_version()).then_some(hit)
     }
@@ -737,7 +1026,7 @@ impl Session {
     fn cached(&mut self, sql: &str) -> Result<Arc<Prepared>> {
         let catalog = self.catalog();
         let private = self.txn.as_ref().is_some_and(|t| t.dirty);
-        let key = format!("{}\u{0}{}", self.state.search_path.join(","), sql);
+        let key = self.cache_key(sql);
         if !private {
             if let Some(p) = self.shared.plan_cache.lock().get(&key) {
                 if p.catalog_version == catalog.version {
@@ -865,7 +1154,7 @@ impl Session {
         // Re-plan if the schema or the search path changed since planning.
         let current_version = self.catalog_version();
         let stale = match &stmt.kind {
-            Kind::Plan { .. } => stmt.catalog_version != current_version || stmt.search_path != self.state.search_path,
+            Kind::Plan { .. } => stmt.catalog_version != current_version || !stmt.context.matches(&self.state),
             _ => false,
         };
         let replanned;
@@ -876,7 +1165,7 @@ impl Session {
             let reusable = self.replans.get(&key).filter(|(original, new)| {
                 Arc::ptr_eq(original, stmt)
                     && new.catalog_version == current_version
-                    && new.search_path == self.state.search_path
+                    && new.context.matches(&self.state)
             });
             replanned = match reusable {
                 Some((_, new)) => new.clone(),
@@ -1079,7 +1368,7 @@ impl Session {
             None => {
                 let p = self.prepare(&sql, &[])?;
                 if !self.txn.as_ref().is_some_and(|t| t.dirty) {
-                    let key = format!("{}\u{0}{}", self.state.search_path.join(","), sql);
+                    let key = self.cache_key(&sql);
                     let mut cache = self.shared.plan_cache.lock();
                     if cache.len() >= PLAN_CACHE_LIMIT {
                         cache.clear();
@@ -1135,6 +1424,7 @@ impl Session {
                 source: values,
                 on_conflict: None,
                 checks: insert.checks.clone(),
+                rls_checks: insert.rls_checks.clone(),
                 returning: None,
             };
             crate::dml::insert(&direct, &mut cx)?;
@@ -1170,8 +1460,8 @@ impl Session {
             None => self.shared.store.begin(isolation),
         };
         drop(gate);
-        // A replica only reads.
-        txn.set_read_only(recovery);
+        // A replica only reads, and so does a read-only login.
+        txn.set_read_only(recovery || self.state.read_only_login || self.state.default_read_only);
         self.txn = Some(TxnState {
             txn,
             catalog,
@@ -1189,15 +1479,27 @@ impl Session {
         Ok(())
     }
 
+    /// Ends the open transaction and starts a new one with `isolation`,
+    /// keeping the settings it changed (`SET TRANSACTION ISOLATION LEVEL`
+    /// after `BEGIN`).
+    pub(crate) fn restart_transaction(&mut self, isolation: Option<Isolation>, explicit: bool) -> Result<()> {
+        let settings = std::mem::take(&mut self.state.guc_txn);
+        self.rollback();
+        self.state.guc_txn = settings;
+        self.begin(isolation, explicit)
+    }
+
     pub(crate) fn commit(&mut self) -> Result<()> {
         let Some(t) = self.txn.take() else { return Ok(()) };
         self.shared.advisory.release_all(self.state.pid, true, false);
         if t.failed {
+            self.state.end_settings(false);
             return Ok(());
         }
         let TxnState { mut txn, catalog, dirty, dropped_objects, columnar_inserted, written_objects, .. } = t;
         let result = txn.end(true);
         self.spare_txn = Some(txn);
+        self.state.end_settings(result.is_ok());
         if let Err(e) = result {
             // A failed commit may still have reached the log (an error
             // while syncing it), so the objects it wrote may be named by
@@ -1294,6 +1596,11 @@ impl Session {
             ));
         }
         self.begin(Some(Isolation::ReadCommitted), false)?;
+        // Compaction changes no data; it runs for read-only sessions too
+        // (`VACUUM`), but not on a replica (checked above).
+        if let Some(t) = &mut self.txn {
+            t.txn.set_read_only(false);
+        }
         let result = (|| {
             let wait = match wait {
                 Some(d) => WaitPolicy::Wait(Some(d)),
@@ -1332,6 +1639,7 @@ impl Session {
     pub(crate) fn rollback(&mut self) {
         if let Some(mut t) = self.txn.take() {
             self.shared.advisory.release_all(self.state.pid, true, false);
+            self.state.end_settings(false);
             let _ = t.txn.end(false);
             self.spare_txn = Some(t.txn);
             for id in t.reset_counters {
@@ -1346,7 +1654,14 @@ impl Session {
             Error::new(sqlstate::NO_ACTIVE_SQL_TRANSACTION, "SAVEPOINT can only be used in transaction blocks")
         })?;
         let mark = t.txn.savepoint();
-        t.savepoints.push(Savepoint { name: name.to_string(), mark, catalog: t.catalog.clone(), dirty: t.dirty });
+        let settings = self.state.settings_mark();
+        t.savepoints.push(Savepoint {
+            name: name.to_string(),
+            mark,
+            catalog: t.catalog.clone(),
+            dirty: t.dirty,
+            settings,
+        });
         Ok(())
     }
 
@@ -1366,6 +1681,7 @@ impl Session {
         t.catalog = sp.catalog.clone();
         t.dirty = sp.dirty;
         t.failed = false;
+        self.state.rollback_settings_to(&sp.settings);
         Ok(())
     }
 
@@ -1542,6 +1858,18 @@ impl ExecCx<'_> {
             .ok_or_else(|| Error::new(sqlstate::UNDEFINED_TABLE, format!("relation \"{text}\" does not exist")))
     }
 
+    /// Fails in a read-only transaction, as functions with effects do in
+    /// PostgreSQL.
+    fn check_txn_writable(&self, what: &str) -> Result<()> {
+        if self.txn.is_read_only() && !self.shared.in_recovery() {
+            return Err(Error::new(
+                sqlstate::READ_ONLY_SQL_TRANSACTION,
+                format!("cannot execute {what} in a read-only transaction"),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn session_fn(&mut self, func: &SessionFn, args: Vec<Value>) -> Result<Value> {
         let text = |i: usize| args.get(i).and_then(Value::as_str).unwrap_or_default();
         Ok(match func {
@@ -1551,6 +1879,7 @@ impl ExecCx<'_> {
                     return Ok(Value::Null);
                 }
                 let seq = self.sequence_by_text(text(0))?;
+                self.check_txn_writable("nextval()")?;
                 let v = self.shared.nextval(&seq)?;
                 self.session.currval.insert(seq.id, v);
                 self.session.lastval = Some(v);
@@ -1582,6 +1911,7 @@ impl ExecCx<'_> {
                     return Ok(Value::Null);
                 }
                 let seq = self.sequence_by_text(text(0))?;
+                self.check_txn_writable("setval()")?;
                 let v = args[1].as_i64().ok_or_else(|| Error::internal("setval value is not an integer"))?;
                 let called = args.get(2).and_then(Value::as_bool).unwrap_or(true);
                 self.shared.setval(&seq, v, called)?;
@@ -1626,9 +1956,20 @@ impl ExecCx<'_> {
                 }
             }
             SessionFn::SetConfig => {
-                let (name, value) = (text(0).to_string(), text(1).to_string());
-                crate::ddl::apply_setting(self.session, &name, Some(&value))?;
-                Value::Text(value)
+                let name = match &args[0] {
+                    Value::Null => {
+                        return Err(Error::new(sqlstate::NULL_VALUE_NOT_ALLOWED, "SET requires parameter name"))
+                    }
+                    v => v.as_str().unwrap_or_default().to_string(),
+                };
+                // A NULL value resets the setting.
+                let value = args.get(1).and_then(Value::as_str).map(str::to_string);
+                let local = args.get(2).and_then(Value::as_bool).unwrap_or(false);
+                crate::ddl::check_settable(self.session, &name)?;
+                self.session.change_settings(true, local, &mut |state| {
+                    crate::ddl::apply_setting(state, &name, value.as_deref())
+                })?;
+                Value::Text(crate::ddl::show_setting(self.session, &name)?)
             }
             SessionFn::Catalog(name) => crate::system::catalog_fn(name, args, self)?,
         })

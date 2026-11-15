@@ -5,7 +5,7 @@ use pg_query::protobuf::{self as pb, a_const::Val, node::Node as N};
 
 use super::expr::{node_kind, sort_key, srf, Typed};
 use super::{name_list, node, opt_node, parse_sql, range_var_name, AggLevel, Binder, CteBinding, Scope};
-use crate::catalog::Relation;
+use crate::catalog::{PolicyCommand, Relation};
 use crate::expr::Expr;
 use crate::plan::{CteDef, JoinKind, LockWait, Plan, RowLock, ScanPlan, SetOpKind, SortKey};
 use crate::types::Type;
@@ -892,13 +892,29 @@ impl<'a> Binder<'a> {
                 if table.columnar.is_some() {
                     return Err(Error::unsupported("FOR UPDATE/FOR SHARE on columnar tables"));
                 }
+                // Rows locked for update must also pass the UPDATE
+                // policies, as in PostgreSQL.
+                let mut recheck = recheck.clone();
+                if self.rls_applies(table)? {
+                    if rel.len != table.columns.len() {
+                        return Err(Error::unsupported(
+                            "FOR UPDATE/FOR SHARE on a subquery over a table with row-level security",
+                        ));
+                    }
+                    let using = self.rls_using(table, PolicyCommand::Update)?.shift_columns(rel.start);
+                    recheck = Some(match recheck {
+                        Some(r) => Expr::And(vec![using.clone(), r]),
+                        None => using.clone(),
+                    });
+                    plan = Plan::Filter(Box::new(plan), using);
+                }
                 plan = Plan::LockRows {
                     input: Box::new(plan),
                     table: table.clone(),
                     offset: rel.start,
                     mode,
                     wait,
-                    recheck: recheck.clone(),
+                    recheck,
                 };
             }
         }
@@ -1177,7 +1193,11 @@ impl<'a> Binder<'a> {
             Some(Relation::Table(table)) => {
                 self.tables_used.push(table.id);
                 let scope = Scope::for_table(&table, alias);
-                Ok((Plan::Scan(ScanPlan::full(table)), finish(scope)))
+                let mut scan = ScanPlan::full(table.clone());
+                if self.rls_applies(&table)? {
+                    scan.filter = Some(self.rls_using(&table, PolicyCommand::Select)?);
+                }
+                Ok((Plan::Scan(scan), finish(scope)))
             }
             Some(Relation::View(view)) => {
                 if self.view_stack.contains(&view.id) {

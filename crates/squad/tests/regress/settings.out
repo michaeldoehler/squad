@@ -1,0 +1,384 @@
+-- Custom settings (names with a dot), SET LOCAL, set_config and
+-- current_setting, and how transactions undo setting changes.
+SHOW app.tenant;
+ERROR:  42704
+SELECT current_setting('app.tenant');
+ERROR:  42704
+SELECT current_setting('app.tenant', true) IS NULL AS unset;
+unset
+t
+(1 row)
+SET app.tenant = 'acme';
+SHOW app.tenant;
+app.tenant
+acme
+(1 row)
+SELECT current_setting('app.tenant'), current_setting('app.tenant', false);
+current_setting|current_setting
+acme|acme
+(1 row)
+SET app.tenant TO 'globex';
+SHOW app.tenant;
+app.tenant
+globex
+(1 row)
+-- reset keeps the setting, empty
+RESET app.tenant;
+SHOW app.tenant;
+app.tenant
+
+(1 row)
+SELECT current_setting('app.tenant', true) IS NULL AS unset, current_setting('app.tenant') = '' AS empty;
+unset|empty
+f|t
+(1 row)
+SET app.tenant TO DEFAULT;
+SHOW app.tenant;
+app.tenant
+
+(1 row)
+SET app.count = 42;
+SHOW app.count;
+app.count
+42
+(1 row)
+SET app.flag = on;
+SHOW app.flag;
+app.flag
+on
+(1 row)
+SET app.list = 'a', 'b';
+ERROR:  22023
+SET SESSION app.tenant = 'acme';
+SHOW app.tenant;
+app.tenant
+acme
+(1 row)
+-- names without a dot are not custom settings
+SELECT current_setting('no_such_setting');
+ERROR:  42704
+SELECT current_setting('no_such_setting', true);
+current_setting
+NULL
+(1 row)
+SELECT current_setting('app.never.set', true);
+current_setting
+NULL
+(1 row)
+SELECT current_setting(NULL);
+current_setting
+NULL
+(1 row)
+-- SET in a transaction that rolls back is undone
+BEGIN;
+SET app.tenant = 'initech';
+SHOW app.tenant;
+app.tenant
+initech
+(1 row)
+ROLLBACK;
+SHOW app.tenant;
+app.tenant
+acme
+(1 row)
+BEGIN;
+SET app.tenant = 'initech';
+COMMIT;
+SHOW app.tenant;
+app.tenant
+initech
+(1 row)
+-- SET LOCAL lasts until the transaction ends
+BEGIN;
+SET LOCAL app.tenant = 'local';
+SHOW app.tenant;
+app.tenant
+local
+(1 row)
+SELECT current_setting('app.tenant');
+current_setting
+local
+(1 row)
+COMMIT;
+SHOW app.tenant;
+app.tenant
+initech
+(1 row)
+BEGIN;
+SET LOCAL app.tenant = 'local';
+ROLLBACK;
+SHOW app.tenant;
+app.tenant
+initech
+(1 row)
+BEGIN;
+SET app.tenant = 'session';
+SET LOCAL app.tenant = 'local';
+SHOW app.tenant;
+app.tenant
+local
+(1 row)
+COMMIT;
+SHOW app.tenant;
+app.tenant
+session
+(1 row)
+BEGIN;
+SET LOCAL app.tenant = 'local';
+SET app.tenant = 'session2';
+SHOW app.tenant;
+app.tenant
+session2
+(1 row)
+COMMIT;
+SHOW app.tenant;
+app.tenant
+session2
+(1 row)
+-- SET LOCAL outside a transaction block has no effect
+SET LOCAL app.tenant = 'ignored';
+SHOW app.tenant;
+app.tenant
+session2
+(1 row)
+SET LOCAL app.other = 'ignored';
+SHOW app.other;
+app.other
+
+(1 row)
+-- savepoints
+BEGIN;
+SET app.tenant = 't1';
+SAVEPOINT a;
+SET app.tenant = 't2';
+SHOW app.tenant;
+app.tenant
+t2
+(1 row)
+ROLLBACK TO SAVEPOINT a;
+SHOW app.tenant;
+app.tenant
+t1
+(1 row)
+SAVEPOINT b;
+SET LOCAL app.tenant = 't3';
+RELEASE SAVEPOINT b;
+SHOW app.tenant;
+app.tenant
+t3
+(1 row)
+COMMIT;
+SHOW app.tenant;
+app.tenant
+t1
+(1 row)
+BEGIN;
+SAVEPOINT a;
+SET app.tenant = 't4';
+ROLLBACK TO a;
+SHOW app.tenant;
+app.tenant
+t1
+(1 row)
+SET app.tenant = 't5';
+COMMIT;
+SHOW app.tenant;
+app.tenant
+t5
+(1 row)
+-- an error aborts the transaction; its settings are undone
+BEGIN;
+SET app.tenant = 'doomed';
+SELECT 1 / 0;
+ERROR:  22012
+COMMIT;
+SHOW app.tenant;
+app.tenant
+t5
+(1 row)
+-- set_config
+SELECT set_config('app.tenant', 'acme', false);
+set_config
+acme
+(1 row)
+SHOW app.tenant;
+app.tenant
+acme
+(1 row)
+SELECT set_config('app.tenant', 'tmp', true), current_setting('app.tenant');
+set_config|current_setting
+tmp|tmp
+(1 row)
+SHOW app.tenant;
+app.tenant
+acme
+(1 row)
+SELECT set_config('app.fresh', 'x', true);
+set_config
+x
+(1 row)
+SHOW app.fresh;
+app.fresh
+
+(1 row)
+BEGIN;
+SELECT set_config('app.tenant', 'in_txn', true);
+set_config
+in_txn
+(1 row)
+SELECT current_setting('app.tenant');
+current_setting
+in_txn
+(1 row)
+SELECT current_setting('app.tenant');
+current_setting
+in_txn
+(1 row)
+COMMIT;
+SHOW app.tenant;
+app.tenant
+acme
+(1 row)
+BEGIN;
+SELECT set_config('app.tenant', 'rolled_back', false);
+set_config
+rolled_back
+(1 row)
+ROLLBACK;
+SHOW app.tenant;
+app.tenant
+acme
+(1 row)
+SELECT set_config('app.tenant', NULL, false);
+set_config
+
+(1 row)
+SHOW app.tenant;
+app.tenant
+
+(1 row)
+SELECT set_config(NULL, 'x', false);
+ERROR:  22004
+SELECT set_config('app.tenant', 'acme', false) AS a, current_setting('app.tenant') AS b;
+a|b
+acme|acme
+(1 row)
+-- a failing statement undoes its set_config
+SELECT set_config('app.tenant', 'failed', false), 1 / 0;
+ERROR:  22012
+SHOW app.tenant;
+app.tenant
+acme
+(1 row)
+-- the same setting in WHERE clauses and with parameters
+CREATE TABLE docs (id int PRIMARY KEY, tenant text NOT NULL);
+INSERT INTO docs VALUES (1, 'acme'), (2, 'globex'), (3, 'acme');
+SELECT id FROM docs WHERE tenant = current_setting('app.tenant') ORDER BY id;
+id
+1
+3
+(2 rows)
+SET app.tenant = 'globex';
+SELECT id FROM docs WHERE tenant = current_setting('app.tenant') ORDER BY id;
+id
+2
+(1 row)
+PREPARE by_tenant AS SELECT id FROM docs WHERE tenant = current_setting('app.tenant', true) ORDER BY id;
+EXECUTE by_tenant;
+id
+2
+(1 row)
+SET app.tenant = 'acme';
+EXECUTE by_tenant;
+id
+1
+3
+(2 rows)
+RESET app.tenant;
+EXECUTE by_tenant;
+id
+(0 rows)
+-- RESET ALL and DISCARD ALL empty custom settings
+SET app.tenant = 'acme';
+RESET ALL;
+SHOW app.tenant;
+app.tenant
+
+(1 row)
+SET app.tenant = 'acme';
+BEGIN;
+DISCARD ALL;
+ERROR:  25001
+ROLLBACK;
+DISCARD ALL;
+SHOW app.tenant;
+app.tenant
+
+(1 row)
+-- default_transaction_read_only
+SHOW default_transaction_read_only;
+default_transaction_read_only
+off
+(1 row)
+SHOW transaction_read_only;
+transaction_read_only
+off
+(1 row)
+SET default_transaction_read_only = on;
+SHOW transaction_read_only;
+transaction_read_only
+on
+(1 row)
+INSERT INTO docs VALUES (4, 'acme');
+ERROR:  25006
+CREATE TABLE nope (a int);
+ERROR:  25006
+SELECT count(*) FROM docs;
+count
+3
+(1 row)
+BEGIN READ WRITE;
+INSERT INTO docs VALUES (4, 'acme');
+SHOW transaction_read_only;
+transaction_read_only
+off
+(1 row)
+ROLLBACK;
+BEGIN;
+SHOW transaction_read_only;
+transaction_read_only
+on
+(1 row)
+SET TRANSACTION READ WRITE;
+SHOW transaction_read_only;
+transaction_read_only
+off
+(1 row)
+INSERT INTO docs VALUES (5, 'acme');
+COMMIT;
+SET default_transaction_read_only = maybe;
+ERROR:  22023
+SET default_transaction_read_only = off;
+INSERT INTO docs VALUES (6, 'acme');
+BEGIN;
+SET transaction_read_only = on;
+SHOW transaction_read_only;
+transaction_read_only
+on
+(1 row)
+INSERT INTO docs VALUES (7, 'acme');
+ERROR:  25006
+ROLLBACK;
+CREATE SEQUENCE seq;
+BEGIN READ ONLY;
+SELECT nextval('seq');
+ERROR:  25006
+ROLLBACK;
+SELECT id FROM docs ORDER BY id;
+id
+1
+2
+3
+5
+6
+(5 rows)

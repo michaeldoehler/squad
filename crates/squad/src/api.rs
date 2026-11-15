@@ -213,6 +213,17 @@ impl Database {
         Connection { inner: Arc::new(Mutex::new(session)), cancel }
     }
 
+    /// Opens a connection that runs as `login`: `current_user` is its
+    /// name, row-level security policies apply unless it bypasses them,
+    /// and a read-only login cannot write. [`connect`](Database::connect)
+    /// uses [`Login::default`](crate::Login::default).
+    pub fn connect_as(&self, login: crate::Login) -> Connection {
+        let mut session = Session::new(self.shared.clone());
+        session.set_login(login);
+        let cancel = session.cancel_handle();
+        Connection { inner: Arc::new(Mutex::new(session)), cancel }
+    }
+
     /// Opens a raw session, the interface protocol servers build on.
     pub fn session(&self) -> Session {
         Session::new(self.shared.clone())

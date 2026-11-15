@@ -45,6 +45,8 @@ const CONSTRAINT_BASE: i64 = 1_000_000_000;
 const ATTRDEF_BASE: i64 = 1_500_000_000;
 const ENUM_LABEL_BASE: i64 = 1_800_000_000;
 const ENUM_ARRAY_BASE: i64 = 2_000_000_000;
+/// Login names that policies name, other than the session's own.
+const ROLE_BASE: i64 = 1_700_000_000;
 /// System relations are numbered from here in the order of `relations.txt`.
 const SYSTEM_REL_BASE: i64 = 12000;
 
@@ -338,6 +340,9 @@ pub(crate) struct Env {
     cat: Arc<Catalog>,
     path: Vec<String>,
     user: String,
+    /// The session's login bypasses row-level security (reported as a
+    /// superuser).
+    bypass_rls: bool,
     database: String,
 }
 
@@ -347,8 +352,34 @@ impl Env {
             cat: cx.catalog.clone(),
             path: cx.session.search_path.clone(),
             user: cx.session.user.clone(),
+            bypass_rls: cx.session.bypass_rls,
             database: cx.shared.database_name.clone(),
         }
+    }
+
+    /// The roles the catalogs show: the session's login (OID 10) and
+    /// every other name that a policy applies to, in name order.
+    fn roles(&self) -> Vec<(i64, String)> {
+        let mut others: Vec<&String> = self
+            .cat
+            .tables
+            .values()
+            .flat_map(|t| t.policies.iter().flat_map(|p| p.roles.iter()))
+            .filter(|r| **r != self.user)
+            .collect();
+        others.sort();
+        others.dedup();
+        let mut out = vec![(OWNER_OID, self.user.clone())];
+        out.extend(others.into_iter().enumerate().map(|(i, r)| (ROLE_BASE + i as i64, r.clone())));
+        out
+    }
+
+    fn role_oid(&self, name: &str) -> Option<i64> {
+        self.roles().into_iter().find(|(_, n)| n == name).map(|(oid, _)| oid)
+    }
+
+    fn role_name(&self, oid: i64) -> Option<String> {
+        self.roles().into_iter().find(|(o, _)| *o == oid).map(|(_, n)| n)
     }
 
     /// `(oid, name)` of every schema, system schemas first.

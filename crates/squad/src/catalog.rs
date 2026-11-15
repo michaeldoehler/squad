@@ -96,6 +96,75 @@ pub struct Table {
     /// Set for tables created `USING columnar`.
     #[serde(default)]
     pub columnar: Option<Columnar>,
+    /// `ENABLE ROW LEVEL SECURITY` (`pg_class.relrowsecurity`).
+    #[serde(default)]
+    pub row_security: bool,
+    /// `FORCE ROW LEVEL SECURITY` (`pg_class.relforcerowsecurity`): the
+    /// policies apply to logins that bypass them otherwise.
+    #[serde(default)]
+    pub force_row_security: bool,
+    /// Row-level security policies, in creation order.
+    #[serde(default)]
+    pub policies: Vec<Policy>,
+}
+
+/// The command a policy applies to (`pg_policy.polcmd`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PolicyCommand {
+    All,
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+impl PolicyCommand {
+    /// `pg_policy.polcmd`.
+    pub fn code(self) -> char {
+        match self {
+            PolicyCommand::All => '*',
+            PolicyCommand::Select => 'r',
+            PolicyCommand::Insert => 'a',
+            PolicyCommand::Update => 'w',
+            PolicyCommand::Delete => 'd',
+        }
+    }
+
+    /// `pg_policies.cmd`.
+    pub fn name(self) -> &'static str {
+        match self {
+            PolicyCommand::All => "ALL",
+            PolicyCommand::Select => "SELECT",
+            PolicyCommand::Insert => "INSERT",
+            PolicyCommand::Update => "UPDATE",
+            PolicyCommand::Delete => "DELETE",
+        }
+    }
+}
+
+/// A row-level security policy (`CREATE POLICY`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Policy {
+    /// Object id (`pg_policy.oid` is derived from it).
+    pub id: u32,
+    pub name: String,
+    /// `AS PERMISSIVE` (the default) or `AS RESTRICTIVE`.
+    pub permissive: bool,
+    pub command: PolicyCommand,
+    /// Login names the policy applies to; empty means `PUBLIC`.
+    pub roles: Vec<String>,
+    /// SQL text of the `USING` expression.
+    pub using: Option<String>,
+    /// SQL text of the `WITH CHECK` expression.
+    pub check: Option<String>,
+}
+
+impl Policy {
+    /// True if the policy applies to `user` running `command`.
+    pub fn applies(&self, command: PolicyCommand, user: &str) -> bool {
+        (self.command == PolicyCommand::All || self.command == command)
+            && (self.roles.is_empty() || self.roles.iter().any(|r| r == user))
+    }
 }
 
 /// Options of a columnar table.
@@ -390,6 +459,17 @@ mod tests {
                 checks: vec![],
                 foreign_keys: vec![],
                 columnar: None,
+                row_security: true,
+                force_row_security: false,
+                policies: vec![Policy {
+                    id: 7,
+                    name: "p".into(),
+                    permissive: false,
+                    command: PolicyCommand::Select,
+                    roles: vec!["app".into()],
+                    using: Some("id > 0".into()),
+                    check: None,
+                }],
             }),
         );
         let back = Catalog::from_bytes(&c.to_bytes()).unwrap();

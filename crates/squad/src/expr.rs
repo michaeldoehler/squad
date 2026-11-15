@@ -326,6 +326,19 @@ impl Expr {
     pub fn is_volatile(&self) -> bool {
         let mut found = false;
         self.walk(&mut |e| match e {
+            // Stable in PostgreSQL's terms: the same value throughout a
+            // statement, so they can bound an index scan or be compared
+            // by the column engine. Policies use `current_setting`.
+            Expr::Session(
+                SessionFn::CurrentSetting
+                | SessionFn::CurrentUser
+                | SessionFn::CurrentSchema
+                | SessionFn::CurrentSchemas
+                | SessionFn::CurrentDatabase
+                | SessionFn::Version
+                | SessionFn::BackendPid,
+                _,
+            ) => {}
             Expr::Session(..) | Expr::Subquery(_) => found = true,
             Expr::Call(f, _)
                 if matches!(&*f.name, "random" | "gen_random_uuid" | "uuid_generate_v4" | "clock_timestamp") =>

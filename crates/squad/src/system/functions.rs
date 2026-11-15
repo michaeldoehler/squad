@@ -287,7 +287,7 @@ pub(crate) fn catalog_fn(name: &str, args: Vec<Value>, cx: &mut ExecCx) -> Resul
         },
         "regrole" | "to_regrole" => match arg(0) {
             Value::Null => Value::Null,
-            v if text(v) == env.user => Value::Int8(OWNER_OID),
+            v if env.role_oid(text(v)).is_some() => Value::Int8(env.role_oid(text(v)).unwrap_or(OWNER_OID)),
             _ if name == "to_regrole" => Value::Null,
             v => return Err(undefined(sqlstate::UNDEFINED_OBJECT, "role", text(v))),
         },
@@ -323,6 +323,7 @@ pub(crate) fn catalog_fn(name: &str, args: Vec<Value>, cx: &mut ExecCx) -> Resul
         "regrole_out" | "pg_get_userbyid" => match int(arg(0)) {
             None => Value::Null,
             Some(OWNER_OID) => Value::Text(env.user.clone()),
+            Some(oid) if env.role_name(oid).is_some() => Value::Text(env.role_name(oid).unwrap_or_default()),
             Some(oid) if name == "regrole_out" => Value::Text(oid.to_string()),
             Some(oid) => Value::Text(format!("unknown (OID={oid})")),
         },
