@@ -13,6 +13,37 @@ use crate::session::split_qualified;
 use crate::types::{Type, Value, PG_EPOCH_UNIX_MICROS};
 use crate::{sqlstate, Error, Result};
 
+/// Type of argument `i` of a catalog helper function with `args`
+/// arguments, where PostgreSQL's signature is not text. Untyped arguments
+/// such as parameters get this type.
+pub(crate) fn catalog_fn_arg_type(name: &str, args: usize, i: usize) -> Option<Type> {
+    Some(match (name, args, i) {
+        ("pg_cancel_backend" | "pg_terminate_backend", _, 0) => Type::Int4,
+        ("pg_terminate_backend", 2, 1) => Type::Int8,
+        (
+            "pg_advisory_lock"
+            | "pg_advisory_lock_shared"
+            | "pg_advisory_xact_lock"
+            | "pg_advisory_xact_lock_shared"
+            | "pg_advisory_unlock"
+            | "pg_advisory_unlock_shared"
+            | "pg_try_advisory_lock"
+            | "pg_try_advisory_lock_shared"
+            | "pg_try_advisory_xact_lock"
+            | "pg_try_advisory_xact_lock_shared",
+            1 | 2,
+            _,
+        ) => {
+            if args == 1 {
+                Type::Int8
+            } else {
+                Type::Int4
+            }
+        }
+        _ => return None,
+    })
+}
+
 /// Result type of a catalog helper function, if `name` is one that takes
 /// `args` arguments.
 pub(crate) fn catalog_fn_type(name: &str, args: usize) -> Option<Type> {

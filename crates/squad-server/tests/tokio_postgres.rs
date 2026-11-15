@@ -338,7 +338,7 @@ fn pg_terminate_backend_closes_the_connection() {
         // An idle connection is closed at once, with the same error.
         let (idle, idle_conn) = connect_watched(&conninfo).await;
         let pid: i32 = idle.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
-        let ok: bool = admin.query_one("SELECT pg_terminate_backend($1::int, 5000)", &[&pid]).await.unwrap().get(0);
+        let ok: bool = admin.query_one("SELECT pg_terminate_backend($1, $2)", &[&pid, &5000i64]).await.unwrap().get(0);
         assert!(ok, "the session should be gone within the timeout");
         let err = tokio::time::timeout(Duration::from_secs(10), idle_conn).await.unwrap().unwrap().unwrap_err();
         assert_eq!(sqlstate(&err), Some("57P01"), "{err}");
@@ -352,6 +352,18 @@ fn pg_terminate_backend_closes_the_connection() {
         assert_eq!(sqlstate(&err), Some("57P01"), "{err}");
         let _ = me_conn.await.unwrap();
         assert!(me.is_closed());
+
+        // Parameters get PostgreSQL's argument types, as drivers that
+        // describe a statement before binding (tokio-postgres, JDBC) need.
+        let st = admin
+            .prepare(
+                "SELECT pg_cancel_backend($1), pg_terminate_backend($2), pg_advisory_lock($3),
+                        pg_try_advisory_lock($4, $5), pg_size_pretty(1024)",
+            )
+            .await
+            .unwrap();
+        use tokio_postgres::types::Type;
+        assert_eq!(st.params(), [Type::INT4, Type::INT4, Type::INT8, Type::INT4, Type::INT4]);
 
         // Unknown pids give false, and the other connections live on.
         let ok: bool = admin.query_one("SELECT pg_terminate_backend(2147483647)", &[]).await.unwrap().get(0);

@@ -858,10 +858,21 @@ impl<'a> Binder<'a> {
 
     /// Functions answered by the session or the catalog.
     fn bind_session_fn(&mut self, name: &str, args: &mut Vec<Typed>) -> Result<Option<Typed>> {
+        // Untyped arguments (`$1`, `'42'`) get the type PostgreSQL's
+        // signature gives them, text where squad does not know it.
         let text_args = |b: &mut Self, args: &mut Vec<Typed>| -> Result<Vec<Expr>> {
+            let n = args.len();
             std::mem::take(args)
                 .into_iter()
-                .map(|(e, t)| if t == Type::Unknown { b.coerce(e, &t, &Type::Text) } else { Ok(e) })
+                .enumerate()
+                .map(|(i, (e, t))| {
+                    if t == Type::Unknown {
+                        let to = crate::system::catalog_fn_arg_type(name, n, i).unwrap_or(Type::Text);
+                        b.coerce(e, &t, &to)
+                    } else {
+                        Ok(e)
+                    }
+                })
                 .collect()
         };
         let (func, ret) = match (name, args.len()) {

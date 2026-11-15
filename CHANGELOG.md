@@ -259,6 +259,11 @@ preparing it for production use.
   instead of `int2vector` (`'1 2 4'`); SQLAlchemy failed to parse them.
 - `pg_stat_activity` showed only the calling session, and
   `pg_cancel_backend` / `pg_terminate_backend` did not exist.
+- Parameters of the catalog helper functions were always typed `text`.
+  `pg_cancel_backend($1)` and `pg_terminate_backend($1, $2)` now take
+  `integer` and `bigint`, and the advisory lock functions `bigint` (one
+  argument) or `integer` (two), as in PostgreSQL; drivers that send
+  binary parameters (tokio-postgres) failed with a type mismatch.
 
 - Damage in the middle of the write-ahead log (a record that later
   records show was already durable) made recovery drop every later

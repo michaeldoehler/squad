@@ -232,7 +232,9 @@ Helper functions include `format_type`, `pg_get_expr`,
 `current_schema(s)`, `current_setting`, `set_config`, `version`,
 `pg_typeof`, `pg_cancel_backend`, `pg_terminate_backend`, the
 `has_*_privilege` family (always true) and the size functions (which
-return 0).
+return 0). A parameter (`$1`) passed to a helper function is typed as in
+PostgreSQL for the backend and advisory lock functions, and as `text` for
+the others.
 
 ## Reporting a difference
 

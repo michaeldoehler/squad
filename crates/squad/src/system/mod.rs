@@ -26,7 +26,7 @@ use crate::expr::{Expr, Row};
 use crate::types::{Type, Value};
 use crate::{Error, Result};
 
-pub(crate) use functions::{catalog_fn, catalog_fn_type};
+pub(crate) use functions::{catalog_fn, catalog_fn_arg_type, catalog_fn_type};
 
 const PG_CATALOG: &str = "pg_catalog";
 const INFORMATION_SCHEMA: &str = "information_schema";
