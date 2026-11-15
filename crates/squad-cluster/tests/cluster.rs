@@ -621,6 +621,7 @@ fn what_cannot_be_answered_correctly_is_rejected() {
         "SELECT string_agg(email, ',' ORDER BY id) FROM users",
         "SELECT array_agg(id) FROM users",
         "SELECT stddev(score) FROM users",
+        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY score) FROM users",
         "SELECT sum(DISTINCT score) FROM users",
         "SELECT count(DISTINCT (id, score)) FROM users",
         // Window functions, set operations, DISTINCT ON.
@@ -673,6 +674,7 @@ fn what_cannot_be_answered_correctly_is_rejected() {
         "WITH big AS (SELECT * FROM users WHERE project_id = 1 AND score > 3) SELECT count(*) FROM big",
         "SELECT * FROM users WHERE project_id = 1 FOR UPDATE",
         "SELECT project_id, array_agg(id) FROM users GROUP BY project_id",
+        "SELECT project_id, mode() WITHIN GROUP (ORDER BY score) FROM users GROUP BY project_id",
     ] {
         conn.query(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }

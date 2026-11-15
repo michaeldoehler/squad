@@ -85,6 +85,7 @@ const QUERIES: &[&str] = &[
     "SELECT name, rank() OVER (ORDER BY count(*) DESC, name) FROM {t} GROUP BY name ORDER BY 2",
     "SELECT count(*) FROM (SELECT DISTINCT user_id, name FROM {t}) s",
     "SELECT name, count(*) FROM {t} GROUP BY name HAVING count(*) > 10 ORDER BY count(*) DESC, name LIMIT 2",
+    "SELECT name, percentile_cont(0.5) WITHIN GROUP (ORDER BY duration), percentile_disc(0.9) WITHIN GROUP (ORDER BY revenue), mode() WITHIN GROUP (ORDER BY project) FROM {t} GROUP BY name ORDER BY name",
 ];
 
 fn rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {

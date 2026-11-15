@@ -275,5 +275,8 @@ pub(crate) fn is_aggregate(name: &str) -> bool {
             | "approx_count_distinct"
             | "approx_distinct"
             | "approx_percentile"
+            | "percentile_cont"
+            | "percentile_disc"
+            | "mode"
     )
 }

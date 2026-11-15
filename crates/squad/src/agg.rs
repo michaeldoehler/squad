@@ -366,6 +366,119 @@ fn json_result(tree: Json, ret: &Type) -> Value {
     }
 }
 
+// ------------------------------------------------- ordered-set aggregates
+//
+// `percentile_cont`, `percentile_disc` and `mode` with WITHIN GROUP are
+// planned as `array_agg(x ORDER BY x) FILTER (WHERE x IS NOT NULL)` and a
+// final function over the sorted values and the direct argument, which is
+// evaluated once per group like any expression over the grouped row.
+
+fn percentile(v: &Value) -> Result<Option<f64>> {
+    let Some(p) = v.as_f64() else { return Ok(None) };
+    if !(0.0..=1.0).contains(&p) {
+        return Err(Error::new(
+            crate::sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+            format!(
+                "percentile value {} is not between 0 and 1",
+                value::format_value(&Value::Float8(p), &Default::default())
+            ),
+        ));
+    }
+    Ok(Some(p))
+}
+
+/// Applies `one` to the percentile argument: a number, or an array of
+/// them giving an array of results. Without input rows the result is
+/// NULL; a single percentile is checked even then, as in PostgreSQL.
+fn ordered_set(c: &crate::FnCtx, a: &[Value], one: fn(&crate::FnCtx, &[Value], f64) -> Result<Value>) -> Result<Value> {
+    let values: &[Value] = match &a[1] {
+        Value::Array(v) => v,
+        _ => &[],
+    };
+    match &a[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Array(ps) => {
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut out = Vec::with_capacity(ps.len());
+            for p in ps {
+                out.push(match percentile(p)? {
+                    Some(p) => one(c, values, p)?,
+                    None => Value::Null,
+                });
+            }
+            Ok(Value::Array(out))
+        }
+        p => match percentile(p)? {
+            Some(p) if !values.is_empty() => one(c, values, p),
+            _ => Ok(Value::Null),
+        },
+    }
+}
+
+fn interval_op(op: &str, right: Type) -> FuncImpl {
+    value::resolve_operator(op, Some(&Type::Interval), &right).expect("interval operator").eval
+}
+
+/// Linear interpolation between neighbouring values, as PostgreSQL's
+/// `percentile_cont`: `lo + (hi - lo) * fraction`.
+fn cont(c: &crate::FnCtx, values: &[Value], p: f64) -> Result<Value> {
+    let pos = p * (values.len() - 1) as f64;
+    let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+    if lo == hi {
+        return Ok(values[lo].clone());
+    }
+    let t = pos - lo as f64;
+    Ok(match (&values[lo], &values[hi]) {
+        (Value::Float8(x), Value::Float8(y)) => Value::Float8(x + (y - x) * t),
+        (x @ Value::Interval(_), y @ Value::Interval(_)) => {
+            static OPS: OnceLock<[FuncImpl; 3]> = OnceLock::new();
+            let [sub, mul, add] = OPS.get_or_init(|| {
+                [interval_op("-", Type::Interval), interval_op("*", Type::Float8), interval_op("+", Type::Interval)]
+            });
+            let diff = sub(c, &[y.clone(), x.clone()])?;
+            let step = mul(c, &[diff, Value::Float8(t)])?;
+            add(c, &[x.clone(), step])?
+        }
+        _ => return Err(Error::internal("percentile_cont over values that are not float8 or interval")),
+    })
+}
+
+/// The first value whose position in the sorted input is at least the
+/// fraction of the input.
+fn disc(_: &crate::FnCtx, values: &[Value], p: f64) -> Result<Value> {
+    let row = ((p * values.len() as f64).ceil() as usize).clamp(1, values.len());
+    Ok(values[row - 1].clone())
+}
+
+pub(crate) fn percentile_cont_final(c: &crate::FnCtx, a: &[Value]) -> Result<Value> {
+    ordered_set(c, a, cont)
+}
+
+pub(crate) fn percentile_disc_final(c: &crate::FnCtx, a: &[Value]) -> Result<Value> {
+    ordered_set(c, a, disc)
+}
+
+/// The most frequent value; among equally frequent ones the first in
+/// sort order.
+pub(crate) fn mode_final(_: &crate::FnCtx, a: &[Value]) -> Result<Value> {
+    let Value::Array(values) = &a[0] else { return Ok(Value::Null) };
+    let mut best: Option<(&Value, usize)> = None;
+    let mut i = 0;
+    while i < values.len() {
+        let mut j = i + 1;
+        while j < values.len() && compare(&values[i], &values[j]) == Ordering::Equal {
+            j += 1;
+        }
+        if best.is_none_or(|(_, n)| j - i > n) {
+            best = Some((&values[i], j - i));
+        }
+        i = j;
+    }
+    Ok(best.map_or(Value::Null, |(v, _)| v.clone()))
+}
+
 pub(crate) fn aggregate(input: &Plan, groups: &[Expr], aggs: &[AggCall], cx: &mut ExecCx) -> Result<Vec<Row>> {
     let mut node = crate::exec::open(input, cx)?;
     let fresh = || aggs.iter().map(|a| Runner::new(a, &a.func)).collect::<Vec<_>>();

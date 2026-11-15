@@ -139,6 +139,9 @@ preparing it for production use.
   connection fails every statement with `57P01`.
   `Session::is_terminated`, `Session::set_terminate_hook` and
   `Session::refresh_activity`.
+- Ordered-set aggregates `percentile_cont`, `percentile_disc` and `mode`
+  with `WITHIN GROUP (ORDER BY …)`, for one fraction or an array of
+  fractions, as in PostgreSQL. They used to fail with `0A000`.
 - `scripts/sqlalchemy-check.py`: compares SQLAlchemy's schema
   introspection of squad with that of PostgreSQL.
 

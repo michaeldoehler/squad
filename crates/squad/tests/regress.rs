@@ -125,6 +125,7 @@ regress!(
     fuzz_misc,
     noops,
     vectors,
+    ordered_set,
 );
 
 /// Every script in the directory must be listed above.

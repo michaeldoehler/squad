@@ -38,7 +38,10 @@ How the evidence is produced is described in [testing](testing.md).
   `bool_or`, `every`, `bit_and`, `bit_or`, `string_agg`, `array_agg`,
   `json_agg`, `jsonb_agg`, `json_object_agg`, `jsonb_object_agg`,
   `variance`, `var_pop`, `var_samp`, `stddev`, `stddev_pop`,
-  `stddev_samp`; with `DISTINCT`, `ORDER BY` and `FILTER`.
+  `stddev_samp`; with `DISTINCT`, `ORDER BY` and `FILTER`. The
+  ordered-set aggregates `percentile_cont`, `percentile_disc` (with one
+  fraction or an array of them) and `mode` with `WITHIN GROUP (ORDER BY
+  …)`, also with `FILTER`.
 - **Window functions:** `row_number`, `rank`, `dense_rank`,
   `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`,
   `last_value`, `nth_value` and every aggregate, with `PARTITION BY`,
@@ -133,7 +136,7 @@ These fail with SQLSTATE `0A000` (`feature_not_supported`) or an
 | Partitioning, inheritance | |
 | `MERGE` | use `INSERT … ON CONFLICT` |
 | `GROUPING SETS`, `ROLLUP`, `CUBE` | |
-| Ordered-set aggregates (`percentile_cont`, `mode`, `WITHIN GROUP`) | |
+| Hypothetical-set aggregates (`rank(x) WITHIN GROUP (ORDER BY …)` and `dense_rank`, `percent_rank`, `cume_dist` in that form) | the window functions of the same names are supported |
 | Correlated subqueries above `GROUP BY` | a subquery in the select list or `HAVING` of a grouped query that refers to the outer query's columns |
 | SQL cursors (`DECLARE`, `FETCH`) | protocol-level portals work |
 | `LISTEN` / `NOTIFY` | |
