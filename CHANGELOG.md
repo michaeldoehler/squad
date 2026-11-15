@@ -121,6 +121,15 @@ preparing it for production use.
 - `Database::remote_status()` and the fields `fenced` and `local_lsn`
   of `RemoteStats`, for health checks of services that embed squad.
 - `docs/deployment.md`: running on Docker Swarm with Garage.
+- `int2vector` and `oidvector`: `pg_index.indkey`, `indoption`,
+  `indclass` and `indcollation` have these types, with PostgreSQL's
+  space-separated text form (`'1 2 4'`, also for `indkey::varchar`) and
+  subscripts from 0, so that the index introspection of SQLAlchemy 1.4
+  and 2.x (Apache Superset) works. `indclass` holds the default B-tree
+  operator class of each column, `indcollation` the column's collation,
+  and `pg_opclass` lists those classes.
+- `scripts/sqlalchemy-check.py`: compares SQLAlchemy's schema
+  introspection of squad with that of PostgreSQL.
 - `approx_distinct(x)`, another name of `approx_count_distinct(x)` with
   the same fast path on columnar tables; Apache Superset writes it for
   its approximate distinct count.
@@ -189,6 +198,8 @@ preparing it for production use.
 
 ### Fixed
 
+- `pg_index.indkey` and `indoption` were `smallint[]` (`'{1,2,4}'`)
+  instead of `int2vector` (`'1 2 4'`); SQLAlchemy failed to parse them.
 - Damage in the middle of the write-ahead log (a record that later
   records show was already durable) made recovery drop every later
   commit silently; the open now fails with a corruption error and

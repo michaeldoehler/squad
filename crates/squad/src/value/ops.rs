@@ -639,36 +639,30 @@ fn starts_with_op(_: &FnCtx, a: &[Value]) -> Result<Value> {
 
 // ----------------------------------------------------------------- arrays
 
-fn items(v: &Value) -> Result<&[Value]> {
-    match v {
-        Value::Array(i) => Ok(i),
-        _ => Err(bad_arg()),
-    }
+/// Elements of an array or vector (`int2vector`, `oidvector`) argument.
+pub(crate) fn items(v: &Value) -> Result<&[Value]> {
+    v.array_items().map(|(i, _)| i).ok_or_else(bad_arg)
 }
 
 fn arr_cat(_: &FnCtx, a: &[Value]) -> Result<Value> {
     Ok(match (&a[0], &a[1]) {
         (Value::Null, Value::Null) => Value::Null,
-        (Value::Array(x), Value::Null) | (Value::Null, Value::Array(x)) => Value::Array(x.clone()),
-        (Value::Array(x), Value::Array(y)) => Value::Array(x.iter().chain(y).cloned().collect()),
-        _ => return Err(bad_arg()),
+        (x, Value::Null) | (Value::Null, x) => Value::Array(items(x)?.to_vec()),
+        (x, y) => Value::Array(items(x)?.iter().chain(items(y)?).cloned().collect()),
     })
 }
 pub(crate) fn arr_append(_: &FnCtx, a: &[Value]) -> Result<Value> {
     let mut out = match &a[0] {
         Value::Null => Vec::new(),
-        Value::Array(x) => x.clone(),
-        _ => return Err(bad_arg()),
+        x => items(x)?.to_vec(),
     };
     out.push(a[1].clone());
     Ok(Value::Array(out))
 }
 pub(crate) fn arr_prepend(_: &FnCtx, a: &[Value]) -> Result<Value> {
     let mut out = vec![a[0].clone()];
-    match &a[1] {
-        Value::Null => {}
-        Value::Array(x) => out.extend(x.iter().cloned()),
-        _ => return Err(bad_arg()),
+    if !a[1].is_null() {
+        out.extend(items(&a[1])?.iter().cloned());
     }
     Ok(Value::Array(out))
 }

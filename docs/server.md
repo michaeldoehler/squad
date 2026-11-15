@@ -264,6 +264,7 @@ Two caveats:
 | `pgbench` 16 | initialization, TPC-B-like and select-only scripts, simple and prepared mode, no failed transactions |
 | `tokio-postgres` | typed parameters and results, transactions, savepoints, portals, `COPY IN`, SCRAM, TLS (tokio-postgres-rustls), cancel tokens, notices |
 | `sqlx` 0.8 | see above |
+| SQLAlchemy 1.4, 2.0, 2.1 with psycopg2 | `inspect(engine)`: tables, views, columns, primary, foreign and unique keys, indexes, check constraints, compared with PostgreSQL 16 by `scripts/sqlalchemy-check.py` (run by hand). Remaining differences: check constraint text lacks PostgreSQL's casts (`score >= 0` instead of `score >= 0::numeric`), and view columns of type `varchar(n)` are reported as `text`. |
 
 ## Protocol coverage
 

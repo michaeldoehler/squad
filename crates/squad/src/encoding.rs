@@ -89,7 +89,7 @@ pub fn encode_key(out: &mut Vec<u8>, v: &Value) {
         Value::Uuid(u) => out.extend_from_slice(u),
         Value::Enum(ord, _) => out.extend_from_slice(&ord.to_be_bytes()),
         Value::Jsonb(j) => push_escaped(out, j.to_string().as_bytes()),
-        Value::Array(items) | Value::Record(items) => {
+        Value::Array(items) | Value::Vector(items) | Value::Record(items) => {
             for item in items {
                 out.push(1);
                 encode_key(out, item);
@@ -207,6 +207,11 @@ fn encode_value(out: &mut Vec<u8>, v: &Value) {
             push_varint(out, items.len() as u64);
             items.iter().for_each(|i| encode_value(out, i));
         }
+        Value::Vector(items) => {
+            out.push(22);
+            push_varint(out, items.len() as u64);
+            items.iter().for_each(|i| encode_value(out, i));
+        }
     }
 }
 
@@ -287,16 +292,16 @@ impl<'a> Reader<'a> {
             16 => Value::Uuid(self.array()?),
             17 => Value::Json(self.string()?),
             18 => Value::Jsonb(Box::new(serde_json::from_slice(self.bytes()?).map_err(|_| corrupt())?)),
-            t @ (19 | 21) => {
+            t @ (19 | 21 | 22) => {
                 let n = self.varint()? as usize;
                 let mut items = Vec::with_capacity(n.min(1 << 16));
                 for _ in 0..n {
                     items.push(self.value()?);
                 }
-                if t == 19 {
-                    Value::Array(items)
-                } else {
-                    Value::Record(items)
+                match t {
+                    19 => Value::Array(items),
+                    21 => Value::Record(items),
+                    _ => Value::Vector(items),
                 }
             }
             20 => {
@@ -403,6 +408,7 @@ mod tests {
             Value::Array(vec![Value::Int4(1), Value::Null]),
             Value::Enum(2, "happy".into()),
             Value::Record(vec![Value::Int4(1), Value::text("x")]),
+            Value::Vector(vec![Value::Int2(3), Value::Int2(1)]),
         ];
         assert_eq!(decode_row(&encode_row(&row)).unwrap(), row);
         assert!(decode_row(&[5, 9]).is_err());

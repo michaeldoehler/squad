@@ -82,7 +82,9 @@ pub fn to_tree(v: &Value, c: &FnCtx) -> Result<J> {
         Value::TimestampTz(t) if dt::is_finite_ts(*t) => {
             J::String(iso_timestamp(*t, Some(dt::session_zone(c).offset_at_utc(*t))))
         }
-        Value::Array(items) => J::Array(items.iter().map(|i| to_tree(i, c)).collect::<Result<_>>()?),
+        Value::Array(items) | Value::Vector(items) => {
+            J::Array(items.iter().map(|i| to_tree(i, c)).collect::<Result<_>>()?)
+        }
         Value::Record(items) => {
             let mut m = serde_json::Map::new();
             for (i, item) in items.iter().enumerate() {
@@ -102,7 +104,7 @@ fn write_json(v: &Value, c: &FnCtx, out: &mut String) -> Result<()> {
         Value::Float4(f) if f.is_finite() => out.push_str(&io::fmt_float4(*f)),
         Value::Float8(f) if f.is_finite() => out.push_str(&io::fmt_float8(*f)),
         Value::Json(s) => out.push_str(s),
-        Value::Array(items) => {
+        Value::Array(items) | Value::Vector(items) => {
             out.push('[');
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {

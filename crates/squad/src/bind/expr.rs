@@ -606,13 +606,17 @@ impl<'a> Binder<'a> {
                     }
                     other => (r, other),
                 };
-                let Type::Array(elem) = &rt else {
-                    return Err(Error::new(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "op ANY/ALL (array) requires array on right side",
-                    ));
+                let elem = match &rt {
+                    Type::Array(elem) if **elem == Type::Unknown => Type::Text,
+                    Type::Array(elem) => (**elem).clone(),
+                    v if v.is_vector() => v.vector_elem().unwrap_or(Type::Int2),
+                    _ => {
+                        return Err(Error::new(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "op ANY/ALL (array) requires array on right side",
+                        ))
+                    }
                 };
-                let elem = if **elem == Type::Unknown { Type::Text } else { (**elem).clone() };
                 let f = value::resolve_operator(&op, Some(&l.1), &elem)?;
                 if f.ret != Type::Bool {
                     return Err(Error::new(
@@ -738,6 +742,19 @@ impl<'a> Binder<'a> {
                                 let idx = bound(self, &ix.uidx)?.ok_or_else(|| Error::syntax("missing subscript"))?;
                                 e = Expr::Subscript(Box::new(e), idx);
                                 t = (**elem).clone();
+                            }
+                        }
+                        // Subscripts of int2vector and oidvector start at
+                        // 0; a slice of one is an ordinary array.
+                        v if v.is_vector() => {
+                            let elem = v.vector_elem().unwrap_or(Type::Int2);
+                            if ix.is_slice {
+                                e = Expr::Slice(Box::new(e), bound(self, &ix.lidx)?, bound(self, &ix.uidx)?);
+                                t = elem.array_of();
+                            } else {
+                                let idx = bound(self, &ix.uidx)?.ok_or_else(|| Error::syntax("missing subscript"))?;
+                                e = Expr::Subscript(Box::new(e), idx);
+                                t = elem;
                             }
                         }
                         Type::Jsonb if !ix.is_slice => {
@@ -947,6 +964,7 @@ impl<'a> Binder<'a> {
                     let elem = match t {
                         Type::Array(e) if **e != Type::Unknown => (**e).clone(),
                         Type::Array(_) | Type::Unknown => Type::Text,
+                        t if t.is_vector() => t.vector_elem().unwrap_or(Type::Int2),
                         _ => return Err(bad()),
                     };
                     want.push(Type::Array(Box::new(elem.clone())));
@@ -992,7 +1010,7 @@ impl<'a> Binder<'a> {
                 )
             }
             Srf::GenerateSubscripts => {
-                if types.len() != 2 || !matches!(types[0], Type::Array(_)) {
+                if types.len() != 2 || !(matches!(types[0], Type::Array(_)) || types[0].is_vector()) {
                     return Err(bad());
                 }
                 let want = [types[0].clone(), Type::Int4];

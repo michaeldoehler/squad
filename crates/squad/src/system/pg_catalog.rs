@@ -1,7 +1,7 @@
 //! Row generators for the `pg_catalog` relations.
 
 use super::{
-    builtin_type, builtin_types, oid_of, row, Att, Env, Rel, ATTRDEF_BASE, DATABASE_OID, ENUM_ARRAY_BASE,
+    builtin_type, builtin_types, oid_of, row, Att, Env, Rel, Vector, ATTRDEF_BASE, DATABASE_OID, ENUM_ARRAY_BASE,
     ENUM_LABEL_BASE, NS_PG_CATALOG, OWNER_OID,
 };
 use crate::catalog::{FkAction, Table};
@@ -14,6 +14,7 @@ const AM_BTREE: i64 = 403;
 const AM_HASH: i64 = 405;
 /// Default collation, reported for collatable columns.
 const COLLATION_DEFAULT: i64 = 100;
+const COLLATION_C: i64 = 950;
 
 /// Settings listed in `pg_settings` in addition to those a session set.
 const SETTINGS: &[&str] = &[
@@ -62,6 +63,56 @@ fn is_collatable(ty: &Type) -> bool {
     matches!(ty, Type::Text) || matches!(ty, Type::Array(e) if **e == Type::Text)
 }
 
+fn collation(ty: &Type) -> i64 {
+    if is_collatable(ty) {
+        COLLATION_DEFAULT
+    } else {
+        0
+    }
+}
+
+/// The default B-tree operator classes of PostgreSQL 16 for the types
+/// squad has: `(oid, opcname, opcfamily, opcintype, opckeytype)`.
+const OPCLASSES: &[(i64, &str, i64, i64, i64)] = &[
+    (1978, "int4_ops", 1976, 23, 0),
+    (1979, "int2_ops", 1976, 21, 0),
+    (1981, "oid_ops", 1989, 26, 0),
+    (3122, "date_ops", 434, 1082, 0),
+    (3123, "float8_ops", 1970, 701, 0),
+    (3124, "int8_ops", 1976, 20, 0),
+    (3125, "numeric_ops", 1988, 1700, 0),
+    (3126, "text_ops", 1994, 25, 0),
+    (3127, "timestamptz_ops", 434, 1184, 0),
+    (3128, "timestamp_ops", 434, 1114, 0),
+    (10000, "array_ops", 397, 2277, 0),
+    (10003, "bool_ops", 424, 16, 0),
+    (10004, "bpchar_ops", 426, 1042, 0),
+    (10006, "bytea_ops", 428, 17, 0),
+    (10007, "char_ops", 429, 18, 0),
+    (10012, "float4_ops", 1970, 700, 0),
+    (10022, "interval_ops", 1982, 1186, 0),
+    (10028, "name_ops", 1994, 19, 2275),
+    (10032, "oidvector_ops", 1991, 30, 0),
+    (10034, "record_ops", 2994, 2249, 0),
+    (10038, "time_ops", 1996, 1083, 0),
+    (10065, "uuid_ops", 2968, 2950, 0),
+    (10069, "enum_ops", 3522, 3500, 0),
+    (10088, "jsonb_ops", 4033, 3802, 0),
+];
+
+/// OID of the operator class an index uses for a column: the default
+/// B-tree class of its type, as PostgreSQL chooses it.
+fn default_opclass(typid: i64, ty: &Type) -> i64 {
+    let intype = match ty {
+        Type::Enum(_) => 3500,
+        Type::Array(_) => 2277,
+        // varchar has no class of its own and uses text's.
+        _ if typid == 1043 => 25,
+        _ => typid,
+    };
+    OPCLASSES.iter().find(|c| c.3 == intype).map_or(0, |c| c.0)
+}
+
 /// One `pg_attribute` row.
 fn attribute(rel: &Rel, relid: i64, att: &Att) -> Row {
     let t = builtin_type(att.typid);
@@ -87,7 +138,7 @@ fn attribute(rel: &Rel, relid: i64, att: &Att) -> Row {
         "attislocal" => true,
         "attinhcount" => 0i16,
         "attstattarget" => -1i16,
-        "attcollation" => if is_collatable(&att.ty) { COLLATION_DEFAULT } else { 0 },
+        "attcollation" => collation(&att.ty),
     ]
 }
 
@@ -358,10 +409,24 @@ pub(super) fn scan(name: &str, rel: &Rel, env: &Env, cx: &mut ExecCx) -> Vec<Row
                         "indisready" => true,
                         "indislive" => true,
                         "indisreplident" => false,
-                        "indkey" => env.attnums(t, &ix.columns),
-                        "indcollation" => vec![0i64; n],
-                        "indclass" => vec![0i64; n],
-                        "indoption" => vec![0i16; n],
+                        "indkey" => Vector::int2(env.attnums(t, &ix.columns)),
+                        "indcollation" => Vector::oid(
+                            ix.columns
+                                .iter()
+                                .map(|&c| match t.columns[c].decl_oid {
+                                    // name columns have the C collation.
+                                    19 => COLLATION_C,
+                                    _ => collation(&t.columns[c].ty),
+                                })
+                                .collect()
+                        ),
+                        "indclass" => Vector::oid(
+                            ix.columns
+                                .iter()
+                                .map(|&c| default_opclass(t.columns[c].decl_oid as i64, &t.columns[c].ty))
+                                .collect()
+                        ),
+                        "indoption" => Vector::int2(vec![0; n]),
                     ]);
                 }
             }
@@ -515,10 +580,25 @@ pub(super) fn scan(name: &str, rel: &Rel, env: &Env, cx: &mut ExecCx) -> Vec<Row
                 out.push(row![rel; "oid" => oid, "amname" => amname, "amhandler" => handler, "amtype" => amtype]);
             }
         }
+        "pg_opclass" => {
+            for &(oid, name, family, intype, keytype) in OPCLASSES {
+                out.push(row![rel;
+                    "oid" => oid,
+                    "opcmethod" => AM_BTREE,
+                    "opcname" => name,
+                    "opcnamespace" => NS_PG_CATALOG,
+                    "opcowner" => OWNER_OID,
+                    "opcfamily" => family,
+                    "opcintype" => intype,
+                    "opcdefault" => true,
+                    "opckeytype" => keytype,
+                ]);
+            }
+        }
         "pg_collation" => {
             for (oid, collname, provider, locale) in [
                 (COLLATION_DEFAULT, "default", 'd', None),
-                (950, "C", 'c', Some("C")),
+                (COLLATION_C, "C", 'c', Some("C")),
                 (951, "POSIX", 'c', Some("POSIX")),
             ] {
                 out.push(row![rel;

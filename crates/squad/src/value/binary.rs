@@ -144,6 +144,27 @@ pub fn encode_binary(v: &Value, ty: &Type, out: &mut Vec<u8>) -> Result<()> {
                 }
             }
         }
+        // Like an array, but always one dimension with lower bound 0, as
+        // int2vectorsend and oidvectorsend write it.
+        Value::Vector(items) => {
+            let elem = if matches!(items.first(), Some(Value::Int8(_))) || *ty == Type::OidVector {
+                Type::Oid
+            } else {
+                Type::Int2
+            };
+            out.extend_from_slice(&1i32.to_be_bytes());
+            out.extend_from_slice(&0i32.to_be_bytes());
+            out.extend_from_slice(&elem.oid().to_be_bytes());
+            out.extend_from_slice(&(items.len() as i32).to_be_bytes());
+            out.extend_from_slice(&0i32.to_be_bytes());
+            for item in items {
+                let at = out.len();
+                out.extend_from_slice(&[0; 4]);
+                encode_binary(item, &elem, out)?;
+                let len = (out.len() - at - 4) as i32;
+                out[at..at + 4].copy_from_slice(&len.to_be_bytes());
+            }
+        }
         Value::Record(items) => {
             out.extend_from_slice(&(items.len() as i32).to_be_bytes());
             for item in items {
@@ -246,6 +267,13 @@ pub fn decode_binary(b: &[u8], ty: &Type) -> Result<Value> {
                 }
             }
             Value::Array(items)
+        }
+        Type::Int2Vector | Type::OidVector => {
+            let elem = if *ty == Type::Int2Vector { Type::Int2 } else { Type::Oid };
+            match decode_binary(b, &elem.clone().array_of())? {
+                Value::Array(items) if !items.iter().any(Value::is_null) => Value::Vector(items),
+                _ => return Err(Error::new(sqlstate::INVALID_BINARY_REPRESENTATION, "invalid int2vector data")),
+            }
         }
         Type::Record | Type::Void => return Err(Error::unsupported(format!("binary input of type {}", ty.name()))),
     })

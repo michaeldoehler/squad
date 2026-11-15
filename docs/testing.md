@@ -126,6 +126,10 @@ when the tools are missing.
   and select-only scripts and the resulting balances are verified.
 - `tokio-postgres` and `sqlx` run typed queries, transactions, array
   parameters, custom enum types and sqlx's migrator.
+- On demand, `scripts/sqlalchemy-check.py` creates the same tables in
+  squad and in PostgreSQL 16 and compares what SQLAlchemy's inspector
+  (indexes, keys, columns, constraints) reports for both; it needs
+  SQLAlchemy and psycopg2 in a virtual environment (see the script).
 
 `crates/squad/tests/catalog.rs` replays the catalog queries behind
 psql's backslash commands and typical ORM introspection queries, with

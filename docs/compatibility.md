@@ -160,6 +160,7 @@ These fail with SQLSTATE `0A000` (`feature_not_supported`) or an
 | `uuid` | `gen_random_uuid()`, `uuid_generate_v4()` |
 | `json`, `jsonb` | `jsonb` numbers do not keep trailing zeros (`1.50` is stored as `1.5`) |
 | arrays | **one-dimensional only**; lower bound always 1 |
+| `int2vector`, `oidvector` | as in `pg_index.indkey` / `indclass`: space-separated text form, subscripts from 0, `= ANY`, `unnest`, `generate_subscripts`, `array_position` and the other array functions. A cast to an array type (`indkey::int2[]`) and the array functions that return arrays (`array_append`, `array_cat`, `array_remove`, …) return arrays with lower bound 1; PostgreSQL keeps the lower bound 0 (`[0:2]={3,1,4}`), so a subscript of such a result picks a different element. `int2vector = int2[]` is accepted (PostgreSQL has no such operator). |
 | enums | labels can be appended, not inserted or renamed |
 | `oid`, `"char"`, `name`, `regclass`, `regtype` | present as far as catalog queries need them; `regclass` values print as numbers in some places where Postgres prints names |
 
@@ -197,7 +198,8 @@ These fail with SQLSTATE `0A000` (`feature_not_supported`) or an
 `pg_namespace`, `pg_index`, `pg_constraint`, `pg_attrdef`, `pg_enum`,
 `pg_sequence(s)`, `pg_tables`, `pg_views`, `pg_indexes`, `pg_database`,
 `pg_roles`, `pg_settings`, `pg_am`, `pg_collation`, `pg_extension`,
-`pg_stat_activity` and others with content, and about a hundred more
+`pg_opclass` (the default B-tree operator classes), `pg_stat_activity`
+and others with content, and about a hundred more
 relations with the right columns and no rows, so that queries joining
 them still run. `information_schema` has `tables`, `columns`,
 `schemata`, `table_constraints`, `key_column_usage`,

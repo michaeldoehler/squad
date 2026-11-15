@@ -282,7 +282,7 @@ impl<T: FromSql> FromSql for Vec<T> {
     fn from_value(value: &Value) -> Result<Vec<T>> {
         match value {
             Value::Null => Err(unexpected_null::<Vec<T>>()),
-            Value::Array(items) => items.iter().map(T::from_value).collect(),
+            Value::Array(items) | Value::Vector(items) => items.iter().map(T::from_value).collect(),
             v => Err(mismatch::<Vec<T>>(v)),
         }
     }

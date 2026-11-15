@@ -491,7 +491,7 @@ impl Expr {
                 let l = left.eval(row, cx)?;
                 let items = match right.eval(row, cx)? {
                     Value::Null => return Ok(Value::Null),
-                    Value::Array(items) => items,
+                    Value::Array(items) | Value::Vector(items) => items,
                     other => return Err(Error::internal(format!("ANY/ALL over non-array {other:?}"))),
                 };
                 quantified(items.iter(), *all, |item| {
@@ -505,6 +505,11 @@ impl Expr {
             Expr::Subscript(arr, idx) => match (arr.eval(row, cx)?, idx.eval(row, cx)?) {
                 (Value::Array(items), idx) => match idx.as_i64() {
                     Some(i) if i >= 1 => items.into_iter().nth(i as usize - 1).unwrap_or(Value::Null),
+                    _ => Value::Null,
+                },
+                // Vector subscripts start at 0.
+                (Value::Vector(items), idx) => match idx.as_i64() {
+                    Some(i) if i >= 0 => items.into_iter().nth(i as usize).unwrap_or(Value::Null),
                     _ => Value::Null,
                 },
                 (Value::Jsonb(j), idx) => {
@@ -521,11 +526,17 @@ impl Expr {
                 _ => Value::Null,
             },
             Expr::Slice(arr, lo, hi) => {
-                let Value::Array(items) = arr.eval(row, cx)? else { return Ok(Value::Null) };
+                // The result is an array with lower bound 1 also for a
+                // vector (lower bound 0), as in PostgreSQL.
+                let (items, lower) = match arr.eval(row, cx)? {
+                    Value::Array(items) => (items, 1),
+                    Value::Vector(items) => (items, 0),
+                    _ => return Ok(Value::Null),
+                };
                 let bound = |e: &Option<Box<Expr>>, default: i64, cx: &mut ExecCx| -> Result<Option<i64>> {
                     match e {
                         None => Ok(Some(default)),
-                        Some(e) => Ok(e.eval(row, cx)?.as_i64()),
+                        Some(e) => Ok(e.eval(row, cx)?.as_i64().map(|b| b - lower + 1)),
                     }
                 };
                 let (Some(lo), Some(hi)) = (bound(lo, 1, cx)?, bound(hi, items.len() as i64, cx)?) else {

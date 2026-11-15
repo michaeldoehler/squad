@@ -1202,7 +1202,7 @@ fn srf_rows(func: &Srf, args: Vec<Value>, cx: &mut ExecCx) -> Result<Vec<Row>> {
             let lists: Vec<Vec<Value>> = args
                 .into_iter()
                 .map(|a| match a {
-                    Value::Array(items) => items,
+                    Value::Array(items) | Value::Vector(items) => items,
                     _ => Vec::new(),
                 })
                 .collect();
@@ -1285,8 +1285,10 @@ fn srf_rows(func: &Srf, args: Vec<Value>, cx: &mut ExecCx) -> Result<Vec<Row>> {
                 _ => Vec::new(),
             }
         }
-        Srf::GenerateSubscripts => match (&args[0], args[1].as_i64()) {
-            (Value::Array(items), Some(1)) => (1..=items.len() as i32).map(|i| one(Value::Int4(i))).collect(),
+        Srf::GenerateSubscripts => match (args[0].array_items(), args[1].as_i64()) {
+            (Some((items, lower)), Some(1)) => {
+                (lower..lower + items.len() as i32).map(|i| one(Value::Int4(i))).collect()
+            }
             _ => Vec::new(),
         },
     })

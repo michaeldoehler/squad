@@ -6,9 +6,9 @@
 //! taken from PostgreSQL 16 (`relations.txt`), as are the rows of
 //! `pg_type` for the built-in types (`pg_type.txt`).
 //!
-//! Because the engine has no `oid` or `name` types, OID columns are
-//! `bigint` and name columns are `text`; `oidvector` / `int2vector`
-//! columns are ordinary arrays.
+//! OID columns have the alias type `oid` (computed as `bigint`) and name
+//! columns are `text`; `int2vector` / `oidvector` columns have their own
+//! types, with values [`Value::Vector`].
 
 mod functions;
 mod info_schema;
@@ -164,6 +164,24 @@ impl V for Vec<i64> {
         Value::Array(self.into_iter().map(Value::Int8).collect())
     }
 }
+/// An `int2vector` or `oidvector` value.
+pub(crate) struct Vector(Vec<Value>);
+
+impl V for Vector {
+    fn v(self) -> Value {
+        Value::Vector(self.0)
+    }
+}
+
+impl Vector {
+    fn int2(items: Vec<i16>) -> Vector {
+        Vector(items.into_iter().map(Value::Int2).collect())
+    }
+    fn oid(items: Vec<i64>) -> Vector {
+        Vector(items.into_iter().map(Value::Int8).collect())
+    }
+}
+
 impl V for Vec<String> {
     fn v(self) -> Value {
         Value::Array(self.into_iter().map(Value::Text).collect())
@@ -183,8 +201,10 @@ fn spec_type(name: &str) -> Type {
         "timestamptz" => Type::TimestampTz,
         "interval" => Type::Interval,
         "bytea" => Type::Bytea,
-        "_oid" | "oidvector" => Type::Array(Box::new(Type::Oid)),
-        "_int2" | "int2vector" => Type::Array(Box::new(Type::Int2)),
+        "_oid" => Type::Array(Box::new(Type::Oid)),
+        "_int2" => Type::Array(Box::new(Type::Int2)),
+        "oidvector" => Type::OidVector,
+        "int2vector" => Type::Int2Vector,
         "_float4" => Type::Array(Box::new(Type::Float4)),
         "_text" | "_aclitem" | "_name" | "_char" | "_regtype" | "anyarray" | "_pg_statistic" => {
             Type::Array(Box::new(Type::Text))
