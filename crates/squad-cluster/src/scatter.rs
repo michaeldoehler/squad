@@ -375,7 +375,7 @@ impl Rewriter<'_> {
             "count" => (AggKind::Count, vec![node.clone()]),
             "sum" => (AggKind::Sum, vec![node.clone()]),
             "avg" => (AggKind::Avg, vec![renamed("sum"), renamed("count")]),
-            "approx_count_distinct" | "approx_percentile" => {
+            "approx_count_distinct" | "approx_distinct" | "approx_percentile" => {
                 return Err(unsupported(format!("{name} across shards unless the query groups by the distribution column")).with_hint(
                     "The sketches of different shards cannot be combined yet. Group by the distribution column, or restrict the query to one distribution key.",
                 ))

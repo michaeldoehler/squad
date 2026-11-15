@@ -121,6 +121,9 @@ preparing it for production use.
 - `Database::remote_status()` and the fields `fenced` and `local_lsn`
   of `RemoteStats`, for health checks of services that embed squad.
 - `docs/deployment.md`: running on Docker Swarm with Garage.
+- `approx_distinct(x)`, another name of `approx_count_distinct(x)` with
+  the same fast path on columnar tables; Apache Superset writes it for
+  its approximate distinct count.
 
 ### Changed
 

@@ -63,7 +63,8 @@ How the evidence is produced is described in [testing](testing.md).
   CONSTRAINT`, `RENAME TO`, `RENAME COLUMN`, `RENAME CONSTRAINT`.
 - **Columnar tables** (not in PostgreSQL): `CREATE TABLE … USING
   columnar [WITH (order_by = 'a, b')]`, with the aggregates
-  `approx_count_distinct(x)` and `approx_percentile(x, p)`. `INSERT`,
+  `approx_count_distinct(x)` (also called `approx_distinct(x)`, the name
+  Trino and Apache Superset use) and `approx_percentile(x, p)`. `INSERT`,
   `COPY FROM`, `DELETE`, `TRUNCATE`, `DROP TABLE`, and `ALTER TABLE`
   `ADD COLUMN` (constant default), `DROP COLUMN`, `RENAME COLUMN`,
   `RENAME TO`, `ALTER COLUMN SET/DROP DEFAULT`, `DROP NOT NULL`. Not

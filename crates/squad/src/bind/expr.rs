@@ -35,7 +35,8 @@ fn agg_func(name: &str) -> Option<AggFunc> {
         "var_pop" => AggFunc::Variance { sample: false, stddev: false },
         "stddev" | "stddev_samp" => AggFunc::Variance { sample: true, stddev: true },
         "stddev_pop" => AggFunc::Variance { sample: false, stddev: true },
-        "approx_count_distinct" => AggFunc::ApproxCountDistinct,
+        // `approx_distinct` is the name Trino, Presto and Apache Superset use.
+        "approx_count_distinct" | "approx_distinct" => AggFunc::ApproxCountDistinct,
         // The percentile is filled in from the second argument.
         "approx_percentile" => AggFunc::ApproxPercentile(0.5),
         _ => return None,

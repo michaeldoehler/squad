@@ -615,6 +615,7 @@ fn what_cannot_be_answered_correctly_is_rejected() {
     for sql in [
         // Sketches of different shards cannot be combined.
         "SELECT approx_count_distinct(user_id) FROM events",
+        "SELECT approx_distinct(user_id) FROM events",
         "SELECT name, approx_percentile(value, 0.5) FROM events GROUP BY name",
         // Aggregates that need all rows in one place.
         "SELECT string_agg(email, ',' ORDER BY id) FROM users",
@@ -663,6 +664,7 @@ fn what_cannot_be_answered_correctly_is_rejected() {
     // With the key (or grouped by it) the same shapes work.
     for sql in [
         "SELECT approx_count_distinct(user_id) FROM events WHERE project_id = 1",
+        "SELECT project_id, approx_distinct(user_id) FROM events GROUP BY project_id",
         "SELECT project_id, approx_percentile(value, 0.5) FROM events GROUP BY project_id",
         "SELECT string_agg(email, ',' ORDER BY id) FROM users WHERE project_id = 1",
         "SELECT id, row_number() OVER (ORDER BY id) FROM users WHERE project_id = 1",
