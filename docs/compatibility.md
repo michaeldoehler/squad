@@ -80,9 +80,19 @@ How the evidence is produced is described in [testing](testing.md).
 - **Transactions:** `BEGIN`/`START TRANSACTION` with isolation level and
   `READ ONLY`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `ROLLBACK TO`,
   `RELEASE`, `SET TRANSACTION`. DDL is transactional.
-- **Session:** `SET`, `SHOW`, `RESET`, `SET TIME ZONE`, `PREPARE`,
-  `EXECUTE`, `DEALLOCATE`, `DISCARD ALL`, `EXPLAIN [ANALYZE]`,
-  `CHECKPOINT`, `VACUUM`, `ANALYZE`, `SET statement_timeout`.
+- **Session:** `SET`, `SET LOCAL`, `SHOW`, `RESET`, `SET TIME ZONE`,
+  `set_config`, `current_setting` (with `missing_ok`), custom settings
+  such as `app.current_tenant`, `default_transaction_read_only`,
+  `transaction_read_only`, `row_security`, `PREPARE`, `EXECUTE`,
+  `DEALLOCATE`, `DISCARD ALL`, `EXPLAIN [ANALYZE]`, `CHECKPOINT`,
+  `VACUUM`, `ANALYZE`, `SET statement_timeout`. Setting changes are
+  undone when their transaction rolls back, as in PostgreSQL.
+- **Row-level security:** `ALTER TABLE … ENABLE | DISABLE | FORCE | NO
+  FORCE ROW LEVEL SECURITY`, `CREATE POLICY` (permissive and
+  restrictive, per command, `TO` login names), `ALTER POLICY`, `DROP
+  POLICY`, on ordinary and columnar tables. squad has no roles: policies
+  apply according to the attributes of the login. See
+  [security](security.md), which also lists the differences.
 - **`LOCK TABLE`** in the modes `ACCESS SHARE`, `ROW SHARE`, `ROW
   EXCLUSIVE` and `EXCLUSIVE`, with `NOWAIT`; see
   [transactions](transactions.md#table-locks). The other modes fail with
@@ -99,9 +109,8 @@ show an extra line.
 
 | Statement | Message | Why |
 | --- | --- | --- |
-| `GRANT`, `REVOKE` (on objects and roles), `ALTER DEFAULT PRIVILEGES` | WARNING | There are no privileges: whoever can connect can do everything. `GRANT`/`REVOKE` on a table that does not exist still fails with `42P01`. |
+| `GRANT`, `REVOKE` (on objects and roles), `ALTER DEFAULT PRIVILEGES` | WARNING | There are no privileges: what a login may do follows from its attributes (`read_only`, `bypass_rls`) and row-level security, see [security](security.md). `GRANT`/`REVOKE` on a table that does not exist still fails with `42P01`. |
 | `CREATE/ALTER/DROP ROLE`, `CREATE USER`, `CREATE GROUP` | WARNING | There are no roles in SQL. Logins are configured on the server ([server](server.md#authentication)). |
-| `ALTER TABLE … ENABLE ROW LEVEL SECURITY` | WARNING | No row-level security; `CREATE POLICY` fails with `0A000`. |
 | `SET CONSTRAINTS … DEFERRED` | WARNING | Constraints are always checked immediately. |
 | `CREATE EXTENSION` | NOTICE | No extensions. Functions squad provides (such as `gen_random_uuid()`) are built in. |
 | `COMMENT ON` | NOTICE | Comments are not stored. |
@@ -109,10 +118,10 @@ show an extra line.
 | `SET CONSTRAINTS … IMMEDIATE` | none | Already the behaviour. |
 | `REINDEX`, `CLUSTER`, `ALTER TABLE … CLUSTER ON` | none | Indexes never need rebuilding; rows are kept in primary key order. No query result can change. |
 | `ANALYZE` | none | There are no statistics to collect. |
-| `ALTER TABLE … SET (storage options)`, `SET STATISTICS`, `SET STORAGE`, `SET LOGGED/UNLOGGED`, `REPLICA IDENTITY`, `VALIDATE CONSTRAINT`, `DISABLE ROW LEVEL SECURITY`, `ENABLE/DISABLE TRIGGER` | none | Physical or planner settings without a counterpart; constraints are validated when they are added; there are no triggers. |
+| `ALTER TABLE … SET (storage options)`, `SET STATISTICS`, `SET STORAGE`, `SET LOGGED/UNLOGGED`, `REPLICA IDENTITY`, `VALIDATE CONSTRAINT`, `ENABLE/DISABLE TRIGGER` | none | Physical or planner settings without a counterpart; constraints are validated when they are added; there are no triggers. |
 | `DEFERRABLE` / `INITIALLY DEFERRED` in table definitions | none | Constraints are checked immediately. |
 | `COLLATE` clauses | none | Text always compares bytewise. |
-| `idle_in_transaction_session_timeout` and other unknown settings | none | `SET` stores the value, `SHOW` returns it. |
+| `idle_in_transaction_session_timeout` and other unknown settings without a dot in the name | none | `SET` and `set_config` store the value, `SHOW` returns it. PostgreSQL rejects unknown names without a dot with `42704`; names with a dot are custom settings in both. |
 
 `CREATE MATERIALIZED VIEW` creates an ordinary table from the query;
 there is no `REFRESH`.
@@ -131,6 +140,8 @@ These fail with SQLSTATE `0A000` (`feature_not_supported`) or an
 | Generated columns (`GENERATED ALWAYS AS (expr) STORED`) | identity columns are supported |
 | Partitioning, inheritance | |
 | `MERGE` | use `INSERT … ON CONFLICT` |
+| `INSERT … ON CONFLICT DO UPDATE` on a table whose row-level security policies apply to the statement | `DO NOTHING` works; see [security](security.md) |
+| `SET ROLE`, `SET SESSION AUTHORIZATION` to a name other than the login | there are no roles; the login's own name, `NONE` and `DEFAULT` are accepted |
 | `GROUPING SETS`, `ROLLUP`, `CUBE` | |
 | Ordered-set aggregates (`percentile_cont`, `mode`, `WITHIN GROUP`) | |
 | Correlated subqueries above `GROUP BY` | a subquery in the select list or `HAVING` of a grouped query that refers to the outer query's columns |
@@ -189,13 +200,18 @@ These fail with SQLSTATE `0A000` (`feature_not_supported`) or an
 - **Identity columns** created with `GENERATED BY DEFAULT` appear in the
   catalogs like `serial` columns.
 - **`current_time`** returns `time` rather than `time with time zone`.
+- **Views and row-level security.** A view applies the policies of its
+  tables for the login running the query, like a PostgreSQL view created
+  `WITH (security_invoker = true)`; PostgreSQL's default is the view
+  owner's rights. Logins with `bypass_rls` are treated as the owner of
+  every table. Details in [security](security.md#differences-from-postgresql).
 
 ## System catalogs
 
 `pg_catalog` contains `pg_class`, `pg_attribute`, `pg_type`,
 `pg_namespace`, `pg_index`, `pg_constraint`, `pg_attrdef`, `pg_enum`,
 `pg_sequence(s)`, `pg_tables`, `pg_views`, `pg_indexes`, `pg_database`,
-`pg_roles`, `pg_settings`, `pg_am`, `pg_collation`, `pg_extension`,
+`pg_roles`, `pg_policy`, `pg_policies`, `pg_settings`, `pg_am`, `pg_collation`, `pg_extension`,
 `pg_stat_activity` and others with content, and about a hundred more
 relations with the right columns and no rows, so that queries joining
 them still run. `information_schema` has `tables`, `columns`,

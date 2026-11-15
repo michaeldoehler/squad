@@ -24,6 +24,8 @@ psql -h 127.0.0.1 -U squad squad
 | `--users-file <file>` | logins, see [authentication](#authentication) |
 | `--user <name>` | login name for the password in `SQUAD_PASSWORD` |
 | `--user <name> --password <pw>` | a login given on the command line (repeatable); prints a warning, because other users of the machine can read it in the process list |
+| `--read-only <name>` | the login may only read (repeatable); see [login attributes](#login-attributes) |
+| `--no-bypass-rls <name>` | row-level security policies apply to the login (repeatable) |
 | `--trust` | let every client in without a password, also on an address other than loopback |
 | `--cleartext-password` | ask for the password in clear text, for clients without SCRAM |
 | `--tls-cert <file> --tls-key <file>` | PEM certificate chain and private key; see [TLS](#tls) |
@@ -89,17 +91,48 @@ Logins come from three places, which can be combined:
   `user:SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`. The
   second form is PostgreSQL's verifier format: it can be copied from
   `pg_authid.rolpassword` of a PostgreSQL server or produced with `squad
-  hash-password`, and the file then holds no password. Empty lines and
+  hash-password`, and the file then holds no password. Attributes may
+  follow the user name, separated by spaces (below). Empty lines and
   lines starting with `#` are ignored. Passwords are turned into
-  verifiers when the file is read.
+  verifiers when the file is read. A user name cannot contain spaces or
+  colons.
 - `--user <name> --password <pw>`, with a warning (process list).
 
 Clients authenticate with SCRAM-SHA-256, or with a clear-text password
 under `--cleartext-password` (protect it with TLS). An unknown user and a
-wrong password fail the same way, with `28P01`. Logins grant full access;
-there are no roles or privileges in SQL (`GRANT` and `CREATE ROLE` are
-accepted with a warning and do nothing, see
-[compatibility](compatibility.md#accepted-without-effect)).
+wrong password fail the same way, with `28P01`. There are no roles or
+privileges in SQL (`GRANT` and `CREATE ROLE` are accepted with a warning
+and do nothing, see
+[compatibility](compatibility.md#accepted-without-effect)); what a login
+may do is set by its attributes.
+
+### Login attributes
+
+| Attribute | Default | Effect |
+| --- | --- | --- |
+| `bypass_rls` | on | Row-level security policies apply to the login only on tables with `FORCE ROW LEVEL SECURITY`, as for a table's owner in PostgreSQL. Turned off with `no_bypass_rls`: the policies of every table with row-level security apply, and the login cannot change those tables or any policy. |
+| `read_only` | off | Every transaction is read-only; writes and DDL fail with `25006`, and `BEGIN READ WRITE` is refused. |
+
+A login without attributes has full access, as before attributes
+existed. The semantics are described in [security](security.md).
+Attributes are given in the users file after the name, on the command
+line, or in `ServerConfig::logins`:
+
+```text
+# the application, which owns its tables
+beats:SCRAM-SHA-256$4096:…
+# the analytics tool: reads, and only what the policies allow
+superset read_only no_bypass_rls:SCRAM-SHA-256$4096:…
+```
+
+```sh
+squad serve ./data --users-file users --read-only reporting --no-bypass-rls reporting
+```
+
+The attributes apply with trust authentication too (the client's user
+name decides). `current_user` and `session_user` return the login name;
+the server reports `is_superuser` as `on` for logins with `bypass_rls`
+and `off` for the others.
 
 ## TLS
 
@@ -218,7 +251,17 @@ handle.shutdown();
 `Serve::serve` trusts every client and therefore only accepts loopback
 addresses; anything else fails with `PermissionDenied`. `Auth::Verifiers`
 takes SCRAM verifiers instead of passwords, e.g. from
-`squad_server::users::read_users_file`. `ServerConfig` prints passwords
+`squad_server::users::read_users_file`, which also returns the login
+attributes of the file:
+
+```rust
+let users = squad_server::users::read_users_file("users")?;
+let config = ServerConfig {
+    auth: Auth::Verifiers { users: users.verifiers },
+    logins: users.logins,           // HashMap<String, LoginAttributes>
+    ..ServerConfig::default()
+};
+``` `ServerConfig` prints passwords
 as their user names only (`Debug`).
 
 ## Using squad from an sqlx application
@@ -259,7 +302,7 @@ Two caveats:
 
 | Client | Result |
 | --- | --- |
-| `psql` 16 | queries, scripts, `\copy`, `\d`, `\dt`, `\di`, `\dn`, `\ds`, `\dv`, `\dT`, `\l`, `\du`; TLS with `sslmode=verify-full`, notices |
+| `psql` 16 | queries, scripts, `\copy`, `\d` (with policies), `\dt`, `\di`, `\dn`, `\ds`, `\dv`, `\dT`, `\l`, `\du`; TLS with `sslmode=verify-full`, notices |
 | `pg_dump` plain format | a dump with enum, serial and identity columns, jsonb, arrays, bytea, views, constraints and indexes loads through psql |
 | `pgbench` 16 | initialization, TPC-B-like and select-only scripts, simple and prepared mode, no failed transactions |
 | `tokio-postgres` | typed parameters and results, transactions, savepoints, portals, `COPY IN`, SCRAM, TLS (tokio-postgres-rustls), cancel tokens, notices |

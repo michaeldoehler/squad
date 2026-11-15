@@ -205,6 +205,26 @@ Row locks taken after a savepoint are kept when rolling back to it
 (Postgres releases them); this can only make another transaction wait
 longer, never produce a wrong result.
 
+## Settings in transactions
+
+As in PostgreSQL, `SET` inside a transaction is undone if the transaction
+rolls back (also by an error, or by `ROLLBACK TO SAVEPOINT` for changes
+after the savepoint), and `SET LOCAL` lasts only until the transaction
+ends. `set_config(name, value, true)` is `SET LOCAL`; outside a
+transaction block its effect ends with the statement. Custom settings
+such as `app.current_tenant` behave the same; see
+[security](security.md#custom-settings).
+
+## Read-only transactions
+
+`BEGIN READ ONLY`, `SET TRANSACTION READ ONLY` and `SET
+transaction_read_only = on` make the transaction read-only;
+`default_transaction_read_only = on` makes every new transaction
+read-only unless it asks for `READ WRITE`. Writes, DDL, `nextval` and
+`setval` then fail with `25006`. A read replica and a read-only login
+([security](security.md#read-only-logins)) are read-only without a way
+out: `READ WRITE` fails with `25006`.
+
 ## Differences from PostgreSQL to be aware of
 
 - Serializable can report `40001` more often (see above).

@@ -121,8 +121,55 @@ preparing it for production use.
 - `Database::remote_status()` and the fields `fenced` and `local_lsn`
   of `RemoteStats`, for health checks of services that embed squad.
 - `docs/deployment.md`: running on Docker Swarm with Garage.
+- **Row-level security** with PostgreSQL 16's semantics: `ALTER TABLE …
+  ENABLE | DISABLE | FORCE | NO FORCE ROW LEVEL SECURITY`, `CREATE
+  POLICY` (permissive and restrictive, per command, `TO` login names,
+  `USING`, `WITH CHECK`), `ALTER POLICY`, `DROP POLICY`, on ordinary and
+  columnar tables; enforcement in queries, joins, subqueries, views,
+  prepared statements, `COPY … TO`, `INSERT`, `UPDATE` and `DELETE`
+  (`42501` for rows that fail `WITH CHECK`); `row_security`;
+  `pg_class.relrowsecurity`/`relforcerowsecurity`, `pg_policy`,
+  `pg_policies` and policies in psql's `\d`. Policy conditions with
+  `current_setting` use indexes and the column engine. See
+  `docs/security.md`.
+- **Logins and their attributes**: `squad::Login`,
+  `Database::connect_as`, `Session::set_login`; `bypass_rls` (default
+  on: treated as the owner of every table) and `read_only` (every
+  transaction read-only, `25006`). On the server:
+  `squad_server::LoginAttributes`, `ServerConfig::logins`, attributes in
+  the users file (`user read_only no_bypass_rls:secret`), `--read-only`
+  and `--no-bypass-rls`. `is_superuser` reports whether the login
+  bypasses row-level security.
+- `SET LOCAL`, `set_config(…, true)`, custom settings that stay known
+  (empty) after `RESET` as in PostgreSQL, `default_transaction_read_only`
+  and `SET transaction_read_only`.
+- `Session::is_read_only` and `Session::row_security_applies`.
 
 ### Changed
+
+- `SET` inside a transaction is undone when the transaction rolls back
+  (also by an error or `ROLLBACK TO SAVEPOINT`), and `SET LOCAL` ends with
+  the transaction, as in PostgreSQL; both used to last for the session.
+  Outside a transaction block, `SET LOCAL` now sends a warning and has no
+  effect.
+- `ALTER TABLE … ENABLE ROW LEVEL SECURITY` takes effect instead of
+  sending a warning; `DISABLE ROW LEVEL SECURITY` is no longer ignored.
+  The default login bypasses the policies of tables without `FORCE ROW
+  LEVEL SECURITY`, so existing applications see no change.
+- `current_setting`, `current_user` and the other session functions
+  that do not change anything are treated as stable: they are evaluated
+  once per statement and can bound index scans.
+- `nextval` and `setval` fail with `25006` in a read-only transaction.
+- `SET ROLE` and `SET SESSION AUTHORIZATION` to a name other than the
+  login fail with `0A000`; they used to be stored and ignored.
+- `RESET ALL` also resets `default_transaction_isolation`; `DISCARD ALL`
+  resets every setting and fails inside a transaction block (`25001`).
+- `squad_server::users::parse_users` and `read_users_file` return
+  `Users { verifiers, logins }`. In the users file, words after the user
+  name are attributes, so user names can no longer contain spaces.
+- `pg_roles` lists the names that policies apply to besides the
+  session's login, and reports `rolsuper`/`rolbypassrls` according to
+  the login.
 
 - **Writer fencing no longer relies on conditional writes.** Garage and
   other S3-compatible stores accept `If-None-Match: *` and overwrite

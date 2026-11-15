@@ -123,7 +123,11 @@ databases.
 - **Binder.** Resolves names against the catalog, infers and checks types
   with Postgres' rules for implicit casts, operator and function overload
   resolution, and produces typed expressions. Untyped literals and
-  parameters take their type from context as in Postgres.
+  parameters take their type from context as in Postgres. It also adds
+  row-level security: for the session's login, a table's policies become
+  the first conditions of its scans and checks on the rows `INSERT` and
+  `UPDATE` write (see [security](security.md)); plans are therefore
+  cached per login.
 - **Optimizer.** Rule based: predicate pushdown through joins, choice of
   primary key or secondary index from equality and range predicates,
   index nested-loop joins when the inner side has a matching key, hash

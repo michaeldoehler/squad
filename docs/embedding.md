@@ -100,6 +100,12 @@ for row in conn.query("SELECT id, email FROM users ORDER BY id", &[])? {
 | `transaction() -> Transaction` | a transaction that rolls back unless committed |
 | `append(table, rows) -> u64` | insert rows given as values, without SQL text (below) |
 
+`db.connect()` runs as the login `squad`, which is treated as the owner
+of every table. `db.connect_as(Login { user, bypass_rls, read_only })`
+opens a connection as another login: `current_user` returns its name,
+row-level security policies apply to it unless `bypass_rls` is set, and
+a `read_only` login cannot write. See [security](security.md).
+
 ### Appending rows without SQL
 
 `append` inserts rows given as `Vec<Value>`, one value per visible

@@ -65,6 +65,10 @@ let name: String = stmt.query_one(&[&"ada@example.org"])?.get(0);
   embedded database to psql, pgAdmin, migration tools and services in
   other languages, with SCRAM, TLS and query cancellation. An application written for sqlx and PostgreSQL runs
   against it unchanged. → [server](docs/server.md)
+- **Row-level security.** PostgreSQL's `CREATE POLICY` on ordinary and
+  columnar tables, read-only logins, and custom settings such as
+  `app.current_tenant`, so that a BI tool sees only one tenant's rows.
+  → [security](docs/security.md)
 
 ## A taste
 
@@ -228,6 +232,7 @@ squad serve ./replica --replica-of s3://my-bucket/prod   # read replica
 | --- | --- |
 | [Embedding](docs/embedding.md) | the Rust API: connections, statements, types, transactions, errors |
 | [Server](docs/server.md) | wire protocol, the `squad` command, sqlx and other clients |
+| [Security](docs/security.md) | logins, read-only logins, row-level security policies |
 | [Analytics](docs/analytics.md) | columnar tables: how they work, what is fast, limits |
 | [Cloud storage](docs/cloud-storage.md) | object stores, S3, remote durability, restore |
 | [Replication](docs/replication.md) | read replicas, lag, promotion and fencing, failover runbook |

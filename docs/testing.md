@@ -7,7 +7,7 @@ version 0.1; "run on demand" suites are not part of `cargo test`.
 
 | Question | Suite | Scale |
 | --- | --- | --- |
-| Does SQL behave like PostgreSQL? | SQL regression suite | 12 scripts, ~580 statements, output identical to PostgreSQL 16 |
+| Does SQL behave like PostgreSQL? | SQL regression suite | 15 scripts, ~950 statements, output identical to PostgreSQL 16 |
 | | sqllogictest, own suite | 468 records with results from PostgreSQL 16 |
 | | sqllogictest, public corpus (on demand) | 5,663,445 of 5,675,004 records pass (99.80 %); differs from PostgreSQL 16 on 6 |
 | | Differential fuzzer (on demand) | ~1.3 M random statements against PostgreSQL 16 |
@@ -43,8 +43,18 @@ requires byte-identical output.
 The scripts cover expressions and literals, tables and constraints,
 joins, aggregates, subqueries and set operations, window functions,
 CTEs, data types, schema changes, transactions and settings, sequences,
-views and prepared statements, plus one script of reproductions for
+views and prepared statements, custom settings (`SET LOCAL`,
+`set_config`), row-level security, plus one script of reproductions for
 every bug the fuzzer found.
+
+`rls.sql` tests row-level security from the point of view of a table's
+owner, which is how squad treats its default login. Its expected output
+must be produced by a PostgreSQL role that owns the tables and is not a
+superuser (superusers bypass every policy), e.g.
+`PGUSER=regress_rls scripts/regress-expected.sh rls` after `CREATE ROLE
+regress_rls LOGIN CREATEDB`. Other logins, read-only logins and
+columnar tables are tested in `crates/squad/tests/rls.rs` and, over the
+wire with tokio-postgres and psql, in `crates/squad-server/tests/rls.rs`.
 
 ```sh
 cargo test -p squad --test regress
