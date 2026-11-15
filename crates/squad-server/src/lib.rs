@@ -81,11 +81,39 @@ impl fmt::Debug for Auth {
     }
 }
 
+/// What a login may do, beyond logging in. Logins without an entry in
+/// [`ServerConfig::logins`] get [`LoginAttributes::default`]: they bypass
+/// row-level security and may write, as every login did before these
+/// attributes existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoginAttributes {
+    /// Exempt from row-level security policies, like a table's owner in
+    /// PostgreSQL: policies apply to such a login only on tables with
+    /// `FORCE ROW LEVEL SECURITY`. Without it, the policies of every table
+    /// with row-level security apply, and the login may not change those
+    /// tables or their policies. Default true.
+    pub bypass_rls: bool,
+    /// Every transaction of the login is read-only: writes and DDL fail
+    /// with SQLSTATE 25006, and `BEGIN READ WRITE` is refused. Default
+    /// false.
+    pub read_only: bool,
+}
+
+impl Default for LoginAttributes {
+    fn default() -> LoginAttributes {
+        LoginAttributes { bypass_rls: true, read_only: false }
+    }
+}
+
 /// Settings of a [`Server`]. Start from [`ServerConfig::default`] and
 /// change what you need.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub auth: Auth,
+    /// Attributes of logins by user name, e.g. from
+    /// [`users::read_users_file`]. Applies with every kind of `auth`,
+    /// trust included.
+    pub logins: HashMap<String, LoginAttributes>,
     /// With password authentication: ask for the password in clear text
     /// instead of SCRAM-SHA-256, for clients that do not implement SCRAM.
     /// Without TLS the password then crosses the network unprotected.
@@ -124,6 +152,7 @@ impl Default for ServerConfig {
     fn default() -> ServerConfig {
         ServerConfig {
             auth: Auth::Trust,
+            logins: HashMap::new(),
             allow_cleartext_password: false,
             trust_remote: false,
             unix_socket: None,
@@ -153,6 +182,7 @@ const REFUSE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct Inner {
     db: Database,
     pub(crate) auth: AuthData,
+    pub(crate) logins: HashMap<String, LoginAttributes>,
     pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
     pub(crate) require_tls: bool,
     pub(crate) authentication_timeout: Duration,
@@ -249,6 +279,7 @@ impl Server {
             inner: Arc::new(Inner {
                 db,
                 auth,
+                logins: config.logins,
                 tls: config.tls.map(|t| t.config),
                 require_tls: config.require_tls,
                 authentication_timeout: config.authentication_timeout,

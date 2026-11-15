@@ -10,7 +10,7 @@ use std::time::Duration;
 use squad::{Config, Database, RemoteConfig, RemoteSync, ReplicaConfig, SyncMode};
 use squad_server::ping::{PingOptions, PingStatus};
 use squad_server::scram::Verifier;
-use squad_server::{Auth, Server, ServerConfig, TlsConfig};
+use squad_server::{Auth, LoginAttributes, Server, ServerConfig, TlsConfig};
 
 const USAGE: &str = "\
 squad - an embeddable, Postgres-compatible database
@@ -30,7 +30,11 @@ OPTIONS for serve:
     --listen <addr>           TCP address to listen on (default 127.0.0.1:5432)
     --unix-socket-dir <dir>   also listen on <dir>/.s.PGSQL.<port>
     --users-file <file>       logins, one user:password or user:SCRAM-SHA-256$...
-                              verifier per line
+                              verifier per line; attributes may follow the
+                              name: `user read_only no_bypass_rls:password`
+    --read-only <name>        the login may only read (repeatable)
+    --no-bypass-rls <name>    row-level security policies apply to the login
+                              (repeatable)
     --user <name>             login name for the password in SQUAD_PASSWORD
                               (default: SQUAD_USER, else squad)
     --password <pw>           password for --user (repeatable pairs); visible
@@ -111,6 +115,8 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         "--user",
         "--password",
         "--users-file",
+        "--read-only",
+        "--no-bypass-rls",
         "--tls-cert",
         "--tls-key",
         "--max-connections",
@@ -266,7 +272,7 @@ fn open(args: &Args, dir: Option<&String>) -> Result<Database, String> {
 
 /// Collects logins from --user/--password, SQUAD_PASSWORD(_FILE) and
 /// --users-file.
-fn logins(args: &Args) -> Result<HashMap<String, Verifier>, String> {
+fn logins(args: &Args) -> Result<squad_server::users::Users, String> {
     let users = args.options.get("--user").cloned().unwrap_or_default();
     let passwords = args.options.get("--password").cloned().unwrap_or_default();
     let env_password = env_or_file("SQUAD_PASSWORD")?;
@@ -299,22 +305,32 @@ fn logins(args: &Args) -> Result<HashMap<String, Verifier>, String> {
     } else if passwords.is_empty() && !users.is_empty() {
         return Err("--user needs a password: set SQUAD_PASSWORD or SQUAD_PASSWORD_FILE, or use --users-file".into());
     }
+    let mut attributes = HashMap::new();
     if let Some(path) = args.last("--users-file") {
-        for (user, verifier) in squad_server::users::read_users_file(path).map_err(|e| e.to_string())? {
+        let file = squad_server::users::read_users_file(path).map_err(|e| e.to_string())?;
+        for (user, verifier) in file.verifiers {
             add(user, verifier)?;
         }
+        attributes = file.logins;
     }
-    Ok(logins)
+    for user in args.options.get("--read-only").into_iter().flatten() {
+        attributes.entry(user.clone()).or_insert_with(LoginAttributes::default).read_only = true;
+    }
+    for user in args.options.get("--no-bypass-rls").into_iter().flatten() {
+        attributes.entry(user.clone()).or_insert_with(LoginAttributes::default).bypass_rls = false;
+    }
+    Ok(squad_server::users::Users { verifiers: logins, logins: attributes })
 }
 
 fn server_config(args: &Args) -> Result<ServerConfig, String> {
-    let logins = logins(args)?;
+    let squad_server::users::Users { verifiers: logins, logins: attributes } = logins(args)?;
     let trust = args.flag("--trust");
     if trust && !logins.is_empty() {
         return Err("--trust cannot be combined with passwords".into());
     }
     let mut config = ServerConfig {
         auth: if logins.is_empty() { Auth::Trust } else { Auth::Verifiers { users: logins } },
+        logins: attributes,
         allow_cleartext_password: args.flag("--cleartext-password"),
         trust_remote: trust,
         unix_socket: args.last("--unix-socket-dir").map(PathBuf::from),

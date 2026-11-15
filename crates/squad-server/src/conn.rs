@@ -412,7 +412,12 @@ impl Conn {
         }
         self.io.deadline = None;
         self.io.max_message = self.inner.max_message_size;
-        self.session.state_mut().user = user.clone();
+        let attributes = self.inner.logins.get(&user).copied().unwrap_or_default();
+        self.session.set_login(squad::Login {
+            user: user.clone(),
+            bypass_rls: attributes.bypass_rls,
+            read_only: attributes.read_only,
+        });
 
         // Run-time parameters passed in the startup packet.
         let mut settings: Vec<(String, String)> = Vec::new();
@@ -457,7 +462,7 @@ impl Conn {
             ("integer_datetimes", "on"),
             ("standard_conforming_strings", "on"),
             ("application_name", app.as_str()),
-            ("is_superuser", "on"),
+            ("is_superuser", if attributes.bypass_rls { "on" } else { "off" }),
             ("session_authorization", user.as_str()),
         ] {
             self.parameter_status(name, value);
@@ -725,6 +730,18 @@ impl Conn {
             return Err(
                 Error::new(sqlstate::READ_ONLY_SQL_TRANSACTION, "cannot execute COPY FROM on a read replica").into()
             );
+        }
+        if self.session.is_read_only() {
+            return Err(Error::new(
+                sqlstate::READ_ONLY_SQL_TRANSACTION,
+                "cannot execute COPY FROM in a read-only transaction",
+            )
+            .into());
+        }
+        if req.table.as_deref().is_some_and(|t| self.session.row_security_applies(t)) {
+            return Err(Error::new(sqlstate::FEATURE_NOT_SUPPORTED, "COPY FROM not supported with row-level security")
+                .with_hint("Use INSERT statements instead.")
+                .into());
         }
         let columns: Vec<String> = if req.columns.is_empty() {
             self.session.prepare(&req.select_sql(), &[])?.columns.iter().map(|c| c.name.clone()).collect()

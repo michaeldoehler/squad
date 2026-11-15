@@ -412,7 +412,7 @@ fn verifiers_from_a_users_file() {
     // `pg` was produced by PostgreSQL 16 for the password "secret".
     let pg = "SCRAM-SHA-256$4096:2p69YhUMsuJ9UY9GhURkFg==$btRVJP5LmOQTVAAf2sXJeDPPa4dj3mYOSahIsXWl8SU=:VQGgrY+lvmyvr0xiP+b7VjMzf4JJlB+lf1XRYBAA4Yc=";
     std::fs::write(&path, format!("# test logins\nalice:{pg}\nbob:plain pw\n")).unwrap();
-    let users = squad_server::users::read_users_file(&path).unwrap();
+    let users = squad_server::users::read_users_file(&path).unwrap().verifiers;
     let (server, addr) = start(ServerConfig { auth: Auth::Verifiers { users: users.clone() }, ..Default::default() });
     runtime().block_on(async {
         for (user, pw, ok) in [("alice", "secret", true), ("bob", "plain pw", true), ("alice", "wrong", false)] {

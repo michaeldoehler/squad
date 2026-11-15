@@ -161,6 +161,25 @@ fn serve_with_password() {
 }
 
 #[test]
+fn login_attributes_from_the_command_line() {
+    let (mut child, addr) = serve(&["--memory", "--read-only", "reporting", "--no-bypass-rls", "reporting"]);
+    let mut owner = connect_when_free(addr);
+    owner.rows(
+        "CREATE TABLE t (tenant text); INSERT INTO t VALUES ('a'), ('b');
+         ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY p ON t USING (tenant = current_setting('app.tenant', true))",
+    );
+    let mut reporting = Client::startup(addr, &[("user", "reporting")]);
+    reporting.until_ready();
+    assert_eq!(reporting.rows("SELECT count(*) FROM t"), [[Some("0".to_string())]]);
+    assert_eq!(reporting.rows("SET app.tenant = 'b'; SELECT tenant FROM t"), [[Some("b".to_string())]]);
+    assert_eq!(reporting.error("INSERT INTO t VALUES ('b')"), "25006");
+    assert_eq!(owner.rows("SELECT count(*) FROM t"), [[Some("2".to_string())]]);
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
 fn remote_copy_and_restore() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
