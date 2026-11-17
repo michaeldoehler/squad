@@ -255,6 +255,25 @@ preparing it for production use.
   `engine_bench`, so that example names are unique in the workspace.
 
 ### Fixed
+
+- **Columnar tables no longer rewrite whole tables over and over.** Small
+  segments were merged smallest first, and every segment under 2 million
+  rows counted as small, so whenever eight new small segments had gathered
+  (about every 100 s with steady inserts) the whole table was merged into
+  one new segment again. Merges now combine segments of similar size
+  (tiers of a factor of 4), so each row is rewritten about once per tier.
+- **Memory of columnar tables is bounded.** The cache of opened segments
+  was bounded by count (4096 segments), not bytes; it is now a sixteenth
+  of `cache_bytes`. Deleted segments are dropped from the caches at once.
+  A compaction moves at most `compact_max_bytes` (new, default 64 MiB) of
+  decoded rows per run and sorts them without copying them into one batch
+  first. Parallel range reads use a fixed set of 8 threads per process
+  instead of new threads per read. `Database::columnar_memory()` (new)
+  reports what the caches hold.
+- **Read replicas no longer lose segments right after a compaction.**
+  With segments in a remote object store, replaced segment objects are
+  deleted only after `ColumnarConfig::retire_grace` (new, default 10
+  minutes).
 - `pg_index.indkey` and `indoption` were `smallint[]` (`'{1,2,4}'`)
   instead of `int2vector` (`'1 2 4'`); SQLAlchemy failed to parse them.
 - `pg_stat_activity` showed only the calling session, and

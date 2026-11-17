@@ -84,12 +84,25 @@ GROUP BY 1 ORDER BY 1;
 The compactor thread compacts a table once its delta holds
 `compact_rows` rows (default 65,536) or `compact_blocks` blocks
 (default 512), or once its oldest rows are `compact_age` old (default
-10 s). One run moves at most 262,144 rows (four row groups); the rest
-follows in the next run. Afterwards it merges small segments: when at least 8
-segments have fewer than 2 million rows each, up to 32 of them, at most
-4 million rows and `merge_max_bytes` (default 256 MiB) of segment data
-in total, are merged into one. The merge streams: it holds one decoded
-row group per input and the encoded output, not the inputs.
+10 s). One run moves at most 262,144 rows (four row groups) and at most
+`compact_max_bytes` of decoded data (default 64 MiB, which wide rows such
+as JSON documents reach first); the rest follows in the next run right
+away. A run holds the rows it moves plus about two row groups: it sorts
+them by the `order_by` columns without copying them into one batch and
+encodes one row group at a time.
+
+Afterwards it merges small segments **by size tier**. Segments with
+fewer than 2 million rows and less than half of `merge_max_bytes`
+(default 256 MiB) are grouped by size, each tier spanning a factor of 4
+in bytes (everything below 16 KiB is one tier). When a tier holds at
+least 8 segments, up to 32 of them, at most 4 million rows and
+`merge_max_bytes` in total, are merged into one, which lands in a higher
+tier. A large segment is therefore rewritten only when enough segments
+of its own size have gathered, not every time a few small ones arrive:
+each row is rewritten about once per tier it passes, so the work of
+merging follows the rate of new data, not the size of the table. The
+merge streams: it holds one decoded row group per input and the encoded
+output, not the inputs.
 
 Compaction never blocks inserts or queries. It takes the table's shared
 lock (DDL on the table waits for it, and a compaction waits at most
@@ -140,8 +153,14 @@ of one row group are requested together: neighbouring ranges in one
 request, separate requests in parallel.
 
 Fetched ranges are kept in an LRU cache bounded by `cache_bytes`
-(default 512 MiB; a quarter of it more for decoded delta blocks).
-Concurrent misses of the same range are fetched once. There is no
+(default 512 MiB). Two more caches come on top: decoded delta blocks
+(a quarter of `cache_bytes`, at least 16 MiB) and opened segments, that
+is their row group directories and statistics (a sixteenth of
+`cache_bytes`, at least 4 MiB). All three are bounded in bytes;
+`Database::columnar_memory()` reports what they hold. When a segment
+object is deleted, its cached ranges and its opened form are dropped at
+once. Concurrent misses of the same range are fetched once. Requests
+that run in parallel use a fixed set of 8 fetch threads per process. There is no
 local-disk cache tier for segments in a bucket: after a restart, the
 first queries fetch what they need again.
 
@@ -307,18 +326,20 @@ you filter or group by in their own columns rather than inside `jsonb`.
 
 ## Limits
 
-- Old segment objects are deleted when the transaction that replaced
-  them commits. A query that started earlier and has not yet read that
-  segment fails with an error instead of reading a stale copy; retry it.
-  (Segments already loaded into the cache keep working.)
+- A segment object that a compaction, merge or `DELETE` replaced is
+  deleted once no snapshot of this process can read it; with segments in
+  a remote object store, also not before `retire_grace` has passed
+  (default 10 minutes), for the sake of read replicas. A query on a
+  replica that lags further than that and has not yet read the segment
+  fails with an error instead of reading a stale copy; retry it.
 - Segment data is cached in memory only; the first query after a
   restart fetches the column chunks it needs from the object store
   again (see [benchmarks](benchmarks.md#analytics) for cold-cache
   timings against Garage).
-- A compaction of the delta holds the rows it moves (at most 262,144)
-  in memory while encoding; a bulk insert holds its rows, in
-  chunks of one million per segment. A merge holds its encoded output
-  (bounded by `merge_max_bytes`).
+- A compaction of the delta holds the rows it moves (at most 262,144
+  rows and `compact_max_bytes`) plus about two row groups; a bulk insert
+  holds its rows, in chunks of one million per segment. A merge holds its
+  encoded output (bounded by `merge_max_bytes`).
 - The delta has no back-pressure: if inserts outpace compaction for a
   long time, the delta grows and queries slow down accordingly.
 - Exact `count(DISTINCT)` and group-by with very many groups are bounded

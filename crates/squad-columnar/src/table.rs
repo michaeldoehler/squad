@@ -1,6 +1,7 @@
 //! Table-level helpers: the manifest of a table's segments, compaction
 //! and retention.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use std::cmp::Ordering;
@@ -176,12 +177,22 @@ impl Manifest {
     /// row count stays within `target_rows`, if there are at least
     /// `min_segments` of them.
     pub fn compaction_candidates(&self, target_rows: u64, min_segments: usize) -> Vec<&SegmentMeta> {
-        self.merge_candidates(target_rows, u64::MAX, usize::MAX, min_segments)
+        let mut small: Vec<&SegmentMeta> = self.segments.iter().filter(|s| s.rows < target_rows / 2).collect();
+        small.sort_by_key(|s| s.rows);
+        pick(small, target_rows, u64::MAX, usize::MAX, min_segments)
     }
 
-    /// Like [`compaction_candidates`](Manifest::compaction_candidates),
-    /// also bounding the combined size in bytes and the number of
-    /// segments picked.
+    /// Segments to merge, by size tier: segments below half of
+    /// `target_rows` and half of `max_bytes` are grouped by size (a tier
+    /// spans a factor of [`MERGE_TIER_FACTOR`] in bytes), and the
+    /// smallest tier that holds at least `min_segments` segments is
+    /// merged, its smallest segments first, within `target_rows`,
+    /// `max_bytes` and `max_segments`.
+    ///
+    /// Merging within a tier keeps the work proportional to new data: a
+    /// large segment is rewritten only when enough segments of its own
+    /// size have gathered, not every time a few small ones arrive, so
+    /// each row is rewritten about log(rows) times over its life.
     pub fn merge_candidates(
         &self,
         target_rows: u64,
@@ -189,24 +200,63 @@ impl Manifest {
         max_segments: usize,
         min_segments: usize,
     ) -> Vec<&SegmentMeta> {
-        let mut small: Vec<&SegmentMeta> =
-            self.segments.iter().filter(|s| s.rows < target_rows / 2 && s.bytes < max_bytes / 2).collect();
-        small.sort_by_key(|s| s.rows);
-        let mut picked = Vec::new();
-        let (mut rows, mut bytes) = (0, 0);
-        for s in small {
-            if rows + s.rows > target_rows || bytes + s.bytes > max_bytes || picked.len() >= max_segments {
-                break;
+        let mut tiers: BTreeMap<u32, Vec<&SegmentMeta>> = BTreeMap::new();
+        for s in self.segments.iter().filter(|s| s.rows < target_rows / 2 && s.bytes < max_bytes / 2) {
+            tiers.entry(size_tier(s.bytes)).or_default().push(s);
+        }
+        for (_, mut members) in tiers {
+            if members.len() < min_segments.max(2) {
+                continue;
             }
-            rows += s.rows;
-            bytes += s.bytes;
-            picked.push(s);
+            members.sort_by_key(|s| (s.bytes, s.rows));
+            let picked = pick(members, target_rows, max_bytes, max_segments, min_segments);
+            if !picked.is_empty() {
+                return picked;
+            }
         }
-        if picked.len() >= min_segments.max(2) {
-            picked
-        } else {
-            Vec::new()
+        Vec::new()
+    }
+}
+
+/// Size ratio between neighbouring merge tiers.
+pub const MERGE_TIER_FACTOR: u64 = 4;
+
+/// The merge tier of a segment of `bytes` bytes: tier `t > 0` holds sizes
+/// in `[4 KiB · 4^t, 4 KiB · 4^(t+1))`; tier 0 holds everything below
+/// 16 KiB.
+fn size_tier(bytes: u64) -> u32 {
+    let mut b = bytes.max(4096) / 4096;
+    let mut t = 0;
+    while b >= MERGE_TIER_FACTOR {
+        b /= MERGE_TIER_FACTOR;
+        t += 1;
+    }
+    t
+}
+
+/// The longest prefix of `sorted` within the limits, if it has at least
+/// `min_segments` (and two) segments.
+fn pick(
+    sorted: Vec<&SegmentMeta>,
+    target_rows: u64,
+    max_bytes: u64,
+    max_segments: usize,
+    min_segments: usize,
+) -> Vec<&SegmentMeta> {
+    let mut picked = Vec::new();
+    let (mut rows, mut bytes) = (0, 0);
+    for s in sorted {
+        if rows + s.rows > target_rows || bytes + s.bytes > max_bytes || picked.len() >= max_segments {
+            break;
         }
+        rows += s.rows;
+        bytes += s.bytes;
+        picked.push(s);
+    }
+    if picked.len() >= min_segments.max(2) {
+        picked
+    } else {
+        Vec::new()
     }
 }
 
@@ -349,7 +399,7 @@ fn cmp_rows(a: &Batch, ra: usize, b: &Batch, rb: usize, keys: &[usize]) -> Order
     Ordering::Equal
 }
 
-fn cmp_cells(a: &Column, ra: usize, b: &Column, rb: usize) -> Ordering {
+pub(crate) fn cmp_cells(a: &Column, ra: usize, b: &Column, rb: usize) -> Ordering {
     match (a.is_null(ra), b.is_null(rb)) {
         (true, true) => return Ordering::Equal,
         (true, false) => return Ordering::Greater,
@@ -363,5 +413,83 @@ fn cmp_cells(a: &Column, ra: usize, b: &Column, rb: usize) -> Ordering {
         (ColumnData::Decimal(x), ColumnData::Decimal(y)) => x[ra].cmp(&y[rb]),
         (ColumnData::Bytes(x), ColumnData::Bytes(y)) => x.get(ra).cmp(y.get(rb)),
         _ => cmp_datum(&a.datum(ra), &b.datum(rb)),
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn seg(id: usize, rows: u64, bytes: u64) -> SegmentMeta {
+        SegmentMeta { id: format!("s{id}"), rows, bytes, stats: Vec::new(), columns: Vec::new() }
+    }
+
+    /// Simulates a table that gets one small segment per compaction and
+    /// merges whatever `merge_candidates` picks. Returns the bytes
+    /// rewritten by merges and the largest segment that was ever picked
+    /// together with segments far smaller than itself.
+    fn simulate(arrivals: usize, rows: u64, bytes: u64) -> (u64, Manifest) {
+        let mut m = Manifest::new(Schema::new(Vec::new()), Vec::new());
+        let mut next = 0;
+        let mut rewritten = 0;
+        for _ in 0..arrivals {
+            m.segments.push(seg(next, rows, bytes));
+            next += 1;
+            loop {
+                let picked: Vec<String> =
+                    m.merge_candidates(4_000_000, 256 << 20, 32, 8).iter().map(|s| s.id.clone()).collect();
+                if picked.is_empty() {
+                    break;
+                }
+                let (r, b) = m
+                    .segments
+                    .iter()
+                    .filter(|s| picked.contains(&s.id))
+                    .fold((0, 0), |(r, b), s| (r + s.rows, b + s.bytes));
+                // The smallest and largest picked are in one tier.
+                let sizes: Vec<u64> = m.segments.iter().filter(|s| picked.contains(&s.id)).map(|s| s.bytes).collect();
+                let (lo, hi) = (*sizes.iter().min().unwrap(), *sizes.iter().max().unwrap());
+                assert!(hi < lo.max(4096) * MERGE_TIER_FACTOR * 4, "merged {lo} with {hi}");
+                m.segments.retain(|s| !picked.contains(&s.id));
+                m.segments.push(seg(next, r, b));
+                next += 1;
+                rewritten += b;
+            }
+        }
+        (rewritten, m)
+    }
+
+    #[test]
+    fn merges_stay_within_a_size_tier() {
+        // 10 s compactions of ~5 KB for a day: the old rule rewrote the
+        // whole table every eighth arrival (quadratic in the table).
+        let arrivals = 8_640;
+        let (rewritten, m) = simulate(arrivals, 50, 5_000);
+        let total = arrivals as u64 * 5_000;
+        assert_eq!(m.segments.iter().map(|s| s.bytes).sum::<u64>(), total);
+        // Each byte is rewritten about once per tier it passes through.
+        assert!(rewritten <= total * 8, "rewrote {rewritten} bytes for {total}");
+        assert!(m.segments.len() < 64, "{} segments", m.segments.len());
+    }
+
+    #[test]
+    fn a_large_segment_is_not_merged_with_a_few_small_ones() {
+        let mut m = Manifest::new(Schema::new(Vec::new()), Vec::new());
+        m.segments.push(seg(0, 30_000, 3_700_000));
+        for i in 1..=8 {
+            m.segments.push(seg(i, 50, 5_000));
+        }
+        let picked: Vec<&str> = m.merge_candidates(4_000_000, 256 << 20, 32, 8).iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(picked.len(), 8);
+        assert!(!picked.contains(&"s0"));
+    }
+
+    #[test]
+    fn size_tiers() {
+        assert_eq!(size_tier(0), 0);
+        assert_eq!(size_tier(16_383), 0);
+        assert_eq!(size_tier(16_384), 1);
+        assert_eq!(size_tier(65_536), 2);
+        assert!(size_tier(3_700_000) > size_tier(5_000) + 3);
     }
 }

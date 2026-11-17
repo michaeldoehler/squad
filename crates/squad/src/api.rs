@@ -205,6 +205,11 @@ impl Database {
         self.shared.columnar.cache_counters()
     }
 
+    /// Memory held by the caches of columnar tables right now.
+    pub fn columnar_memory(&self) -> crate::ColumnarMemory {
+        self.shared.columnar.memory()
+    }
+
     /// Opens a new connection (session). Connections are independent:
     /// each has its own transaction state and settings.
     pub fn connect(&self) -> Connection {
