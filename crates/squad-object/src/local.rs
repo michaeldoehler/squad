@@ -150,11 +150,19 @@ impl ObjectStore for LocalStore {
         let created = create_dirs(parent)?;
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         let tmp = parent.join(format!("{TMP_PREFIX}{}-{n}", std::process::id()));
-        let copied = fs::copy(source, &tmp).and_then(|_| OpenOptions::new().write(true).open(&tmp)?.sync_all());
-        if let Err(e) = copied.and_then(|_| fs::rename(&tmp, &path)) {
+        // Errors name the file and the step, so that a failure can be told
+        // apart: the source gone, the target directory gone, or the rename.
+        let step = |what: &str, e: io::Error| {
             let _ = fs::remove_file(&tmp);
-            return Err(e.into());
-        }
+            Error::Io(io::Error::new(e.kind(), format!("{what} {} to {}: {e}", source.display(), tmp.display())))
+        };
+        fs::copy(source, &tmp).map_err(|e| step("copying", e))?;
+        OpenOptions::new()
+            .write(true)
+            .open(&tmp)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| step("syncing the copy of", e))?;
+        fs::rename(&tmp, &path).map_err(|e| step("renaming the copy of", e))?;
         sync_dir(parent)?;
         sync_created(&created)?;
         Ok(())
