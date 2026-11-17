@@ -510,7 +510,7 @@ struct Counting {
     bytes: AtomicU64,
     keys: std::sync::Mutex<std::collections::BTreeSet<String>>,
     puts: AtomicU64,
-    put_bytes: AtomicU64,
+    put_sizes: std::sync::Mutex<Vec<u64>>,
 }
 
 impl Counting {
@@ -522,7 +522,7 @@ impl Counting {
             bytes: AtomicU64::new(0),
             keys: Default::default(),
             puts: AtomicU64::new(0),
-            put_bytes: AtomicU64::new(0),
+            put_sizes: Default::default(),
         })
     }
     fn reset(&self) -> (u64, u64, u64, usize) {
@@ -543,7 +543,7 @@ impl squad::object::ObjectStore for Counting {
     fn put(&self, key: &str, data: &[u8]) -> squad::object::Result<()> {
         if key.starts_with("columnar/") {
             self.puts.fetch_add(1, Ordering::SeqCst);
-            self.put_bytes.fetch_add(data.len() as u64, Ordering::SeqCst);
+            self.put_sizes.lock().unwrap().push(data.len() as u64);
         }
         self.inner.put(key, data)
     }
@@ -981,11 +981,12 @@ fn background_merges_do_not_rewrite_the_whole_table_each_time() {
     let n: i64 = conn.query_one("SELECT count(*) FROM e", &[]).unwrap().get(0);
     assert_eq!(n, 40_000);
     let live = store.segment_bytes();
-    let written = store.put_bytes.load(Ordering::SeqCst);
     // Merging the whole table whenever eight small segments had gathered
-    // wrote about 25 times the table; merging by size tier writes each
-    // row once per tier it passes.
-    assert!(written < live * 8, "wrote {written} bytes of segments for a table of {live}");
+    // wrote a segment of about the size of the table every eighth
+    // insert; merging by size tier writes large segments rarely.
+    let sizes = store.put_sizes.lock().unwrap().clone();
+    let large = sizes.iter().filter(|&&n| n * 4 >= live).count();
+    assert!(large <= 4, "{large} of {} segment writes were a quarter of the table ({live} bytes) or more", sizes.len());
 }
 
 #[test]
@@ -1027,10 +1028,9 @@ fn caches_drop_deleted_segments_and_stay_within_their_limits() {
         assert!(m.chunk_bytes <= cache + (cache / 16), "round {round}: {m:?}");
         assert!(m.segment_bytes <= 4 << 20, "round {round}: {m:?}");
     }
-    // Rewriting the table drops what was cached of the segments it
-    // replaced.
-    conn.execute("INSERT INTO e SELECT g, 'x' FROM generate_series(1, 10) g", &[]).unwrap();
-    conn.batch_execute("VACUUM e").unwrap();
+    // Deleting every row replaces every segment: what was cached of them
+    // is dropped.
+    conn.execute("DELETE FROM e", &[]).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while db.columnar_memory().retired_segments > 0 && std::time::Instant::now() < deadline {
         thread::sleep(std::time::Duration::from_millis(20));
@@ -1038,6 +1038,7 @@ fn caches_drop_deleted_segments_and_stay_within_their_limits() {
     let m = db.columnar_memory();
     assert_eq!(m.retired_segments, 0);
     assert_eq!(m.chunk_bytes, 0, "ranges of deleted segments are still cached: {m:?}");
+    assert_eq!(conn.query_one("SELECT count(*) FROM e", &[]).unwrap().get::<i64>(0), 0);
     assert_eq!(m.segment_bytes, 0, "deleted segments are still open: {m:?}");
 }
 
