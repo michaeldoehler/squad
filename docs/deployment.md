@@ -154,8 +154,13 @@ let db = Database::open("/var/lib/ingest/db", Config {
 
 Losing the volume loses nothing that is in the bucket. The start-up time
 after a move is the download of the newest snapshot plus the replay of
-the log since; a new snapshot is uploaded after every
-`snapshot_wal_bytes` (default 64 MiB) of log. Column segments are not
+the log since, both fetched with 16 requests at a time
+(`restore_concurrency`); a new snapshot is uploaded after 64 MiB or
+2000 objects of log, or 15 minutes after the last one if there was a
+commit since (see
+[cloud storage](cloud-storage.md#snapshots-and-recovery-time)), and the
+count survives restarts. The restore logs its progress at level info,
+so a long one can be told from a hang. Column segments are not
 downloaded at start; they are read in ranges as queries need them and
 kept in an in-memory cache (`ColumnarConfig::cache_bytes`).
 

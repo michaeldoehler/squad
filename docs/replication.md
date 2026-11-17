@@ -86,7 +86,8 @@ replica the same way.
 | `store` | — | the object store the writer ships to |
 | `poll_interval` | 1 s | how often the store is asked for new commits |
 | `promoted_sync` | `Sync` | how this node ships its own log after promotion |
-| `snapshot_wal_bytes` | 64 MiB | snapshot interval after promotion |
+| `snapshot_wal_bytes` | 64 MiB | snapshot interval after promotion (the other snapshot triggers keep their defaults, see [cloud storage](cloud-storage.md#snapshots-and-recovery-time)) |
+| `restore_concurrency` | 16 | requests at a time when the replica downloads a snapshot or catches up on the log |
 | `sync_mode`, `cache_size`, `checkpoint_wal_bytes` | as in `Config` | local durability and memory |
 
 ## What a replica does and does not do

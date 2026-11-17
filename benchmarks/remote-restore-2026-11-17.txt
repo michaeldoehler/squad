@@ -1,0 +1,23 @@
+# 2026-11-17T14:45Z, 4 cores shared with another worker building in parallel (load average about 8): indicative only.
+# Store: Garage v2.5.0 single node (replication_factor 1, sqlite metadata) on 127.0.0.1, same machine.
+# Local disk: tempdir, DiskOptions::default().
+
+# cargo run --release -p squad-storage --example remote_bench --features squad-object/test-util -- 's3://squad-test/bench-restore-…'
+commit of one 120-byte row                     p50 (µs)   p99 (µs)  commits/s
+local only (fsync)                                 3995       6290        343
+remote, async shipping                             3993       7997        315
+remote, sync shipping (1 thread)                   8166      16816        117
+remote, sync shipping (16 threads)                                       1282
+
+log objects so far: 2504, 1680000 bytes
+data file: 23.5 MiB
+first snapshot uploaded 24 chunks, 23.5 MiB
+snapshot after changing 1% of the rows (spread evenly): 24 chunks uploaded, 23.5 MiB, 0 chunks reused, 2049 ms
+
+restore with  1 requests at a time: 24 chunks (23.5 MiB), 1500 log objects, 0.71 s
+restore with 16 requests at a time: 24 chunks (23.5 MiB), 1500 log objects, 0.76 s
+
+# A GET against this local Garage takes well under a millisecond, so the restore is bound by
+# local work (writing the chunks, applying 1500 records) and concurrency does not help here.
+# It helps where every request waits for the network: see the unit test
+# restore_fetches_in_parallel_and_matches_the_serial_result (2 ms per GET: 668 ms -> 59 ms).

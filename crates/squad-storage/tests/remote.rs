@@ -11,8 +11,8 @@ use std::time::Duration;
 use squad_object::emulator::S3Emulator;
 use squad_object::{Fault, MemoryStore, ObjectStore, S3Store};
 use squad_storage::{
-    restore_from, DiskEngine, DiskOptions, Engine, RemoteConfig, RemoteSync, SimVfs, StorageError, SyncMode,
-    TieredEngine, WriteBatch,
+    restore_from, DiskEngine, DiskOptions, Engine, RemoteConfig, RemoteStats, RemoteSync, SimVfs, SnapshotTrigger,
+    StorageError, SyncMode, TieredEngine, WriteBatch,
 };
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -657,4 +657,160 @@ fn concurrent_sync_commits_share_and_overlap_uploads() {
             );
         }
     }
+}
+
+/// A configuration whose snapshots happen only when asked for or when a
+/// test turns one trigger on.
+fn quiet(store: &MemoryStore) -> RemoteConfig {
+    RemoteConfig {
+        snapshot_wal_bytes: u64::MAX,
+        snapshot_wal_objects: 0,
+        snapshot_interval: None,
+        ..RemoteConfig::new(Arc::new(store.clone()), RemoteSync::Sync)
+    }
+}
+
+fn commit(engine: &TieredEngine, key: &str) {
+    let mut b = WriteBatch::new();
+    b.put(key.as_bytes().to_vec(), vec![7u8; 200]);
+    let lsn = engine.write(b).unwrap();
+    engine.sync(lsn).unwrap();
+}
+
+/// Waits until the engine has taken `n` snapshots.
+fn wait_for_snapshots(engine: &TieredEngine, n: u64) -> RemoteStats {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let stats = engine.remote_stats();
+        if stats.snapshots >= n {
+            return stats;
+        }
+        assert!(std::time::Instant::now() < deadline, "no snapshot {n}: {stats:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The log after the newest snapshot is counted from the store when a
+/// writer opens: a restart does not reset the measure, and a threshold
+/// that the log in the store already exceeds starts a snapshot without
+/// any new commit.
+#[test]
+fn the_log_since_the_newest_snapshot_counts_across_restarts() {
+    let store = MemoryStore::new();
+    let vfs = SimVfs::new(40);
+    let (objects, bytes) = {
+        let engine = TieredEngine::open(Path::new("/db"), options(&vfs), quiet(&store)).unwrap();
+        for i in 0..5 {
+            commit(&engine, &format!("a{i}"));
+        }
+        engine.snapshot_remote().unwrap();
+        for i in 0..30 {
+            commit(&engine, &format!("b{i}"));
+        }
+        let stats = engine.remote_stats();
+        assert_eq!((stats.snapshots, stats.wal_objects_since_snapshot), (1, 30), "{stats:?}");
+        (stats.wal_objects_since_snapshot, stats.wal_bytes_since_snapshot)
+    };
+    let engine = TieredEngine::open(Path::new("/db"), options(&vfs), quiet(&store)).unwrap();
+    let stats = engine.remote_stats();
+    assert_eq!((stats.wal_objects_since_snapshot, stats.wal_bytes_since_snapshot), (objects, bytes), "{stats:?}");
+    assert_eq!((stats.snapshots, stats.snapshot_lsn), (0, 5));
+    commit(&engine, "c");
+    assert_eq!(engine.remote_stats().wal_objects_since_snapshot, 31);
+    drop(engine);
+
+    let config = RemoteConfig { snapshot_wal_objects: 31, ..quiet(&store) };
+    let engine = TieredEngine::open(Path::new("/db"), options(&vfs), config).unwrap();
+    let stats = wait_for_snapshots(&engine, 1);
+    assert_eq!(stats.last_snapshot_trigger, Some(SnapshotTrigger::WalObjects), "{stats:?}");
+    assert_eq!((stats.snapshot_lsn, stats.wal_objects_since_snapshot, stats.wal_bytes_since_snapshot), (36, 0, 0));
+    assert!(stats.last_restore.is_none());
+}
+
+#[test]
+fn a_snapshot_follows_enough_log_objects() {
+    let store = MemoryStore::new();
+    let config = RemoteConfig { snapshot_wal_objects: 20, ..quiet(&store) };
+    let engine = TieredEngine::open(Path::new("/db"), options(&SimVfs::new(41)), config).unwrap();
+    for i in 0..19 {
+        commit(&engine, &format!("k{i}"));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(engine.remote_stats().snapshots, 0);
+    commit(&engine, "k19");
+    let stats = wait_for_snapshots(&engine, 1);
+    assert_eq!(stats.last_snapshot_trigger, Some(SnapshotTrigger::WalObjects), "{stats:?}");
+    assert_eq!(stats.snapshot_lsn, 20);
+}
+
+#[test]
+fn a_snapshot_follows_enough_log_bytes() {
+    let store = MemoryStore::new();
+    let config = RemoteConfig { snapshot_wal_bytes: 4 << 10, ..quiet(&store) };
+    let engine = TieredEngine::open(Path::new("/db"), options(&SimVfs::new(42)), config).unwrap();
+    for i in 0..30 {
+        commit(&engine, &format!("k{i}"));
+    }
+    let stats = wait_for_snapshots(&engine, 1);
+    assert_eq!(stats.last_snapshot_trigger, Some(SnapshotTrigger::WalBytes), "{stats:?}");
+}
+
+/// With `snapshot_interval`, a snapshot follows once that much time has
+/// passed since the newest one, but only if there is new log.
+#[test]
+fn a_snapshot_follows_the_interval_if_there_is_new_log() {
+    let store = MemoryStore::new();
+    let config = RemoteConfig { snapshot_interval: Some(Duration::from_millis(300)), ..quiet(&store) };
+    let engine = TieredEngine::open(Path::new("/db"), options(&SimVfs::new(43)), config).unwrap();
+    commit(&engine, "a");
+    engine.snapshot_remote().unwrap();
+    let taken = engine.remote_stats().snapshots;
+    assert_eq!(engine.remote_stats().last_snapshot_trigger, Some(SnapshotTrigger::Requested));
+    // Nothing new: no snapshot however long the wait.
+    std::thread::sleep(Duration::from_millis(1000));
+    assert_eq!(engine.remote_stats().snapshots, taken);
+    commit(&engine, "b");
+    let stats = wait_for_snapshots(&engine, taken + 1);
+    assert_eq!(stats.last_snapshot_trigger, Some(SnapshotTrigger::Interval), "{stats:?}");
+    assert_eq!(stats.snapshot_lsn, 2);
+}
+
+/// A writer that restored at open and had to replay more log than the
+/// thresholds allow takes a snapshot in the background soon after, so
+/// that the next restore is short.
+#[test]
+fn a_long_restore_is_followed_by_a_snapshot() {
+    let store = MemoryStore::new();
+    let vfs = SimVfs::new(44);
+    let engine = TieredEngine::open(Path::new("/db"), options(&vfs), quiet(&store)).unwrap();
+    for i in 0..5 {
+        commit(&engine, &format!("a{i}"));
+    }
+    engine.snapshot_remote().unwrap();
+    for i in 0..60 {
+        commit(&engine, &format!("b{i}"));
+    }
+    let want = contents(&engine);
+    // The machine dies.
+    vfs.kill();
+    std::mem::forget(engine);
+
+    let config = RemoteConfig { snapshot_wal_objects: 50, restore_concurrency: 4, ..quiet(&store) };
+    let engine = TieredEngine::open(Path::new("/db"), options(&SimVfs::new(45)), config).unwrap();
+    assert_eq!(contents(&engine), want);
+    let restore = engine.remote_stats().last_restore.expect("restored at open");
+    assert_eq!((restore.snapshot_lsn, restore.lsn, restore.wal_objects, restore.records), (5, 65, 60, 60));
+    assert_eq!(restore.concurrency, 4);
+    let stats = wait_for_snapshots(&engine, 1);
+    assert_eq!(stats.last_snapshot_trigger, Some(SnapshotTrigger::Restore), "{stats:?}");
+    assert_eq!(stats.snapshot_lsn, 65);
+    drop(engine);
+    assert_eq!(restored(&store), want);
+
+    // A short restore is not followed by one.
+    let config = RemoteConfig { snapshot_wal_objects: 50, ..quiet(&store) };
+    let engine = TieredEngine::open(Path::new("/db2"), options(&SimVfs::new(46)), config).unwrap();
+    assert_eq!(engine.remote_stats().last_restore.map(|r| r.wal_objects), Some(0));
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(engine.remote_stats().snapshots, 0);
 }

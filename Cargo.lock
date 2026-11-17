@@ -2598,6 +2598,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "hmac 0.12.1",
+ "log",
  "parking_lot",
  "pbkdf2",
  "rand 0.8.8",
@@ -2631,6 +2632,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "fs2",
+ "log",
  "parking_lot",
  "sha2 0.10.9",
  "squad-object",

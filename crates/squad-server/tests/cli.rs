@@ -79,6 +79,12 @@ fn version_help_and_usage_errors() {
     assert_eq!(out.trim(), format!("squad {}", env!("CARGO_PKG_VERSION")));
     let (ok, out, _) = output(squad().arg("--help"));
     assert!(ok && out.contains("squad serve <dir>"));
+    for args in [&["serve", "--help"][..], &["serve", "./data", "-h"], &["restore", "--help"], &["-h"]] {
+        let (ok, out, err) = output(squad().args(args));
+        assert!(ok && out.contains("OPTIONS for serve"), "{args:?}: {err}");
+    }
+    let (ok, _, err) = output(squad().env("SQUAD_LOG", "loud").arg("--version"));
+    assert!(!ok && err.contains("invalid SQUAD_LOG"), "{err}");
     let (ok, _, err) = output(&mut squad());
     assert!(!ok && err.contains("USAGE"));
     let (ok, _, err) = output(squad().args(["frobnicate"]));
@@ -205,6 +211,11 @@ fn remote_copy_and_restore() {
     let copy = dir.path().join("copy");
     let (ok, out, err) = output(squad().args(["restore", &remote, copy.to_str().unwrap()]));
     assert!(ok && out.contains("database restored"), "{out}{err}");
+    // Progress goes to stderr: start and end of the download.
+    assert!(err.contains("info: restore: snapshot at LSN") && err.contains("info: restore: done at LSN"), "{err}");
+    let quiet = dir.path().join("quiet");
+    let (ok, _, err) = output(squad().env("SQUAD_LOG", "off").args(["restore", &remote, quiet.to_str().unwrap()]));
+    assert!(ok && !err.contains("info:"), "{err}");
     let (ok, out, err) = run(&["shell", copy.to_str().unwrap()], "SELECT count(*), max(v) FROM t;\n");
     assert!(ok && out.contains(" 500 ") && out.contains("row 99"), "{out}{err}");
     let (ok, out, _) = output(squad().args(["verify", copy.to_str().unwrap()]));
