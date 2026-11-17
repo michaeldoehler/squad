@@ -63,6 +63,9 @@ pub(crate) const META_TABLE: &str = "squad_cluster_meta";
 const PLAN_CACHE: usize = 4096;
 
 /// Where one shard lives.
+// A spec is made once per shard; boxing the config would only make the
+// `Local { dir, config }` form harder to write.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum ShardSpec {
     /// A database directory opened in this process.
