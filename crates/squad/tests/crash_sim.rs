@@ -323,10 +323,12 @@ fn open_columnar(vfs: &SimVfs, store: &Arc<squad::object::MemoryStore>, rng: &mu
     };
     let engine = DiskEngine::open(Path::new("/db"), options)?;
     // Compaction runs where the workload says (VACUUM), so that a seed
-    // replays the same way; orphans are removed at once.
+    // replays the same way; orphans and replaced segments are removed at
+    // once.
     let columnar = squad::ColumnarConfig {
         background_compaction: false,
         orphan_grace: std::time::Duration::ZERO,
+        retire_grace: std::time::Duration::ZERO,
         ..Default::default()
     };
     Database::with_engine_and_objects(Arc::new(engine), store.clone(), columnar)
