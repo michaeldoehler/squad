@@ -86,6 +86,7 @@ pub(crate) fn show_setting(state: &SessionState, name: &str) -> Result<String> {
         "intervalstyle" => "postgres".to_string(),
         "max_identifier_length" => "63".to_string(),
         "statement_timeout" => state.statement_timeout.map_or("0".to_string(), |d| format!("{}ms", d.as_millis())),
+        "work_mem" => crate::spill::format_memory(state.work_mem),
         "idle_in_transaction_session_timeout" => "0".to_string(),
         "application_name" => String::new(),
         "extra_float_digits" => "1".to_string(),
@@ -201,6 +202,12 @@ pub(crate) fn apply_setting(state: &mut SessionState, name: &str, value: Option<
         }
         "lock_timeout" => state.lock_timeout = value.map(parse_duration_ms).transpose()?.flatten(),
         "statement_timeout" => state.statement_timeout = value.map(parse_duration_ms).transpose()?.flatten(),
+        "work_mem" => {
+            state.work_mem = match value {
+                Some(v) if !v.eq_ignore_ascii_case("default") => crate::spill::parse_memory("work_mem", v)?,
+                _ => state.work_mem_default,
+            }
+        }
         "default_transaction_isolation" => {
             state.default_isolation = value.map(parse_isolation).transpose()?.unwrap_or_default();
         }
@@ -256,6 +263,7 @@ fn reset_all(state: &mut SessionState) {
     state.tz = chrono_tz::UTC;
     state.lock_timeout = None;
     state.statement_timeout = None;
+    state.work_mem = state.work_mem_default;
     state.default_isolation = Isolation::default();
     state.default_read_only = false;
     state.row_security = true;
@@ -2738,7 +2746,7 @@ fn explain(sess: &mut Session, stmt: &pb::ExplainStmt) -> Result<QueryResult> {
     }
     let sql = deparse_stmt(query)?;
     let prepared = sess.prepare(&sql, &[])?;
-    let mut lines = crate::explain::render(&prepared);
+    let mut lines = crate::explain::render(&prepared, &Default::default());
     if analyze {
         let start = std::time::Instant::now();
         let explicit = sess.txn.as_ref().is_some_and(|t| t.explicit);
@@ -2746,11 +2754,14 @@ fn explain(sess: &mut Session, stmt: &pb::ExplainStmt) -> Result<QueryResult> {
             sess.begin(None, false)?;
         }
         sess.txn.as_mut().unwrap().explicit = true;
+        sess.state.plan_notes = Some(Default::default());
         let result = sess.execute_prepared(&prepared, &[]);
+        let notes = sess.state.plan_notes.take().unwrap_or_default();
         if let Some(t) = &mut sess.txn {
             t.explicit = explicit;
         }
         let result = result?;
+        lines = crate::explain::render(&prepared, &notes);
         let rows = if prepared.returns_rows() { result.rows.len() as u64 } else { result.rows_affected };
         lines.push(format!("Actual Rows: {rows}"));
         lines.push(format!("Execution Time: {:.3} ms", start.elapsed().as_secs_f64() * 1000.0));

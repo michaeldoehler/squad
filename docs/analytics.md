@@ -103,7 +103,8 @@ each row is rewritten about once per tier it passes, so the work of
 merging follows the rate of new data, not the size of the table. The
 merge streams: it holds one decoded row group per input and the encoded
 output, not the inputs. The output is written to a temporary file
-(`ColumnarConfig::temp_dir`, default the system's temporary directory)
+(in the database's directory for temporary files, `Config::temp_dir`,
+by default `tmp/` in the database directory)
 and stored from there (in an S3 bucket as a multipart upload, one 8 MiB
 part in memory at a time), so a merge needs about one row group per input
 in memory, however large its output; the file is deleted afterwards.

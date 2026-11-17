@@ -88,9 +88,6 @@ pub struct ColumnarConfig {
     /// can finish reading it. Local stores delete as soon as no snapshot
     /// of this process reads it.
     pub retire_grace: Duration,
-    /// Directory for the temporary file a merge writes its output into
-    /// before it is stored; `None` means the system's temporary directory.
-    pub temp_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ColumnarConfig {
@@ -105,7 +102,6 @@ impl Default for ColumnarConfig {
             merge_max_bytes: 256 << 20,
             orphan_grace: Duration::from_secs(3600),
             retire_grace: Duration::from_secs(600),
-            temp_dir: None,
         }
     }
 }
@@ -1841,14 +1837,15 @@ struct TempFile {
 }
 
 impl TempFile {
-    fn create(dir: Option<&std::path::Path>) -> Result<TempFile> {
+    /// A file in the database's directory for temporary files, named so
+    /// that a crashed process's leftovers are removed at the next open.
+    fn create(dir: &std::path::Path) -> Result<TempFile> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = dir.map(std::path::Path::to_path_buf).unwrap_or_else(std::env::temp_dir);
         let io =
             |e: std::io::Error| Error::new(sqlstate::IO_ERROR, format!("temporary file in {}: {e}", dir.display()));
-        std::fs::create_dir_all(&dir).map_err(io)?;
+        std::fs::create_dir_all(dir).map_err(io)?;
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!("squad-merge-{}-{n}.seg", std::process::id()));
+        let path = dir.join(format!("{}merge-{}-{n}.seg", crate::spill::PREFIX, std::process::id()));
         std::fs::File::create(&path).map_err(io)?;
         Ok(TempFile { path })
     }
@@ -2001,7 +1998,7 @@ pub(crate) fn merge_segments(table: &Arc<Table>, cx: &mut ExecCx) -> Result<usiz
     let inputs = open_segments(table, &layout, &picked, None, cx)?;
     // The output goes to a temporary file and is stored from there, so
     // that memory holds one row group per input, not the merged segment.
-    let tmp = TempFile::create(cx.shared.columnar.config().temp_dir.as_deref())?;
+    let tmp = TempFile::create(cx.shared.temp_space().dir())?;
     cs::merge_to_file(&inputs, writer_options(table), tmp.file()?)?;
     drop(inputs);
     manifest.segments.retain(|s| !small.iter().any(|m| m.id == s.id));

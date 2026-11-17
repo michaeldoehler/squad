@@ -8,12 +8,17 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 
 use crate::encoding::{encode_key, encode_key_tuple};
-use crate::exec::{collect, compare_keys, ExecCx};
+use crate::exec::{compare_keys, sort_orders, ExecCx, Node, SortedNode};
 use crate::expr::{Expr, Row};
 use crate::plan::{AggCall, AggFunc, Frame, FrameBound, FrameUnit, Plan, WindowCall, WindowFunc};
+use crate::spill::{
+    json_size, out_of_memory, partition_of, row_size, value_size, Partitions, RowStore, SortOrder, Sorter, SpillFile,
+    Stored, ENTRY_OVERHEAD, MAX_LEVEL,
+};
 use crate::types::{compare, Interval, Type, Value};
 use crate::value::{self, FuncImpl};
 use crate::{Error, Result};
+use std::rc::Rc;
 
 type Json = serde_json::Value;
 
@@ -103,11 +108,12 @@ impl<'p> Runner<'p> {
         Runner { call, func, acc, n: 0, distinct: distinct.then(HashSet::new), ordered: Vec::new() }
     }
 
-    /// Feeds one input row.
-    fn feed(&mut self, row: &[Value], cx: &mut ExecCx) -> Result<()> {
+    /// Feeds one input row. Returns by how many bytes the state grew
+    /// (an estimate; zero for states of fixed size).
+    fn feed(&mut self, row: &[Value], cx: &mut ExecCx) -> Result<usize> {
         if let Some(f) = &self.call.filter {
             if !f.test(row, cx)? {
-                return Ok(());
+                return Ok(0);
             }
         }
         let mut args = Vec::with_capacity(self.call.args.len());
@@ -119,23 +125,27 @@ impl<'p> Runner<'p> {
             for k in &self.call.order_by {
                 key.push(k.expr.eval(row, cx)?);
             }
+            let size = row_size(&key) + row_size(&args) + ENTRY_OVERHEAD;
             self.ordered.push((key, args));
-            return Ok(());
+            return Ok(size);
         }
         self.accumulate(args, cx)
     }
 
-    fn accumulate(&mut self, args: Vec<Value>, cx: &mut ExecCx) -> Result<()> {
+    fn accumulate(&mut self, args: Vec<Value>, cx: &mut ExecCx) -> Result<usize> {
         let skip_null = !matches!(
             self.func,
             AggFunc::CountStar | AggFunc::ArrayAgg | AggFunc::JsonAgg { .. } | AggFunc::JsonObjectAgg { .. }
         );
         if skip_null && args.first().is_some_and(Value::is_null) {
-            return Ok(());
+            return Ok(0);
         }
+        let mut grown = 0;
         if let Some(seen) = &mut self.distinct {
-            if !seen.insert(encode_key_tuple(&args)) {
-                return Ok(());
+            let key = encode_key_tuple(&args);
+            grown += key.len() + ENTRY_OVERHEAD;
+            if !seen.insert(key) {
+                return Ok(0);
             }
         }
         self.n += 1;
@@ -191,24 +201,34 @@ impl<'p> Runner<'p> {
             }
             Acc::Text(state) => {
                 let piece = first.as_str().unwrap_or_default();
+                grown += piece.len();
                 match state {
                     None => *state = Some(piece.to_string()),
                     Some(s) => {
                         if let Some(Value::Text(sep)) = args.next() {
+                            grown += sep.len();
                             s.push_str(&sep);
                         }
                         s.push_str(piece);
                     }
                 }
             }
-            Acc::Array(items) => items.push(first),
-            Acc::JsonArray(items) => items.push(to_json(&first, cx)?),
+            Acc::Array(items) => {
+                grown += value_size(&first);
+                items.push(first)
+            }
+            Acc::JsonArray(items) => {
+                let j = to_json(&first, cx)?;
+                grown += std::mem::size_of::<Json>() + json_size(&j);
+                items.push(j)
+            }
             Acc::JsonObject(map) => {
                 let Value::Text(key) = first else {
                     return Err(Error::new(crate::sqlstate::NULL_VALUE_NOT_ALLOWED, "field name must not be null"));
                 };
-                let v = args.next().unwrap_or(Value::Null);
-                map.insert(key, to_json(&v, cx)?);
+                let v = to_json(&args.next().unwrap_or(Value::Null), cx)?;
+                grown += key.len() + std::mem::size_of::<Json>() + ENTRY_OVERHEAD + json_size(&v);
+                map.insert(key, v);
             }
             Acc::Moments(n, sum, sq, exact) => {
                 let x = first.as_f64().ok_or_else(|| Error::internal("variance over non-numeric value"))?;
@@ -222,7 +242,121 @@ impl<'p> Runner<'p> {
                 }
             }
         }
-        Ok(())
+        Ok(grown)
+    }
+
+    /// The state as a value, to be written to a temporary file.
+    fn save(self) -> Value {
+        let tagged = |tag: i16, mut rest: Vec<Value>| {
+            rest.insert(0, Value::Int2(tag));
+            Value::Record(rest)
+        };
+        let acc = match self.acc {
+            Acc::Count(c) => tagged(0, vec![Value::Int8(c)]),
+            Acc::SumInt(s) => tagged(1, vec![Value::Bytea(s.to_le_bytes().to_vec())]),
+            Acc::SumNumeric(d) => tagged(2, vec![Value::Numeric(d)]),
+            Acc::SumFloat(f) => tagged(3, vec![Value::Float8(f)]),
+            Acc::SumInterval(i) => tagged(4, vec![Value::Interval(i)]),
+            Acc::Extreme(v) => tagged(5, vec![v.unwrap_or(Value::Null)]),
+            Acc::Bool(b) => tagged(6, vec![b.map_or(Value::Null, Value::Bool)]),
+            Acc::Bits(b) => tagged(7, vec![b.map_or(Value::Null, Value::Int8)]),
+            Acc::Text(t) => tagged(8, vec![t.map_or(Value::Null, Value::Text)]),
+            Acc::Array(items) => tagged(9, vec![Value::Array(items)]),
+            Acc::JsonArray(items) => {
+                tagged(10, vec![Value::Array(items.into_iter().map(|j| Value::Jsonb(Box::new(j))).collect())])
+            }
+            Acc::JsonObject(map) => tagged(11, vec![Value::Jsonb(Box::new(Json::Object(map)))]),
+            Acc::Moments(n, s, q, exact) => {
+                let (es, eq) = match exact {
+                    Some((a, b)) => (Value::Numeric(a), Value::Numeric(b)),
+                    None => (Value::Null, Value::Null),
+                };
+                tagged(12, vec![Value::Float8(n), Value::Float8(s), Value::Float8(q), es, eq])
+            }
+        };
+        let distinct = match self.distinct {
+            None => Value::Null,
+            Some(set) => Value::Array(set.into_iter().map(Value::Bytea).collect()),
+        };
+        let ordered = Value::Array(
+            self.ordered.into_iter().map(|(k, a)| Value::Record(vec![Value::Record(k), Value::Record(a)])).collect(),
+        );
+        Value::Record(vec![acc, Value::Int8(self.n), distinct, ordered])
+    }
+
+    /// The inverse of [`save`](Runner::save).
+    fn restore(call: &'p AggCall, func: &'p AggFunc, saved: Value) -> Result<Runner<'p>> {
+        let bad = || Error::internal("malformed aggregate state in a temporary file");
+        let Value::Record(parts) = saved else { return Err(bad()) };
+        let [acc, n, distinct, ordered]: [Value; 4] = parts.try_into().map_err(|_| bad())?;
+        let Value::Record(acc) = acc else { return Err(bad()) };
+        let mut acc = acc.into_iter();
+        let (Some(Value::Int2(tag)), Some(first)) = (acc.next(), acc.next()) else { return Err(bad()) };
+        let opt = |v: Value| if v.is_null() { None } else { Some(v) };
+        let acc = match (tag, first) {
+            (0, Value::Int8(c)) => Acc::Count(c),
+            (1, Value::Bytea(b)) => Acc::SumInt(i128::from_le_bytes(b.try_into().map_err(|_| bad())?)),
+            (2, Value::Numeric(d)) => Acc::SumNumeric(d),
+            (3, Value::Float8(f)) => Acc::SumFloat(f),
+            (4, Value::Interval(i)) => Acc::SumInterval(i),
+            (5, v) => Acc::Extreme(opt(v)),
+            (6, v) => Acc::Bool(opt(v).and_then(|v| v.as_bool())),
+            (7, v) => Acc::Bits(opt(v).and_then(|v| v.as_i64())),
+            (8, Value::Text(t)) => Acc::Text(Some(t)),
+            (8, Value::Null) => Acc::Text(None),
+            (9, Value::Array(items)) => Acc::Array(items),
+            (10, Value::Array(items)) => Acc::JsonArray(
+                items
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::Jsonb(j) => Ok(*j),
+                        _ => Err(bad()),
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+            (11, Value::Jsonb(j)) => match *j {
+                Json::Object(map) => Acc::JsonObject(map),
+                _ => return Err(bad()),
+            },
+            (12, Value::Float8(cnt)) => {
+                let (Some(Value::Float8(s)), Some(Value::Float8(q)), Some(es), Some(eq)) =
+                    (acc.next(), acc.next(), acc.next(), acc.next())
+                else {
+                    return Err(bad());
+                };
+                let exact = match (es, eq) {
+                    (Value::Numeric(a), Value::Numeric(b)) => Some((a, b)),
+                    _ => None,
+                };
+                Acc::Moments(cnt, s, q, exact)
+            }
+            _ => return Err(bad()),
+        };
+        let Value::Int8(n) = n else { return Err(bad()) };
+        let distinct = match distinct {
+            Value::Null => None,
+            Value::Array(keys) => Some(
+                keys.into_iter()
+                    .map(|k| match k {
+                        Value::Bytea(b) => Ok(b),
+                        _ => Err(bad()),
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+            _ => return Err(bad()),
+        };
+        let Value::Array(ordered) = ordered else { return Err(bad()) };
+        let ordered = ordered
+            .into_iter()
+            .map(|pair| match pair {
+                Value::Record(mut kv) if kv.len() == 2 => match (kv.pop(), kv.pop()) {
+                    (Some(Value::Record(a)), Some(Value::Record(k))) => Ok((k, a)),
+                    _ => Err(bad()),
+                },
+                _ => Err(bad()),
+            })
+            .collect::<Result<_>>()?;
+        Ok(Runner { call, func, acc, n, distinct, ordered })
     }
 
     fn finish(mut self, cx: &mut ExecCx) -> Result<Value> {
@@ -479,47 +613,297 @@ pub(crate) fn mode_final(_: &crate::FnCtx, a: &[Value]) -> Result<Value> {
     Ok(best.map_or(Value::Null, |(v, _)| v.clone()))
 }
 
-pub(crate) fn aggregate(input: &Plan, groups: &[Expr], aggs: &[AggCall], cx: &mut ExecCx) -> Result<Vec<Row>> {
-    let mut node = crate::exec::open(input, cx)?;
-    let fresh = || aggs.iter().map(|a| Runner::new(a, &a.func)).collect::<Vec<_>>();
-    let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
-    let mut states: Vec<(Row, Vec<Runner>)> = Vec::new();
-    if groups.is_empty() {
-        states.push((Vec::new(), fresh()));
-    }
-    while let Some(row) = node.next(cx)? {
-        let slot = if groups.is_empty() {
-            0
-        } else {
-            let mut vals = Vec::with_capacity(groups.len());
-            let mut key = Vec::with_capacity(16);
-            for g in groups {
-                let v = g.eval(&row, cx)?;
-                encode_key(&mut key, &v);
-                vals.push(v);
-            }
-            match index.get(&key) {
-                Some(i) => *i,
-                None => {
-                    index.insert(key, states.len());
-                    states.push((vals, fresh()));
-                    states.len() - 1
+/// One group of a hash aggregation.
+struct Group<'p> {
+    key: Vec<u8>,
+    vals: Row,
+    runners: Vec<Runner<'p>>,
+    /// Estimated bytes of key, values and states.
+    size: usize,
+}
+
+/// An input record of an aggregation pass: an input row, or a group's
+/// state saved to a temporary file when the hash table was evicted.
+enum Record {
+    Row(Row),
+    State(Row, Vec<Value>),
+}
+
+/// Where an aggregation pass reads from.
+enum Source<'p> {
+    Node(Box<dyn Node + 'p>),
+    File(crate::spill::SpillReader),
+}
+
+impl Source<'_> {
+    fn next(&mut self, cx: &mut ExecCx) -> Result<Option<Record>> {
+        match self {
+            Source::Node(n) => Ok(n.next(cx)?.map(Record::Row)),
+            Source::File(f) => {
+                let Some(mut rec) = f.next_row()? else { return Ok(None) };
+                let bad = || Error::internal("malformed aggregation record in a temporary file");
+                if rec.is_empty() {
+                    return Err(bad());
+                }
+                match rec.remove(0) {
+                    Value::Bool(false) => Ok(Some(Record::Row(rec))),
+                    Value::Bool(true) => match (rec.pop(), rec.pop()) {
+                        (Some(Value::Record(states)), Some(Value::Record(vals))) => {
+                            Ok(Some(Record::State(vals, states)))
+                        }
+                        _ => Err(bad()),
+                    },
+                    _ => Err(bad()),
                 }
             }
+        }
+    }
+}
+
+/// How a pass treats groups it has not seen yet.
+#[derive(PartialEq, Eq)]
+enum Mode {
+    /// Add them to the hash table.
+    Normal,
+    /// The table is full: rows of new groups go to partitions on disk,
+    /// rows of groups in the table are still aggregated.
+    NoNewGroups,
+    /// The table was evicted to disk because its states kept growing:
+    /// every record goes to the partitions.
+    Evicted,
+}
+
+/// Hash aggregation. Groups are kept in a hash table of at most
+/// `2 × work_mem`. Once it holds `work_mem`, rows of new groups are written
+/// to partitions on disk (by a hash of the group key) while the groups in
+/// the table keep aggregating; if their states grow past the limit, they
+/// are written to the partitions too. Each partition is then aggregated
+/// the same way, one after the other.
+struct AggNode<'p> {
+    plan: &'p Plan,
+    groups: &'p [Expr],
+    aggs: &'p [AggCall],
+    ready: std::vec::IntoIter<Row>,
+    pending: Vec<(Rc<SpillFile>, u32)>,
+    batches: usize,
+    peak: usize,
+    disk: u64,
+}
+
+pub(crate) fn aggregate<'p>(
+    plan: &'p Plan,
+    input: &'p Plan,
+    groups: &'p [Expr],
+    aggs: &'p [AggCall],
+    cx: &mut ExecCx,
+) -> Result<Box<dyn Node + 'p>> {
+    let source = Source::Node(crate::exec::open(input, cx)?);
+    let mut node = AggNode {
+        plan,
+        groups,
+        aggs,
+        ready: Vec::new().into_iter(),
+        pending: Vec::new(),
+        batches: 1,
+        peak: 0,
+        disk: 0,
+    };
+    node.pass(source, 0, cx)?;
+    Ok(Box::new(node))
+}
+
+impl<'p> AggNode<'p> {
+    fn new_group(&self, key: Vec<u8>, vals: Row, saved: Option<Vec<Value>>) -> Result<Group<'p>> {
+        let runners = match saved {
+            None => self.aggs.iter().map(|a| Runner::new(a, &a.func)).collect(),
+            Some(states) => {
+                if states.len() != self.aggs.len() {
+                    return Err(Error::internal("aggregate state does not match the aggregates"));
+                }
+                let mut runners = Vec::with_capacity(states.len());
+                for (a, s) in self.aggs.iter().zip(states) {
+                    let size = value_size(&s);
+                    runners.push((Runner::restore(a, &a.func, s)?, size));
+                }
+                let size = runners.iter().map(|r| r.1).sum::<usize>();
+                let mut g = self.group_of(key, vals, runners.into_iter().map(|r| r.0).collect());
+                g.size += size;
+                return Ok(g);
+            }
         };
-        for r in &mut states[slot].1 {
-            r.feed(&row, cx)?;
+        Ok(self.group_of(key, vals, runners))
+    }
+
+    fn group_of(&self, key: Vec<u8>, vals: Row, runners: Vec<Runner<'p>>) -> Group<'p> {
+        let size = key.len() + row_size(&vals) + runners.len() * std::mem::size_of::<Runner>() + 2 * ENTRY_OVERHEAD;
+        Group { key, vals, runners, size }
+    }
+
+    /// Aggregates the records of `source` at partitioning `level`: the
+    /// finished groups go to `ready`, spilled partitions to `pending`.
+    fn pass(&mut self, mut source: Source<'p>, level: u32, cx: &mut ExecCx) -> Result<()> {
+        let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut table: Vec<Group<'p>> = Vec::new();
+        if self.groups.is_empty() {
+            table.push(self.new_group(Vec::new(), Vec::new(), None)?);
+        }
+        let mut used = table.iter().map(|g| g.size).sum::<usize>();
+        let mut mode = Mode::Normal;
+        let mut parts: Option<Partitions> = None;
+        while let Some(rec) = source.next(cx)? {
+            cx.check_interrupts()?;
+            let slot = if self.groups.is_empty() {
+                0
+            } else {
+                let mut key = Vec::with_capacity(16);
+                let vals = match &rec {
+                    Record::Row(row) => {
+                        let mut vals = Vec::with_capacity(self.groups.len());
+                        for g in self.groups {
+                            let v = g.eval(row, cx)?;
+                            encode_key(&mut key, &v);
+                            vals.push(v);
+                        }
+                        Some(vals)
+                    }
+                    Record::State(vals, _) => {
+                        for v in vals {
+                            encode_key(&mut key, v);
+                        }
+                        None
+                    }
+                };
+                match index.get(&key) {
+                    Some(&i) => {
+                        if matches!(rec, Record::State(..)) {
+                            return Err(Error::internal("aggregate state of a group that is in memory"));
+                        }
+                        i
+                    }
+                    None if mode == Mode::Normal => {
+                        let group = match rec {
+                            Record::Row(_) => self.new_group(key.clone(), vals.unwrap_or_default(), None)?,
+                            Record::State(vals, states) => {
+                                let g = self.new_group(key.clone(), vals, Some(states))?;
+                                used += g.size;
+                                index.insert(key, table.len());
+                                table.push(g);
+                                self.check_memory(&mut used, &mut mode, level, &mut table, &mut index, &mut parts, cx)?;
+                                continue;
+                            }
+                        };
+                        used += group.size;
+                        index.insert(key, table.len());
+                        table.push(group);
+                        table.len() - 1
+                    }
+                    None => {
+                        let p = parts.get_or_insert_with(|| Partitions::new(cx));
+                        p.write(partition_of(&key, level), &record_row(rec))?;
+                        continue;
+                    }
+                }
+            };
+            let Record::Row(row) = rec else {
+                return Err(Error::internal("aggregate state without GROUP BY"));
+            };
+            let group = &mut table[slot];
+            let mut grown = 0;
+            for r in &mut group.runners {
+                grown += r.feed(&row, cx)?;
+            }
+            group.size += grown;
+            used += grown;
+            self.check_memory(&mut used, &mut mode, level, &mut table, &mut index, &mut parts, cx)?;
+        }
+        drop(source);
+        let mut out = Vec::with_capacity(table.len());
+        for g in table {
+            let mut vals = g.vals;
+            for r in g.runners {
+                vals.push(r.finish(cx)?);
+            }
+            out.push(vals);
+        }
+        self.ready = out.into_iter();
+        if let Some(parts) = parts {
+            let files = parts.finish()?;
+            self.disk += files.iter().flatten().map(|f| f.bytes()).sum::<u64>();
+            self.pending.extend(files.into_iter().flatten().map(|f| (f, level + 1)));
+        }
+        Ok(())
+    }
+
+    /// Reacts to the table's memory use: stop taking new groups at
+    /// `work_mem`, write the table out at twice that.
+    #[allow(clippy::too_many_arguments)]
+    fn check_memory(
+        &mut self,
+        used: &mut usize,
+        mode: &mut Mode,
+        level: u32,
+        table: &mut Vec<Group<'p>>,
+        index: &mut HashMap<Vec<u8>, usize>,
+        parts: &mut Option<Partitions>,
+        cx: &mut ExecCx,
+    ) -> Result<()> {
+        self.peak = self.peak.max(*used);
+        let (work_mem, hash_mem) = (cx.work_mem(), cx.hash_mem());
+        if *used > work_mem && *mode == Mode::Normal && !self.groups.is_empty() {
+            *mode = Mode::NoNewGroups;
+        }
+        if *used <= hash_mem {
+            return Ok(());
+        }
+        if self.groups.is_empty() || level >= MAX_LEVEL || table.iter().any(|g| g.size > work_mem) {
+            return Err(out_of_memory("the state of an aggregate", work_mem));
+        }
+        let p = parts.get_or_insert_with(|| Partitions::new(cx));
+        for g in table.drain(..) {
+            cx.check_interrupts()?;
+            let states: Vec<Value> = g.runners.into_iter().map(Runner::save).collect();
+            p.write(partition_of(&g.key, level), &[Value::Bool(true), Value::Record(g.vals), Value::Record(states)])?;
+        }
+        index.clear();
+        *used = 0;
+        *mode = Mode::Evicted;
+        Ok(())
+    }
+}
+
+/// A record as it is written to a partition.
+fn record_row(rec: Record) -> Row {
+    match rec {
+        Record::Row(row) => {
+            let mut out = Vec::with_capacity(row.len() + 1);
+            out.push(Value::Bool(false));
+            out.extend(row);
+            out
+        }
+        Record::State(v, states) => vec![Value::Bool(true), Value::Record(v), Value::Record(states)],
+    }
+}
+
+impl Node for AggNode<'_> {
+    fn next(&mut self, cx: &mut ExecCx) -> Result<Option<Row>> {
+        loop {
+            if let Some(r) = self.ready.next() {
+                return Ok(Some(r));
+            }
+            let Some((file, level)) = self.pending.pop() else {
+                let mut line = format!("Batches: {}  Memory Usage: {}kB", self.batches, self.peak.div_ceil(1024));
+                if self.disk > 0 {
+                    line.push_str(&format!("  Disk Usage: {}kB", self.disk.div_ceil(1024)));
+                }
+                cx.note(self.plan, line);
+                return Ok(None);
+            };
+            self.batches += 1;
+            let source = Source::File(file.reader()?);
+            drop(file);
+            self.pass(source, level, cx)?;
         }
     }
-    drop(node);
-    let mut out = Vec::with_capacity(states.len());
-    for (mut vals, runners) in states {
-        for r in runners {
-            vals.push(r.finish(cx)?);
-        }
-        out.push(vals);
-    }
-    Ok(out)
 }
 
 /// Positions `[start, end)` of the frame of the row at `pos` within its
@@ -767,8 +1151,141 @@ fn window_partition(
     Ok(out)
 }
 
-pub(crate) fn window(input: &Plan, calls: &[WindowCall], cx: &mut ExecCx) -> Result<Vec<Row>> {
-    let mut rows = collect(input, cx)?;
+/// Window functions. While the input fits into `work_mem` it is processed
+/// in memory. Otherwise it goes to a temporary file and each window call
+/// sorts it by partition (external sort), computes one partition at a time
+/// in memory, and a final sort restores the input order. A single
+/// partition larger than `work_mem` fails with SQLSTATE 53200.
+pub(crate) fn window<'p>(
+    plan: &'p Plan,
+    input: &'p Plan,
+    calls: &'p [WindowCall],
+    cx: &mut ExecCx,
+) -> Result<Box<dyn Node + 'p>> {
+    let budget = cx.work_mem();
+    let mut node = crate::exec::open(input, cx)?;
+    let mut rows = Vec::new();
+    let mut used = 0;
+    let mut spilled: Option<RowStore> = None;
+    while let Some(r) = node.next(cx)? {
+        cx.check_interrupts()?;
+        if let Some(s) = &mut spilled {
+            s.push(r, cx)?;
+            continue;
+        }
+        used += row_size(&r) + ENTRY_OVERHEAD;
+        rows.push(r);
+        if used > budget {
+            let mut s = RowStore::new(cx);
+            for r in std::mem::take(&mut rows) {
+                s.push(r, cx)?;
+            }
+            spilled = Some(s);
+        }
+    }
+    drop(node);
+    match spilled {
+        None => {
+            cx.note(plan, format!("Storage: Memory  Maximum Storage: {}kB", used.div_ceil(1024)));
+            Ok(crate::exec::rows(window_in_memory(rows, calls, cx)?))
+        }
+        Some(s) => window_spilled(plan, s.finish()?, calls, cx),
+    }
+}
+
+fn window_spilled<'p>(
+    plan: &'p Plan,
+    input: Rc<Stored>,
+    calls: &'p [WindowCall],
+    cx: &mut ExecCx,
+) -> Result<Box<dyn Node + 'p>> {
+    let budget = cx.work_mem();
+    let mut disk = 0;
+    let mut current = input;
+    // Each row carries its input position as a last column.
+    let mut numbered = false;
+    for call in calls {
+        let mut orders = vec![SortOrder::ASC];
+        orders.extend(sort_orders(&call.order_by));
+        orders.push(SortOrder::ASC);
+        let mut sorter = Sorter::new(orders, cx);
+        let mut it = current.iter()?;
+        let mut seq = 0i64;
+        while let Some(mut row) = it.next_row()? {
+            cx.check_interrupts()?;
+            if !numbered {
+                row.push(Value::Int8(seq));
+                seq += 1;
+            }
+            let mut part = Vec::new();
+            for p in &call.partition_by {
+                encode_key(&mut part, &p.eval(&row, cx)?);
+            }
+            let mut keys = Vec::with_capacity(call.order_by.len() + 2);
+            keys.push(Value::Bytea(part));
+            for k in &call.order_by {
+                keys.push(k.expr.eval(&row, cx)?);
+            }
+            keys.push(row.last().cloned().unwrap_or(Value::Null));
+            sorter.push(keys, row, cx)?;
+        }
+        drop(it);
+        numbered = true;
+        let (mut sorted, stats) = sorter.finish(cx)?;
+        disk += stats.disk;
+        let mut next = RowStore::new(cx);
+        let mut part_rows: Vec<Row> = Vec::new();
+        let mut part_vals: Vec<Vec<Value>> = Vec::new();
+        let mut part_key: Option<Value> = None;
+        let mut used = 0;
+        loop {
+            let item = sorted.next()?;
+            let boundary = match (&item, &part_key) {
+                (Some((k, _)), Some(pk)) => compare(&k[0], pk) != Ordering::Equal,
+                _ => true,
+            };
+            if boundary && !part_rows.is_empty() {
+                let idx: Vec<usize> = (0..part_rows.len()).collect();
+                let vals = window_partition(call, &part_rows, &idx, &part_vals, cx)?;
+                for (mut row, v) in std::mem::take(&mut part_rows).into_iter().zip(vals) {
+                    let seq = row.pop().unwrap_or(Value::Null);
+                    row.push(v);
+                    row.push(seq);
+                    next.push(row, cx)?;
+                }
+                part_vals.clear();
+                used = 0;
+            }
+            let Some((mut keys, row)) = item else { break };
+            cx.check_interrupts()?;
+            keys.pop();
+            part_key = Some(keys.remove(0));
+            used += row_size(&row) + row_size(&keys) + ENTRY_OVERHEAD;
+            if used > budget {
+                return Err(out_of_memory("a window partition", budget));
+            }
+            part_rows.push(row);
+            part_vals.push(keys);
+        }
+        current = next.finish()?;
+    }
+    // Back to the input order.
+    let mut sorter = Sorter::new(vec![SortOrder::ASC], cx);
+    let mut it = current.iter()?;
+    while let Some(mut row) = it.next_row()? {
+        cx.check_interrupts()?;
+        let seq = row.pop().unwrap_or(Value::Null);
+        sorter.push(vec![seq], row, cx)?;
+    }
+    drop(it);
+    drop(current);
+    let (sorted, stats) = sorter.finish(cx)?;
+    disk += stats.disk;
+    cx.note(plan, format!("Storage: Disk  Maximum Storage: {}kB", disk.div_ceil(1024)));
+    Ok(Box::new(SortedNode(sorted)))
+}
+
+fn window_in_memory(mut rows: Vec<Row>, calls: &[WindowCall], cx: &mut ExecCx) -> Result<Vec<Row>> {
     let n = rows.len();
     let mut extra: Vec<Vec<Value>> = vec![Vec::with_capacity(calls.len()); n];
     for call in calls {

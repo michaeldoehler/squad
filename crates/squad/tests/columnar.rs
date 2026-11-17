@@ -1069,7 +1069,8 @@ fn a_compaction_moves_at_most_compact_max_bytes() {
 fn merges_write_through_a_temporary_file_and_remove_it() {
     let store = Counting::new();
     let tmp = tempfile::tempdir().unwrap();
-    let db = remote_db(&store, ColumnarConfig { temp_dir: Some(tmp.path().join("merge")), ..manual() });
+    let db = remote_db(&store, manual());
+    db.set_temp_dir(tmp.path().join("merge")).unwrap();
     let conn = db.connect();
     conn.batch_execute("CREATE TABLE e (n int, body text) USING columnar WITH (order_by = 'n')").unwrap();
     for i in 0..8 {
