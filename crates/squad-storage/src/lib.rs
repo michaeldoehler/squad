@@ -29,7 +29,10 @@ pub use disk::{DiskEngine, DiskOptions};
 pub use engine::{Engine, EngineStats, SyncMode, VerifyReport, WriteBatch, MAX_KEY_LEN};
 pub use error::{Result, StorageError};
 pub use mem::MemEngine;
-pub use remote::{restore_from, RemoteConfig, RemoteStats, RemoteSync, TieredEngine};
+pub use remote::{
+    restore_from, restore_from_with, RemoteConfig, RemoteStats, RemoteSync, RestoreStats, SnapshotTrigger,
+    TieredEngine, DEFAULT_RESTORE_CONCURRENCY,
+};
 pub use replica::{ReplayHooks, ReplicaEngine, ReplicaStatus};
 pub use sim::SimVfs;
 pub use vfs::{RealVfs, Vfs, VfsFile, VfsLock};

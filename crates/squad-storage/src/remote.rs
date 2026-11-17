@@ -51,8 +51,24 @@
 //! When a writer opens it checks whether the store enforces
 //! `If-None-Match: *` and reports the answer in
 //! [`RemoteStats::conditional_writes`]. The answer is informational.
+//!
+//! # Snapshots
+//!
+//! A writer uploads a new snapshot when one of the thresholds in
+//! [`RemoteConfig`] is reached: bytes or objects of log after the newest
+//! snapshot, or time since it while there is new log. The log after the
+//! newest snapshot is counted from the store when the writer opens, so a
+//! restart does not reset the measure. See [`SnapshotTrigger`].
+//!
+//! # Download
+//!
+//! A restore fetches snapshot chunks and log objects with up to
+//! [`RemoteConfig::restore_concurrency`] requests at a time and applies
+//! the log objects strictly in order. It logs its progress (`log` crate,
+//! level info).
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::hash::{BuildHasher, Hasher};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -61,6 +77,7 @@ use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use log::{info, warn};
 use parking_lot::{Condvar, Mutex};
 use sha2::{Digest, Sha256};
 use squad_object::ObjectStore;
@@ -86,6 +103,13 @@ pub(crate) const DATA_FILE: &str = "data.db";
 /// How often a claimant tries again after losing against a concurrent
 /// one before giving up.
 const CLAIM_ATTEMPTS: u32 = 20;
+/// Requests a restore runs at a time unless configured otherwise.
+pub const DEFAULT_RESTORE_CONCURRENCY: usize = 16;
+/// How often a long restore reports its progress.
+const PROGRESS_EVERY: Duration = Duration::from_secs(5);
+/// How long the background thread waits after a failed snapshot before
+/// it tries again.
+const SNAPSHOT_RETRY: Duration = Duration::from_secs(5);
 
 /// When a commit counts as safe in the object store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,9 +133,24 @@ pub struct RemoteConfig {
     /// disagree (the remote is ahead, or the directory belongs to a
     /// superseded writer). Without it such an open fails.
     pub restore: bool,
-    /// A new snapshot is uploaded once this many bytes of log have been
-    /// shipped since the last one.
+    /// A new snapshot is uploaded once this many bytes of log lie after
+    /// the newest one in the store (default 64 MiB).
     pub snapshot_wal_bytes: u64,
+    /// A new snapshot is uploaded once this many log objects lie after
+    /// the newest one in the store (default 2000; 0 turns this off). In
+    /// `Sync` mode every commit group is one object, so this bounds the
+    /// number of requests a restore needs for the log.
+    pub snapshot_wal_objects: u64,
+    /// A new snapshot is uploaded once this much time has passed since
+    /// the newest one, if log was shipped since (default 15 minutes;
+    /// `None` turns this off). The clock starts when the writer opens,
+    /// because the store does not report the age of its objects.
+    pub snapshot_interval: Option<Duration>,
+    /// Requests a restore (at open, of a replica, or with
+    /// [`restore_from`]) runs at a time to fetch snapshot chunks and log
+    /// objects (default 16). Log objects are still applied one after the
+    /// other, in order.
+    pub restore_concurrency: usize,
     /// Log uploads that may be under way at the same time (default 1).
     /// With more than one, commits that arrive while an upload is in
     /// flight go out in a second upload instead of waiting for the first
@@ -124,7 +163,16 @@ pub struct RemoteConfig {
 
 impl RemoteConfig {
     pub fn new(store: Arc<dyn ObjectStore>, mode: RemoteSync) -> RemoteConfig {
-        RemoteConfig { store, mode, restore: false, snapshot_wal_bytes: 64 << 20, upload_concurrency: 1 }
+        RemoteConfig {
+            store,
+            mode,
+            restore: false,
+            snapshot_wal_bytes: 64 << 20,
+            snapshot_wal_objects: 2000,
+            snapshot_interval: Some(Duration::from_secs(15 * 60)),
+            restore_concurrency: DEFAULT_RESTORE_CONCURRENCY,
+            upload_concurrency: 1,
+        }
     }
 }
 
@@ -134,9 +182,75 @@ impl std::fmt::Debug for RemoteConfig {
             .field("mode", &self.mode)
             .field("restore", &self.restore)
             .field("snapshot_wal_bytes", &self.snapshot_wal_bytes)
+            .field("snapshot_wal_objects", &self.snapshot_wal_objects)
+            .field("snapshot_interval", &self.snapshot_interval)
+            .field("restore_concurrency", &self.restore_concurrency)
             .field("upload_concurrency", &self.upload_concurrency)
             .finish_non_exhaustive()
     }
+}
+
+/// Why a snapshot was uploaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotTrigger {
+    /// When the writer opened: the store held no snapshot, or the local
+    /// directory had commits the store lacked.
+    Open,
+    /// Soon after a restore at open that replayed more log than
+    /// [`RemoteConfig::snapshot_wal_bytes`] or
+    /// [`RemoteConfig::snapshot_wal_objects`] allow.
+    Restore,
+    /// `CHECKPOINT`, or [`TieredEngine::snapshot_remote`].
+    Requested,
+    /// [`RemoteConfig::snapshot_wal_bytes`] was reached.
+    WalBytes,
+    /// [`RemoteConfig::snapshot_wal_objects`] was reached.
+    WalObjects,
+    /// [`RemoteConfig::snapshot_interval`] passed with new log.
+    Interval,
+    /// Records waiting for upload in `Async` mode were dropped; only a
+    /// snapshot covers them.
+    Overflow,
+}
+
+impl SnapshotTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SnapshotTrigger::Open => "open",
+            SnapshotTrigger::Restore => "restore",
+            SnapshotTrigger::Requested => "requested",
+            SnapshotTrigger::WalBytes => "wal_bytes",
+            SnapshotTrigger::WalObjects => "wal_objects",
+            SnapshotTrigger::Interval => "interval",
+            SnapshotTrigger::Overflow => "overflow",
+        }
+    }
+}
+
+impl fmt::Display for SnapshotTrigger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a download of the database from the object store did.
+#[derive(Debug, Clone, Default)]
+pub struct RestoreStats {
+    /// LSN of the snapshot the download started from (0 without one).
+    pub snapshot_lsn: u64,
+    /// LSN the local copy reached.
+    pub lsn: u64,
+    /// Snapshot chunks downloaded, and their bytes.
+    pub chunks: u64,
+    pub chunk_bytes: u64,
+    /// Log objects downloaded and applied, and their bytes.
+    pub wal_objects: u64,
+    pub wal_bytes: u64,
+    /// Log records applied.
+    pub records: u64,
+    /// Requests that ran at a time, at most.
+    pub concurrency: usize,
+    pub duration: Duration,
 }
 
 /// Counters of the remote copy.
@@ -170,6 +284,16 @@ pub struct RemoteStats {
     pub chunk_bytes_uploaded: u64,
     /// Chunks that were already present and not uploaded again.
     pub chunks_reused: u64,
+    /// Log after the newest snapshot, in bytes and objects, including
+    /// log that earlier writers left in the store: what a restore
+    /// replays.
+    pub wal_bytes_since_snapshot: u64,
+    pub wal_objects_since_snapshot: u64,
+    /// Why this writer's newest snapshot was taken.
+    pub last_snapshot_trigger: Option<SnapshotTrigger>,
+    /// The download at open, if this writer restored the local directory
+    /// from the store.
+    pub last_restore: Option<RestoreStats>,
 }
 
 pub(crate) fn remote_err(e: squad_object::Error) -> StorageError {
@@ -461,6 +585,8 @@ pub(crate) struct WalObject {
     pub(crate) epoch: u64,
     /// Records above this LSN are ignored: the next writer took over there.
     pub(crate) limit: u64,
+    /// Size in bytes.
+    pub(crate) size: u64,
 }
 
 /// A writer in the chain of established writers.
@@ -611,17 +737,17 @@ pub(crate) fn read_remote_from(
             Some((done, key)) if epoch == done && key.starts_with(&prefix) => store.list_after(&prefix, key),
             _ => store.list(&prefix),
         };
-        let mut objects: Vec<(String, u64, u64)> = listed
+        let mut objects: Vec<(String, u64, u64, u64)> = listed
             .map_err(remote_err)?
             .into_iter()
-            .filter_map(|m| pair(&m.key[prefix.len()..]).map(|(a, b)| (m.key, a, b)))
+            .filter_map(|m| pair(&m.key[prefix.len()..]).map(|(a, b)| (m.key, a, b, m.size)))
             .collect();
         objects.sort_by_key(|o| (o.1, o.2));
-        for (key, first, last) in objects {
+        for (key, first, last, size) in objects {
             // Usable if it continues the sequence without a gap.
             if first <= lsn + 1 && last > lsn && lsn < lim {
                 lsn = last.min(lim);
-                wal.push(WalObject { key, epoch, limit: lim });
+                wal.push(WalObject { key, epoch, limit: lim, size });
             }
         }
     }
@@ -635,67 +761,277 @@ fn data_file_lsn(first_page: &[u8]) -> Result<u64> {
     Ok(page::rd64(first_page[..PAGE_SIZE].try_into().unwrap(), HDR + 24))
 }
 
+/// Fetches items `0..count` with up to `concurrency` calls of `fetch`
+/// running at a time, on worker threads, and hands them to `consume` on
+/// the calling thread strictly in order. Fetching runs at most
+/// `concurrency` items ahead of the one being consumed, which bounds the
+/// memory held. Stops at the first error (in index order) or when
+/// `consume` returns `false`; fetches under way then finish and are
+/// dropped.
+pub(crate) fn fetch_in_order<T: Send>(
+    count: usize,
+    concurrency: usize,
+    fetch: impl Fn(usize) -> Result<T> + Sync,
+    mut consume: impl FnMut(usize, T) -> Result<bool>,
+) -> Result<()> {
+    if concurrency <= 1 || count <= 1 {
+        for i in 0..count {
+            if !consume(i, fetch(i)?)? {
+                break;
+            }
+        }
+        return Ok(());
+    }
+    struct Window<T> {
+        /// Next index to hand to a worker.
+        next: usize,
+        /// Indexes below this were handed to `consume`.
+        consumed: usize,
+        done: BTreeMap<usize, Result<T>>,
+        stop: bool,
+    }
+    let window = Mutex::new(Window { next: 0, consumed: 0, done: BTreeMap::new(), stop: false });
+    let changed = Condvar::new();
+    let worker = || loop {
+        let i = {
+            let mut w = window.lock();
+            while !w.stop && w.next < count && w.next >= w.consumed + concurrency {
+                changed.wait(&mut w);
+            }
+            if w.stop || w.next >= count {
+                return;
+            }
+            w.next += 1;
+            w.next - 1
+        };
+        // A panic must not leave the consumer waiting for this item.
+        let item = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fetch(i)))
+            .unwrap_or_else(|_| Err(StorageError::Remote(format!("fetching item {i} of a restore panicked"))));
+        window.lock().done.insert(i, item);
+        changed.notify_all();
+    };
+    thread::scope(|s| {
+        let mut spawned = Ok(());
+        for _ in 0..concurrency.min(count) {
+            if let Err(e) = thread::Builder::new().name("squad-fetch".into()).spawn_scoped(s, worker) {
+                spawned = Err(StorageError::Io(e));
+                break;
+            }
+        }
+        let result = spawned.and_then(|()| {
+            for i in 0..count {
+                let item = {
+                    let mut w = window.lock();
+                    let item = loop {
+                        if let Some(item) = w.done.remove(&i) {
+                            break item;
+                        }
+                        changed.wait(&mut w);
+                    };
+                    w.consumed = i + 1;
+                    item
+                };
+                changed.notify_all();
+                if !consume(i, item?)? {
+                    break;
+                }
+            }
+            Ok(())
+        });
+        window.lock().stop = true;
+        changed.notify_all();
+        result
+    })
+}
+
+/// Rate limit for progress messages of a long download.
+struct Progress {
+    last: Instant,
+}
+
+impl Progress {
+    fn new() -> Progress {
+        Progress { last: Instant::now() }
+    }
+
+    /// True at most once every [`PROGRESS_EVERY`].
+    fn due(&mut self) -> bool {
+        if self.last.elapsed() < PROGRESS_EVERY {
+            return false;
+        }
+        self.last = Instant::now();
+        true
+    }
+}
+
+/// Subtracts `n` from `counter`, stopping at zero.
+fn saturating_sub(counter: &AtomicU64, n: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    while let Err(seen) =
+        counter.compare_exchange_weak(current, current.saturating_sub(n), Ordering::Relaxed, Ordering::Relaxed)
+    {
+        current = seen;
+    }
+}
+
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1 << 20) as f64
+}
+
+/// Applies the records of log object `key` (its contents in `bytes`)
+/// that continue the copy at `last_lsn()`, up to `limit`. `write`
+/// applies one record, given its LSN, and returns the LSN the engine
+/// assigned. Returns the number of records applied.
+pub(crate) fn apply_object(
+    key: &str,
+    bytes: &[u8],
+    limit: u64,
+    last_lsn: impl Fn() -> u64,
+    mut write: impl FnMut(u64, WriteBatch) -> Result<u64>,
+) -> Result<u64> {
+    let mut off = 0;
+    let mut applied = 0;
+    while let Some((lsn, ops, next)) = wal::read_record(bytes, off) {
+        off = next;
+        let have = last_lsn();
+        if lsn <= have || lsn > limit {
+            continue;
+        }
+        if lsn != have + 1 {
+            return Err(StorageError::Corruption(format!("log object {key} does not continue at LSN {}", have + 1)));
+        }
+        let batch = WriteBatch { ops: ops.iter().map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec))).collect() };
+        let written = write(lsn, batch)?;
+        if written != lsn {
+            return Err(StorageError::Corruption(format!("replay of {key} produced LSN {written}, expected {lsn}")));
+        }
+        applied += 1;
+    }
+    if off != bytes.len() {
+        return Err(StorageError::Corruption(format!("log object {key} is damaged")));
+    }
+    Ok(applied)
+}
+
 /// Downloads the remote state into the empty directory `dir` and returns
 /// the opened engine, positioned at the last restorable commit.
+///
+/// Snapshot chunks are fetched and verified on up to `concurrency`
+/// threads and written at their offsets; log objects are fetched the same
+/// way, ahead of the one being applied, and applied strictly in order.
+/// Records are applied with ordinary engine writes, which do not sync;
+/// one sync at the end makes the result durable.
 pub(crate) fn materialize(
     store: &dyn ObjectStore,
     state: &RemoteState,
     dir: &Path,
     opts: &DiskOptions,
-) -> Result<DiskEngine> {
+    concurrency: usize,
+) -> Result<(DiskEngine, RestoreStats)> {
+    let started = Instant::now();
+    let concurrency = concurrency.max(1);
     let vfs = &opts.vfs;
     vfs.create_dir_all(dir)?;
-    if let Some((claim, lsn)) = &state.snapshot {
-        let key = snapshot_key(claim, *lsn);
-        let bytes = store.get(&key).map_err(remote_err)?.ok_or_else(|| vanished(&key))?;
-        let manifest = Manifest::decode(&bytes)
-            .ok_or_else(|| StorageError::Corruption(format!("snapshot manifest {key} is damaged")))?;
+    let manifest = match &state.snapshot {
+        Some((claim, lsn)) => {
+            let key = snapshot_key(claim, *lsn);
+            let bytes = store.get(&key).map_err(remote_err)?.ok_or_else(|| vanished(&key))?;
+            let manifest = Manifest::decode(&bytes)
+                .ok_or_else(|| StorageError::Corruption(format!("snapshot manifest {key} is damaged")))?;
+            Some((key, manifest))
+        }
+        None => None,
+    };
+    let mut stats =
+        RestoreStats { snapshot_lsn: manifest.as_ref().map_or(0, |m| m.1.lsn), concurrency, ..RestoreStats::default() };
+    let (chunk_count, chunk_size) = manifest.as_ref().map_or((0, 0), |(_, m)| (m.chunks.len(), m.size));
+    let wal_size: u64 = state.wal.iter().map(|w| w.size).sum();
+    info!(
+        "restore: snapshot at LSN {} ({chunk_count} chunks, {:.1} MiB), then {} log objects ({:.1} MiB) up to LSN {}; \
+         {concurrency} requests at a time",
+        stats.snapshot_lsn,
+        mib(chunk_size),
+        state.wal.len(),
+        mib(wal_size),
+        state.lsn
+    );
+    let mut progress = Progress::new();
+    if let Some((key, manifest)) = &manifest {
         let tmp = dir.join("data.db.restore");
         let file = vfs.create(&tmp)?;
-        let mut off = 0u64;
-        for (i, (hash, len)) in manifest.chunks.iter().enumerate() {
-            let chunk = store.get(&chunk_key(hash)).map_err(remote_err)?.ok_or_else(|| vanished(&chunk_key(hash)))?;
-            if chunk.len() as u64 != *len || sha256_hex(&chunk) != *hash {
-                return Err(StorageError::Corruption(format!("chunk {hash} of snapshot {key} is damaged")));
-            }
-            if i == 0 && data_file_lsn(&chunk)? != manifest.lsn {
-                return Err(StorageError::Corruption(format!("snapshot {key} does not match its manifest")));
-            }
-            file.write_at(&chunk, off)?;
-            off += len;
-        }
+        let offsets: Vec<u64> = manifest
+            .chunks
+            .iter()
+            .scan(0u64, |off, (_, len)| {
+                let at = *off;
+                *off += len;
+                Some(at)
+            })
+            .collect();
+        fetch_in_order(
+            manifest.chunks.len(),
+            concurrency,
+            |i| {
+                let (hash, len) = &manifest.chunks[i];
+                let chunk_key = chunk_key(hash);
+                let chunk = store.get(&chunk_key).map_err(remote_err)?.ok_or_else(|| vanished(&chunk_key))?;
+                if chunk.len() as u64 != *len || sha256_hex(&chunk) != *hash {
+                    return Err(StorageError::Corruption(format!("chunk {hash} of snapshot {key} is damaged")));
+                }
+                Ok(chunk)
+            },
+            |i, chunk| {
+                if i == 0 && data_file_lsn(&chunk)? != manifest.lsn {
+                    return Err(StorageError::Corruption(format!("snapshot {key} does not match its manifest")));
+                }
+                file.write_at(&chunk, offsets[i])?;
+                stats.chunks += 1;
+                stats.chunk_bytes += chunk.len() as u64;
+                if progress.due() {
+                    info!(
+                        "restore: {}/{chunk_count} snapshot chunks ({:.1} of {:.1} MiB), {:.0} s",
+                        stats.chunks,
+                        mib(stats.chunk_bytes),
+                        mib(chunk_size),
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                Ok(true)
+            },
+        )?;
         file.sync()?;
         vfs.rename(&tmp, &dir.join(DATA_FILE))?;
         vfs.sync_dir(dir)?;
     }
     let engine = DiskEngine::open(dir, opts.clone())?;
-    for WalObject { key, limit, .. } in &state.wal {
-        let bytes = store.get(key).map_err(remote_err)?.ok_or_else(|| vanished(key))?;
-        let mut off = 0;
-        while let Some((lsn, ops, next)) = wal::read_record(&bytes, off) {
-            off = next;
-            let have = engine.last_lsn();
-            if lsn <= have || lsn > *limit {
-                continue;
+    fetch_in_order(
+        state.wal.len(),
+        concurrency,
+        |i| {
+            let key = &state.wal[i].key;
+            store.get(key).map_err(remote_err)?.ok_or_else(|| vanished(key))
+        },
+        |i, bytes| {
+            let object = &state.wal[i];
+            stats.records +=
+                apply_object(&object.key, &bytes, object.limit, || engine.last_lsn(), |_, batch| engine.write(batch))?;
+            stats.wal_objects += 1;
+            stats.wal_bytes += bytes.len() as u64;
+            if progress.due() {
+                info!(
+                    "restore: log applied to LSN {} of {} ({}/{} objects, {:.1} of {:.1} MiB), {:.0} s",
+                    engine.last_lsn(),
+                    state.lsn,
+                    stats.wal_objects,
+                    state.wal.len(),
+                    mib(stats.wal_bytes),
+                    mib(wal_size),
+                    started.elapsed().as_secs_f64()
+                );
             }
-            if lsn != have + 1 {
-                return Err(StorageError::Corruption(format!(
-                    "log object {key} does not continue at LSN {}",
-                    have + 1
-                )));
-            }
-            let batch = WriteBatch { ops: ops.iter().map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec))).collect() };
-            let applied = engine.write(batch)?;
-            if applied != lsn {
-                return Err(StorageError::Corruption(format!(
-                    "replay of {key} produced LSN {applied}, expected {lsn}"
-                )));
-            }
-        }
-        if off != bytes.len() {
-            return Err(StorageError::Corruption(format!("log object {key} is damaged")));
-        }
-    }
+            Ok(true)
+        },
+    )?;
     if engine.last_lsn() != state.lsn {
         return Err(StorageError::Corruption(format!(
             "restore reached LSN {} but the object store promises {}",
@@ -704,7 +1040,17 @@ pub(crate) fn materialize(
         )));
     }
     engine.sync(engine.last_lsn())?;
-    Ok(engine)
+    stats.lsn = engine.last_lsn();
+    stats.duration = started.elapsed();
+    info!(
+        "restore: done at LSN {} in {:.1} s ({} chunks, {} log objects, {} records)",
+        stats.lsn,
+        stats.duration.as_secs_f64(),
+        stats.chunks,
+        stats.wal_objects,
+        stats.records
+    );
+    Ok((engine, stats))
 }
 
 pub(crate) const VANISHED: &str = "was removed while it was being restored";
@@ -721,13 +1067,15 @@ pub(crate) fn materialize_latest(
     store: &dyn ObjectStore,
     dir: &Path,
     opts: &DiskOptions,
-) -> Result<(DiskEngine, RemoteState)> {
+    concurrency: usize,
+) -> Result<(DiskEngine, RemoteState, RestoreStats)> {
     let mut attempt = 0;
     loop {
         let state = read_remote(store)?;
-        match materialize(store, &state, dir, opts) {
-            Ok(engine) => return Ok((engine, state)),
+        match materialize(store, &state, dir, opts, concurrency) {
+            Ok((engine, stats)) => return Ok((engine, state, stats)),
             Err(StorageError::Remote(m)) if m.ends_with(VANISHED) && attempt < 8 => {
+                info!("restore: {m}; starting over from the newer state");
                 attempt += 1;
                 wipe(opts, dir)?;
             }
@@ -759,6 +1107,17 @@ pub(crate) fn wipe(opts: &DiskOptions, dir: &Path) -> Result<()> {
 /// directory `dir`, without becoming its writer. The directory can then
 /// be opened as an ordinary local database.
 pub fn restore_from(store: &dyn ObjectStore, dir: &Path, opts: DiskOptions) -> Result<u64> {
+    Ok(restore_from_with(store, dir, opts, DEFAULT_RESTORE_CONCURRENCY)?.lsn)
+}
+
+/// [`restore_from`] with up to `concurrency` requests at a time; returns
+/// what the download did.
+pub fn restore_from_with(
+    store: &dyn ObjectStore,
+    dir: &Path,
+    opts: DiskOptions,
+    concurrency: usize,
+) -> Result<RestoreStats> {
     opts.vfs.create_dir_all(dir)?;
     if !dir_is_empty(&opts, dir)? {
         return Err(StorageError::Invalid(format!("restore target {} already holds a database", dir.display())));
@@ -766,8 +1125,8 @@ pub fn restore_from(store: &dyn ObjectStore, dir: &Path, opts: DiskOptions) -> R
     if read_remote(store)?.epochs.is_empty() {
         return Err(StorageError::Invalid("the object store holds no database".into()));
     }
-    let (engine, _) = materialize_latest(store, dir, &opts)?;
-    Ok(engine.last_lsn())
+    let (_, _, stats) = materialize_latest(store, dir, &opts, concurrency)?;
+    Ok(stats)
 }
 
 #[derive(Default)]
@@ -868,7 +1227,16 @@ struct Shared {
     /// Every record up to here is in the store, and a fence check that
     /// started after it got there found no newer writer.
     shipped_lsn: AtomicU64,
+    /// Log in the store after the newest snapshot, in bytes and objects.
+    /// Starts from what the store held when this writer opened.
     wal_bytes_since_snapshot: AtomicU64,
+    wal_objects_since_snapshot: AtomicU64,
+    /// When the newest snapshot was taken, or when this writer started.
+    last_snapshot: Mutex<Instant>,
+    /// When an automatic snapshot last failed.
+    snapshot_failed: Mutex<Option<Instant>>,
+    /// A snapshot the background thread takes at its next round.
+    requested: Mutex<Option<SnapshotTrigger>>,
     snapshot: Mutex<SnapshotState>,
     fenced: AtomicBool,
     stop: AtomicBool,
@@ -963,6 +1331,7 @@ impl Shared {
         self.shipped.notify_all();
         result?;
         self.wal_bytes_since_snapshot.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        self.wal_objects_since_snapshot.fetch_add(1, Ordering::Relaxed);
         let mut stats = self.stats.lock();
         stats.wal_objects += 1;
         stats.wal_bytes += buf.len() as u64;
@@ -1034,9 +1403,14 @@ impl Shared {
 
     /// Uploads a full image of the data file and removes what it
     /// supersedes.
-    fn snapshot(&self) -> Result<()> {
+    fn snapshot(&self, trigger: SnapshotTrigger) -> Result<()> {
         let mut snap = self.snapshot.lock();
         self.check_fence()?;
+        let started = Instant::now();
+        // Log shipped while the snapshot is taken lies after it and still
+        // counts towards the next one.
+        let bytes_before = self.wal_bytes_since_snapshot.load(Ordering::Relaxed);
+        let objects_before = self.wal_objects_since_snapshot.load(Ordering::Relaxed);
         let vfs = &self.opts.vfs;
         let tmp = self.dir.join(SNAPSHOT_TMP);
         let cleanup = || -> Result<()> {
@@ -1048,7 +1422,7 @@ impl Shared {
         cleanup()?;
         // A consistent copy of the data file; writers carry on meanwhile.
         self.disk.backup(&tmp)?;
-        let result = (|| -> Result<Manifest> {
+        let result = (|| -> Result<(Manifest, u64, u64, u64)> {
             let file = vfs.open(&tmp.join(DATA_FILE))?;
             let size = file.size()?;
             let mut manifest = Manifest { lsn: 0, size, chunks: Vec::new() };
@@ -1093,14 +1467,24 @@ impl Shared {
             stats.chunks_uploaded += uploaded;
             stats.chunk_bytes_uploaded += uploaded_bytes;
             stats.chunks_reused += reused;
-            Ok(manifest)
+            stats.last_snapshot_trigger = Some(trigger);
+            Ok((manifest, uploaded, uploaded_bytes, reused))
         })();
         let _ = cleanup();
-        let manifest = result?;
+        let (manifest, uploaded, uploaded_bytes, reused) = result?;
         let previous = snap.lsn;
         snap.lsn = manifest.lsn;
         snap.chunks = manifest.chunks.iter().map(|c| c.0.clone()).collect();
-        self.wal_bytes_since_snapshot.store(0, Ordering::Relaxed);
+        saturating_sub(&self.wal_bytes_since_snapshot, bytes_before);
+        saturating_sub(&self.wal_objects_since_snapshot, objects_before);
+        *self.last_snapshot.lock() = started;
+        *self.requested.lock() = None;
+        info!(
+            "snapshot at LSN {} ({trigger}): {uploaded} chunks uploaded ({:.1} MiB), {reused} reused, in {:.1} s",
+            manifest.lsn,
+            mib(uploaded_bytes),
+            started.elapsed().as_secs_f64()
+        );
         self.pending.lock().overflowed = false;
         {
             let mut st = self.shipping.lock();
@@ -1160,11 +1544,59 @@ impl Shared {
         }
         let _ = self.disk.sync(self.disk.last_lsn());
         let _ = self.ship_all();
-        let due = self.wal_bytes_since_snapshot.load(Ordering::Relaxed) >= self.config.snapshot_wal_bytes
-            || self.pending.lock().overflowed;
-        if due {
-            let _ = self.snapshot();
+        if self.snapshot_failed.lock().is_some_and(|t| t.elapsed() < SNAPSHOT_RETRY) {
+            return;
         }
+        if let Some(trigger) = self.snapshot_due() {
+            match self.snapshot(trigger) {
+                Ok(()) => *self.snapshot_failed.lock() = None,
+                Err(e) => {
+                    *self.snapshot_failed.lock() = Some(Instant::now());
+                    if !self.fenced.load(Ordering::Acquire) {
+                        warn!("snapshot ({trigger}) failed, trying again in {} s: {e}", SNAPSHOT_RETRY.as_secs());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether a snapshot is due, and why.
+    fn snapshot_due(&self) -> Option<SnapshotTrigger> {
+        if let Some(trigger) = *self.requested.lock() {
+            return Some(trigger);
+        }
+        if self.pending.lock().overflowed {
+            return Some(SnapshotTrigger::Overflow);
+        }
+        let config = &self.config;
+        let objects = self.wal_objects_since_snapshot.load(Ordering::Relaxed);
+        if self.wal_bytes_since_snapshot.load(Ordering::Relaxed) >= config.snapshot_wal_bytes {
+            return Some(SnapshotTrigger::WalBytes);
+        }
+        if config.snapshot_wal_objects > 0 && objects >= config.snapshot_wal_objects {
+            return Some(SnapshotTrigger::WalObjects);
+        }
+        let interval = config.snapshot_interval?;
+        (objects > 0 && self.last_snapshot.lock().elapsed() >= interval).then_some(SnapshotTrigger::Interval)
+    }
+}
+
+/// What a writer knows about the store when it starts shipping.
+#[derive(Default)]
+pub(crate) struct Backlog {
+    /// Log after the newest snapshot, in bytes and objects.
+    pub(crate) bytes: u64,
+    pub(crate) objects: u64,
+    /// A snapshot to take soon, in the background.
+    pub(crate) request: Option<SnapshotTrigger>,
+    /// The download at open, if there was one.
+    pub(crate) restore: Option<RestoreStats>,
+}
+
+impl Backlog {
+    /// The log `state` holds after its newest snapshot.
+    pub(crate) fn of(state: &RemoteState) -> Backlog {
+        Backlog { bytes: state.wal.iter().map(|w| w.size).sum(), objects: state.wal.len() as u64, ..Backlog::default() }
     }
 }
 
@@ -1236,11 +1668,13 @@ impl TieredEngine {
         let mut state = read_remote(&*store)?;
 
         let mut needs_snapshot = false;
+        let mut restored = None;
         let disk = match local {
             None => {
                 wipe(&opts, dir)?;
-                let (disk, latest) = materialize_latest(&*store, dir, &opts)?;
+                let (disk, latest, stats) = materialize_latest(&*store, dir, &opts, config.restore_concurrency)?;
                 state = latest;
+                restored = Some(stats);
                 disk
             }
             Some(disk) => {
@@ -1255,8 +1689,10 @@ impl TieredEngine {
                     Some(_) if config.restore => {
                         drop(disk);
                         wipe(&opts, dir)?;
-                        let (disk, latest) = materialize_latest(&*store, dir, &opts)?;
+                        let (disk, latest, stats) =
+                            materialize_latest(&*store, dir, &opts, config.restore_concurrency)?;
                         state = latest;
+                        restored = Some(stats);
                         disk
                     }
                     // Another writer got in between the two looks.
@@ -1287,16 +1723,33 @@ impl TieredEngine {
         }
         let snapshot = SnapshotState::load(&*store, &state)?;
         let shipped = if needs_snapshot { state.lsn.min(disk.last_lsn()) } else { disk.last_lsn() };
-        let engine = TieredEngine::start(disk, dir, opts, config, claim, snapshot, shipped)?;
+        let mut backlog = Backlog::of(&state);
+        info!(
+            "writer of epoch {} opened at LSN {}; newest snapshot at LSN {}, {} log objects ({:.1} MiB) after it",
+            claim.epoch,
+            disk.last_lsn(),
+            state.snapshot.as_ref().map_or(0, |s| s.1),
+            backlog.objects,
+            mib(backlog.bytes)
+        );
+        // A restore that had to replay much log is followed by a snapshot,
+        // taken in the background, so that the next one is short.
+        let objects_due = config.snapshot_wal_objects > 0 && backlog.objects >= config.snapshot_wal_objects;
+        if restored.is_some() && (backlog.bytes >= config.snapshot_wal_bytes || objects_due) {
+            backlog.request = Some(SnapshotTrigger::Restore);
+        }
+        backlog.restore = restored;
+        let engine = TieredEngine::start(disk, dir, opts, config, claim, snapshot, shipped, backlog)?;
         engine.shared.stats.lock().conditional_writes = conditional_writes;
         if needs_snapshot {
-            engine.shared.snapshot()?;
+            engine.shared.snapshot(SnapshotTrigger::Open)?;
         }
         Ok(engine)
     }
 
     /// Starts shipping for a local engine whose epoch is established in
     /// the object store.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         disk: DiskEngine,
         dir: &Path,
@@ -1305,8 +1758,15 @@ impl TieredEngine {
         claim: Claim,
         snapshot: SnapshotState,
         shipped: u64,
+        backlog: Backlog,
     ) -> Result<TieredEngine> {
-        let stats = RemoteStats { epoch: claim.epoch, claim_id: claim.id.clone(), ..RemoteStats::default() };
+        let stats = RemoteStats {
+            epoch: claim.epoch,
+            claim_id: claim.id.clone(),
+            snapshot_lsn: snapshot.lsn,
+            last_restore: backlog.restore,
+            ..RemoteStats::default()
+        };
         let shared = Arc::new(Shared {
             disk,
             store: config.store.clone(),
@@ -1318,7 +1778,11 @@ impl TieredEngine {
             shipping: Mutex::new(Shipping { put_through: shipped, ..Shipping::default() }),
             shipped: Condvar::new(),
             shipped_lsn: AtomicU64::new(shipped),
-            wal_bytes_since_snapshot: AtomicU64::new(0),
+            wal_bytes_since_snapshot: AtomicU64::new(backlog.bytes),
+            wal_objects_since_snapshot: AtomicU64::new(backlog.objects),
+            last_snapshot: Mutex::new(Instant::now()),
+            snapshot_failed: Mutex::new(None),
+            requested: Mutex::new(backlog.request),
             snapshot: Mutex::new(snapshot),
             fenced: AtomicBool::new(false),
             stop: AtomicBool::new(false),
@@ -1359,14 +1823,17 @@ impl TieredEngine {
     /// Uploads a snapshot now.
     pub fn snapshot_remote(&self) -> Result<()> {
         self.flush_remote()?;
-        self.shared.snapshot()
+        self.shared.snapshot(SnapshotTrigger::Requested)
     }
 
     pub fn remote_stats(&self) -> RemoteStats {
-        let mut stats = self.shared.stats.lock().clone();
-        stats.shipped_lsn = self.shared.shipped_lsn.load(Ordering::Acquire);
-        stats.local_lsn = self.shared.disk.last_lsn();
-        stats.fenced = self.shared.fenced.load(Ordering::Acquire);
+        let s = &*self.shared;
+        let mut stats = s.stats.lock().clone();
+        stats.shipped_lsn = s.shipped_lsn.load(Ordering::Acquire);
+        stats.local_lsn = s.disk.last_lsn();
+        stats.fenced = s.fenced.load(Ordering::Acquire);
+        stats.wal_bytes_since_snapshot = s.wal_bytes_since_snapshot.load(Ordering::Relaxed);
+        stats.wal_objects_since_snapshot = s.wal_objects_since_snapshot.load(Ordering::Relaxed);
         stats
     }
 
@@ -1593,6 +2060,132 @@ mod tests {
         assert_eq!(keys.len(), 2, "{keys:?}");
         let err = restore_from(&store, Path::new("/r"), options(&SimVfs::new(2))).unwrap_err();
         assert!(err.to_string().contains("remote format 1"), "{err}");
+    }
+
+    #[test]
+    fn fetch_in_order_is_ordered_bounded_and_stops() {
+        let in_flight = AtomicU64::new(0);
+        let max = AtomicU64::new(0);
+        let fetched = AtomicU64::new(0);
+        let fetch = |i: usize| -> Result<usize> {
+            let n = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            max.fetch_max(n, Ordering::SeqCst);
+            fetched.fetch_add(1, Ordering::SeqCst);
+            thread::sleep(Duration::from_micros(random_u64() % 2000));
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            if i == 70 {
+                return Err(StorageError::Remote("item 70".into()));
+            }
+            Ok(i * 2)
+        };
+        // In order, at most four at a time.
+        let mut seen = Vec::new();
+        fetch_in_order(60, 4, fetch, |i, v| {
+            assert_eq!(v, i * 2);
+            seen.push(i);
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(seen, (0..60).collect::<Vec<_>>());
+        assert!(max.load(Ordering::SeqCst) > 1 && max.load(Ordering::SeqCst) <= 4);
+        // Stopped by the consumer: nothing far beyond the stop is fetched.
+        fetched.store(0, Ordering::SeqCst);
+        let mut consumed = 0;
+        fetch_in_order(1000, 4, fetch, |i, _| {
+            consumed += 1;
+            Ok(i < 9)
+        })
+        .unwrap();
+        assert_eq!(consumed, 10);
+        assert!(fetched.load(Ordering::SeqCst) <= 10 + 4, "{}", fetched.load(Ordering::SeqCst));
+        // An error ends it after everything before the failed item.
+        let mut consumed = 0;
+        let err = fetch_in_order(100, 8, fetch, |_, _| {
+            consumed += 1;
+            Ok(true)
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("item 70"), "{err}");
+        assert_eq!(consumed, 70);
+        // The same with one request at a time.
+        let mut consumed = 0;
+        assert!(fetch_in_order(100, 1, fetch, |_, _| {
+            consumed += 1;
+            Ok(true)
+        })
+        .is_err());
+        assert_eq!(consumed, 70);
+    }
+
+    /// A restore with 16 requests at a time against a store with 2 ms
+    /// latency per `GET` keeps many requests in flight, is much faster
+    /// than one request at a time, and produces the same database.
+    #[test]
+    fn restore_fetches_in_parallel_and_matches_the_serial_result() {
+        let store = MemoryStore::new();
+        let config = RemoteConfig {
+            snapshot_wal_bytes: u64::MAX,
+            snapshot_wal_objects: 0,
+            snapshot_interval: None,
+            ..RemoteConfig::new(Arc::new(store.clone()), RemoteSync::Sync)
+        };
+        let a = TieredEngine::open(Path::new("/a"), options(&SimVfs::new(1)), config).unwrap();
+        // A snapshot of several chunks...
+        for i in 0..6000 {
+            let mut b = WriteBatch::new();
+            b.put(format!("row{i:06}").into_bytes(), vec![(i % 251) as u8; 1000]);
+            a.write(b).unwrap();
+        }
+        a.snapshot_remote().unwrap();
+        // ...and 300 log objects after it.
+        for i in 0..300 {
+            let lsn = a.write(one(&format!("row{:06}", i * 7), &format!("new {i}"))).unwrap();
+            a.sync(lsn).unwrap();
+        }
+        drop(a);
+
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let max = Arc::new(AtomicU64::new(0));
+        {
+            let (in_flight, max) = (in_flight.clone(), max.clone());
+            store.set_faults(Some(Box::new(move |op, _| {
+                if op == "get" {
+                    let n = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max.fetch_max(n, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(2));
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                }
+                Fault::None
+            })));
+        }
+        let restore = |concurrency: usize, seed: u64| {
+            max.store(0, Ordering::SeqCst);
+            let vfs = SimVfs::new(seed);
+            let stats = restore_from_with(&store, Path::new("/r"), options(&vfs), concurrency).unwrap();
+            let engine = DiskEngine::open(Path::new("/r"), options(&vfs)).unwrap();
+            assert!(engine.verify().unwrap().is_ok());
+            (stats, dump(&engine), max.load(Ordering::SeqCst))
+        };
+        let (serial, serial_rows, serial_max) = restore(1, 10);
+        let (parallel, rows, parallel_max) = restore(16, 11);
+        eprintln!(
+            "restore of {} chunks and {} log objects at 2 ms per GET: {:?} with 1 request at a time, \
+             {:?} with 16 ({:.1}x)",
+            parallel.chunks,
+            parallel.wal_objects,
+            serial.duration,
+            parallel.duration,
+            serial.duration.as_secs_f64() / parallel.duration.as_secs_f64()
+        );
+        assert_eq!(serial_max, 1);
+        assert!(parallel_max > 4 && parallel_max <= 16, "{parallel_max}");
+        assert_eq!(rows, serial_rows);
+        assert_eq!(rows.len(), 6000);
+        assert_eq!((parallel.lsn, parallel.records, parallel.wal_objects), (6300, 300, 300));
+        assert_eq!((serial.lsn, serial.records, serial.wal_objects), (6300, 300, 300));
+        assert!(parallel.chunks >= 5 && parallel.chunks == serial.chunks, "{parallel:?}");
+        assert_eq!(parallel.snapshot_lsn, 6000);
+        assert!(parallel.duration * 3 < serial.duration, "{parallel:?} against {serial:?}");
     }
 
     #[test]

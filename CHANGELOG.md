@@ -253,6 +253,29 @@ preparing it for production use.
   credentials.
 - The example `analytics_bench` of `squad-columnar` is now
   `engine_bench`, so that example names are unique in the workspace.
+- **Remote snapshots are taken often enough to keep restores short.**
+  The log since the newest snapshot used to be counted in memory from
+  zero at every start, so a writer restarted every few hours never
+  reached `snapshot_wal_bytes` and a restore had to replay tens of
+  thousands of log objects. A writer now counts the log after the newest
+  snapshot from the store when it opens, and takes a snapshot also after
+  `RemoteConfig::snapshot_wal_objects` log objects (default 2000) and
+  `RemoteConfig::snapshot_interval` (default 15 minutes, if there is new
+  log); after a restore at open that replayed more than the thresholds
+  it takes one in the background. `RemoteStats` reports the log since
+  the newest snapshot, the trigger of the last snapshot and what the
+  restore at open did (`RestoreStats`).
+- **Restores fetch in parallel.** Snapshot chunks and log objects are
+  downloaded with up to `RemoteConfig::restore_concurrency` requests at
+  a time (default 16; `ReplicaConfig::restore_concurrency`), chunks are
+  verified on the fetching threads, and log objects are applied strictly
+  in order; replicas prefetch new log objects the same way. Against a
+  store with 2 ms per request, a restore of 6 chunks and 300 log objects
+  went from 668 ms to 59 ms. `restore_from_with` takes the concurrency
+  and returns `RestoreStats`.
+- Restores and snapshots report progress and results through the `log`
+  crate (level info): start, every 5 seconds, end; `squad` writes these
+  messages to stderr, filtered by `SQUAD_LOG`.
 
 ### Fixed
 
@@ -283,6 +306,8 @@ preparing it for production use.
   `integer` and `bigint`, and the advisory lock functions `bigint` (one
   argument) or `integer` (two), as in PostgreSQL; drivers that send
   binary parameters (tokio-postgres) failed with a type mismatch.
+- `squad serve --help` (and `--help`/`-h` after any subcommand) failed
+  with `unknown option --help`; it now prints the usage.
 
 - Damage in the middle of the write-ahead log (a record that later
   records show was already durable) made recovery drop every later

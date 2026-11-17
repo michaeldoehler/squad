@@ -41,12 +41,14 @@ psql -h 127.0.0.1 -U squad squad
 | `--poll-interval <ms>` | how often a replica looks for new commits (default 1000) |
 
 Durations are written `30s`, `500ms`, `5min` or `1h`; a bare number
-means seconds.
+means seconds. `--help` (or `-h`) after any subcommand prints the
+usage.
 
 | Environment variable | Meaning |
 | --- | --- |
 | `SQUAD_PASSWORD`, `SQUAD_PASSWORD_FILE` | password of the login `SQUAD_USER` (or `--user`); the `_FILE` form reads it from a file, as Docker and Kubernetes secrets provide it |
 | `SQUAD_USER` | login name for `SQUAD_PASSWORD` (default `squad`) |
+| `SQUAD_LOG` | which messages of the database go to stderr: `off`, `error`, `warn`, `info` (default) or `debug`; at `info` these are the progress of a restore from the object store and the snapshots uploaded to it |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT_URL` | S3 settings for `--remote`/`--replica-of`; each also as `<NAME>_FILE` |
 
 A replica answers queries and refuses writes with SQLSTATE `25006`;

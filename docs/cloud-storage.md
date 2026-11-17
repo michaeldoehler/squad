@@ -96,8 +96,9 @@ have been applied locally, and it reaches the store later. As with any
 failed commit, the application must treat the outcome as unknown.
 
 **Recovery time** is the download of the newest snapshot plus replay of
-the log written since. Both grow with the database size and with
-`snapshot_wal_bytes` (default 64 MiB of log between snapshots).
+the log written since. The first grows with the database size, the
+second with the log after the newest snapshot, which the snapshot
+triggers bound; see [snapshots and recovery time](#snapshots-and-recovery-time).
 
 ## What is stored
 
@@ -124,10 +125,10 @@ open the result with a fresh remote.
   uploaded as immutable objects named by the range of sequence numbers
   they contain: in `Sync` mode one object per group of concurrent
   commits, in `Async` mode one per interval.
-- **Snapshots.** When enough log has been shipped (or on `CHECKPOINT`),
-  squad takes a consistent copy of the data file, cuts it into 1 MiB
-  chunks, and uploads the chunks whose content is not already in the
-  store, followed by a manifest. The manifest is written last, so a
+- **Snapshots.** When one of the [triggers](#snapshots-and-recovery-time)
+  fires (or on `CHECKPOINT`), squad takes a consistent copy of the data
+  file, cuts it into 1 MiB chunks, and uploads the chunks whose content
+  is not already in the store, followed by a manifest. The manifest is written last, so a
   snapshot either exists completely or not at all.
 - **Cleanup.** After a new manifest is stored, older manifests, chunks
   no manifest refers to, and log objects the snapshot covers are
@@ -139,6 +140,78 @@ open the result with a fresh remote.
 Restore reads the newest valid snapshot and replays the log objects
 after it in order, checking sequence numbers and checksums; a missing
 record ends the replay at the last complete commit before it.
+
+### Snapshots and recovery time
+
+A writer uploads a snapshot when the first of these is reached:
+
+| Setting | Default | A snapshot is due when |
+| --- | --- | --- |
+| `snapshot_wal_bytes` | 64 MiB | that many bytes of log lie after the newest snapshot |
+| `snapshot_wal_objects` | 2000 | that many log objects lie after the newest snapshot (0 turns it off) |
+| `snapshot_interval` | 15 minutes | that much time has passed since the newest snapshot and log was shipped since (`None` turns it off) |
+
+The log after the newest snapshot is counted from the store when a
+writer opens, including what earlier writers left there; a restart
+therefore does not start the count again from zero, and a threshold
+that is already exceeded at open leads to a snapshot within the first
+background round. The clock of `snapshot_interval` starts when the
+writer opens, because the store does not report the age of objects.
+
+In addition, a snapshot is taken
+
+- when the writer opens and the store holds no snapshot, or the local
+  directory has commits the store lacks (before `open` returns);
+- soon after a restore at open that replayed more log than
+  `snapshot_wal_bytes` or `snapshot_wal_objects` allow (in the
+  background; `open` does not wait for it);
+- after records were dropped from a full upload queue in `Async` mode;
+- on `CHECKPOINT` and `TieredEngine::snapshot_remote`.
+
+`RemoteStats::last_snapshot_trigger` says which one it was. A failed
+automatic snapshot is tried again after 5 seconds.
+
+In `Sync` mode every commit group is one log object, so
+`snapshot_wal_objects` bounds the number of requests a restore needs
+for the log. A snapshot uploads only chunks whose content changed, but
+with updates spread across the key space that is most of the data
+file (see below), so a short `snapshot_interval` on a large database
+with scattered writes uploads a lot. Cleanup still keeps the log back
+to the snapshot before the newest one, so a read replica that is less
+than one snapshot interval behind can catch up from the log.
+
+**Restore concurrency.** A restore — at open, by a replica, or with
+`restore_from` / `squad restore` — fetches snapshot chunks and log
+objects with up to `RemoteConfig::restore_concurrency` requests at a
+time (default 16; `ReplicaConfig::restore_concurrency` for replicas).
+Chunks are verified against their SHA-256 name on the fetching thread
+and written at their offset; log objects are fetched at most that many
+ahead of the one being applied and applied strictly in LSN order, one
+engine write per record, without an `fsync` per record and with one
+`fsync` at the end. A replica that follows the writer prefetches new
+log objects the same way. Against a store with 2 ms of latency per
+`GET` (the unit test
+`restore_fetches_in_parallel_and_matches_the_serial_result`), a restore
+of 6 chunks and 300 log objects took 668 ms with one request at a time
+and 59 ms with 16, with the same result. Against a single-node Garage
+on the same machine, where a `GET` takes well under a millisecond, it
+made no difference (24 chunks and 1500 log objects in 0.71 s and
+0.76 s; `benchmarks/remote-restore-2026-11-17.txt`): there the time
+goes to local work. The gain is where each request waits for the
+network.
+
+**Progress.** Restores and snapshots write messages through the
+[`log`](https://docs.rs/log) crate at level info: at the start of a
+restore (snapshot LSN, chunk count and size, number and size of the log
+objects, target LSN), every 5 seconds while it runs (chunks done, log
+applied up to which LSN of which), and at the end (duration); for every
+snapshot its LSN, trigger, chunks uploaded and reused, bytes and
+duration; failed automatic snapshots at level warn. An application
+that embeds squad sees them through whatever `log` backend it installs;
+`squad` writes them to stderr (`SQUAD_LOG`, see [server](server.md)).
+`RemoteStats::last_restore` holds what the restore at open did
+(`RestoreStats`: chunks, log objects, records, bytes, duration), and
+`restore_from_with` returns the same for an explicit restore.
 
 ### Request and storage cost
 
@@ -308,6 +381,8 @@ check:
 | `local_lsn`, `shipped_lsn` | newest commit in the local log and newest commit in the store; the difference is what a lost machine would lose. It is 0 after every `Sync` commit, at most about one interval in `Async` mode, and grows while the store is unreachable. |
 | `epoch`, `claim_id` | which writer this is |
 | `conditional_writes` | whether the store enforces `If-None-Match` (informational) |
+| `snapshot_lsn`, `wal_bytes_since_snapshot`, `wal_objects_since_snapshot` | the newest snapshot and the log after it: what a restore would download and replay |
+| `last_snapshot_trigger`, `last_restore` | why this writer's newest snapshot was taken; what the restore at open did |
 
 The other fields count uploads, snapshots and chunks. See
 [deployment](deployment.md#health-checks) for how to use them in a
@@ -343,7 +418,11 @@ timing differs between runs) and pass; 60 run with every `cargo test`.
 Further tests cover fencing of a replaced writer, refusal of stale
 directories, cleanup (exactly one manifest, no unreferenced chunks, no
 covered log objects), and an end-to-end run against the S3 emulator with
-injected failures.
+injected failures. Each snapshot trigger has a test, including the count
+of log carried across a restart and the snapshot after a long restore;
+a restore through a store that adds latency to every `GET` is checked
+to keep up to `restore_concurrency` requests in flight and to produce
+the same database as a restore with one request at a time.
 
 Fencing is tested against stores that enforce conditional writes and
 stores that ignore them (the memory store and the S3 emulator both have

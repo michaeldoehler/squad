@@ -36,6 +36,9 @@ pub struct ReplicaConfig {
     /// Snapshot interval once promoted. See
     /// [`RemoteConfig::snapshot_wal_bytes`].
     pub snapshot_wal_bytes: u64,
+    /// Requests run at a time to download a snapshot and the log. See
+    /// [`RemoteConfig::restore_concurrency`].
+    pub restore_concurrency: usize,
     /// How the local copy is made durable. A replica can always fetch
     /// again what it lost, so this only matters after promotion.
     pub sync_mode: SyncMode,
@@ -57,6 +60,7 @@ impl ReplicaConfig {
             poll_interval: Duration::from_secs(1),
             promoted_sync: RemoteSync::Sync,
             snapshot_wal_bytes: 64 << 20,
+            restore_concurrency: squad_storage::DEFAULT_RESTORE_CONCURRENCY,
             sync_mode: SyncMode::Sync,
             cache_size: 128 << 20,
             checkpoint_wal_bytes: 64 << 20,
@@ -71,6 +75,7 @@ impl std::fmt::Debug for ReplicaConfig {
             .field("poll_interval", &self.poll_interval)
             .field("promoted_sync", &self.promoted_sync)
             .field("snapshot_wal_bytes", &self.snapshot_wal_bytes)
+            .field("restore_concurrency", &self.restore_concurrency)
             .field("sync_mode", &self.sync_mode)
             .field("cache_size", &self.cache_size)
             .field("checkpoint_wal_bytes", &self.checkpoint_wal_bytes)
@@ -242,6 +247,7 @@ pub(crate) fn open(dir: &std::path::Path, config: ReplicaConfig) -> Result<Arc<S
     };
     let remote = RemoteConfig {
         snapshot_wal_bytes: config.snapshot_wal_bytes,
+        restore_concurrency: config.restore_concurrency,
         ..RemoteConfig::new(config.store.clone(), config.promoted_sync)
     };
     let engine = Arc::new(ReplicaEngine::open(dir, options, remote)?);
