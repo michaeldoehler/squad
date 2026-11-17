@@ -70,11 +70,11 @@ pub use exec::{scan, Scan, ScanRequest, TableSource};
 pub use json::{field_text as json_field_text, for_each_field as json_for_each_field, json_key_hash, json_pair_hash};
 pub use predicate::{CmpOp, Predicate};
 pub use segment::{
-    Bloom, ChunkMeta, ChunkSource, ColumnStats, ProjectedColumn, RowGroupMeta, Segment, SegmentStreamWriter,
-    SegmentWriter, WriterOptions,
+    Bloom, ChunkMeta, ChunkSource, ColumnStats, FileSource, ProjectedColumn, RowGroupMeta, Segment,
+    SegmentStreamWriter, SegmentWriter, WriterOptions,
 };
 pub use sketch::{Hll, QuantileSketch};
-pub use table::{compact, merge, Manifest, SegmentMeta};
+pub use table::{compact, merge, merge_to_file, Manifest, SegmentMeta};
 pub use types::{
     cmp_datum, cmp_f64, Batch, BytesColumn, BytesData, Column, ColumnBuilder, ColumnData, ColumnType, Datum, Field,
     Schema,

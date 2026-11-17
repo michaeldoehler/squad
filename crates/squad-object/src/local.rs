@@ -144,6 +144,30 @@ impl ObjectStore for LocalStore {
         Ok(())
     }
 
+    fn put_file(&self, key: &str, source: &Path) -> Result<()> {
+        let path = self.path(key)?;
+        let parent = path.parent().unwrap_or(&self.dir);
+        let created = create_dirs(parent)?;
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!("{TMP_PREFIX}{}-{n}", std::process::id()));
+        // Errors name the file and the step, so that a failure can be told
+        // apart: the source gone, the target directory gone, or the rename.
+        let step = |what: &str, e: io::Error| {
+            let _ = fs::remove_file(&tmp);
+            Error::Io(io::Error::new(e.kind(), format!("{what} {} to {}: {e}", source.display(), tmp.display())))
+        };
+        fs::copy(source, &tmp).map_err(|e| step("copying", e))?;
+        OpenOptions::new()
+            .write(true)
+            .open(&tmp)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| step("syncing the copy of", e))?;
+        fs::rename(&tmp, &path).map_err(|e| step("renaming the copy of", e))?;
+        sync_dir(parent)?;
+        sync_created(&created)?;
+        Ok(())
+    }
+
     fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool> {
         let path = self.path(key)?;
         let (tmp, created) = self.write_tmp(&path, data)?;

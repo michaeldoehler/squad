@@ -332,6 +332,13 @@ impl S3Store {
     /// Uploads `data` in parts: create, upload each part, complete. Any
     /// failure aborts the upload.
     fn put_multipart(&self, key: &str, data: &[u8]) -> Result<()> {
+        let parts = data.chunks(self.part_size).map(|c| Ok(std::borrow::Cow::Borrowed(c)));
+        self.put_parts(key, parts)
+    }
+
+    /// Uploads the parts `parts` yields as one object; any failure aborts
+    /// the upload.
+    fn put_parts<'a>(&self, key: &str, parts: impl Iterator<Item = Result<std::borrow::Cow<'a, [u8]>>>) -> Result<()> {
         let path = self.object_path(key)?;
         let (r, _) = self.request("POST", &path, &[("uploads".to_string(), String::new())], &[], Some(b""))?;
         if r.status != 200 {
@@ -342,7 +349,7 @@ impl S3Store {
             status: r.status,
             message: "CreateMultipartUpload answered without an UploadId".into(),
         })?;
-        let result = self.upload_parts(&path, &upload_id, data);
+        let result = self.upload_parts(&path, &upload_id, parts);
         if result.is_err() {
             let query = [("uploadId".to_string(), upload_id.clone())];
             let _ = self.request("DELETE", &path, &query, &[], None);
@@ -352,9 +359,16 @@ impl S3Store {
         Ok(())
     }
 
-    fn upload_parts(&self, path: &str, upload_id: &str, data: &[u8]) -> Result<()> {
+    fn upload_parts<'a>(
+        &self,
+        path: &str,
+        upload_id: &str,
+        parts: impl Iterator<Item = Result<std::borrow::Cow<'a, [u8]>>>,
+    ) -> Result<()> {
         let mut etags = Vec::new();
-        for (i, part) in data.chunks(self.part_size).enumerate() {
+        for (i, part) in parts.enumerate() {
+            let part = part?;
+            let part: &[u8] = &part;
             let number = i + 1;
             let query =
                 [("partNumber".to_string(), number.to_string()), ("uploadId".to_string(), upload_id.to_string())];
@@ -458,6 +472,32 @@ impl S3Store {
 }
 
 impl ObjectStore for S3Store {
+    fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
+        let mut file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        if len <= self.multipart_threshold as u64 {
+            let data = std::fs::read(path)?;
+            return self.put(key, &data);
+        }
+        // One part in memory at a time.
+        let part_size = self.part_size;
+        let mut left = len;
+        let parts = std::iter::from_fn(move || {
+            if left == 0 {
+                return None;
+            }
+            let n = (left as usize).min(part_size);
+            let mut buf = vec![0u8; n];
+            left -= n as u64;
+            Some(
+                std::io::Read::read_exact(&mut file, &mut buf)
+                    .map(|_| std::borrow::Cow::Owned(buf))
+                    .map_err(Error::from),
+            )
+        });
+        self.put_parts(key, parts)
+    }
+
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         if data.len() > self.multipart_threshold {
             return self.put_multipart(key, data);

@@ -41,7 +41,7 @@ pub const MIN_WORK_MEM: usize = 64 << 10;
 pub const MAX_WORK_MEM: usize = (i32::MAX as usize).saturating_mul(1024);
 
 /// File names of temporary files start with this.
-const PREFIX: &str = "squad_tmp_";
+pub(crate) const PREFIX: &str = "squad_tmp_";
 /// Buffer of a temporary file being written or read.
 const IO_BUF: usize = 16 << 10;
 /// Partitions a hash operator splits its input into when it spills.

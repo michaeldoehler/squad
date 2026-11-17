@@ -640,12 +640,28 @@ impl ChunkCache {
     /// Registers a fetch of `key` unless it is cached or being fetched.
     fn claim(&self, key: &ChunkKey) -> Option<Arc<Flight>> {
         let mut inflight = self.inflight.lock();
+        self.claim_locked(&mut inflight, key)
+    }
+
+    fn claim_locked(&self, inflight: &mut HashMap<ChunkKey, Arc<Flight>>, key: &ChunkKey) -> Option<Arc<Flight>> {
         if inflight.contains_key(key) || self.cached(key).is_some() {
             return None;
         }
         let f = Arc::new(Flight::default());
         inflight.insert(key.clone(), f.clone());
         Some(f)
+    }
+
+    /// Claims the given ranges in one step, so that two readers fetching
+    /// the same span do not each claim every other range of it (and then
+    /// both send a request).
+    fn claim_all(&self, keys: impl Iterator<Item = ChunkKey>) -> Vec<(ChunkKey, Option<Arc<Flight>>)> {
+        let mut inflight = self.inflight.lock();
+        keys.map(|k| {
+            let f = self.claim_locked(&mut inflight, &k);
+            (k, f)
+        })
+        .collect()
     }
 
     /// Ends a fetch registered by [`claim`](ChunkCache::claim).
@@ -720,8 +736,9 @@ fn io_error(key: &str, e: squad_object::Error) -> std::io::Error {
 fn fetch_span(store: &Arc<dyn squad_object::ObjectStore>, key: &Arc<str>, cache: &ChunkCache, span: &Span) {
     let (start, end, parts) = span;
     // Ranges another reader is already fetching are left to it.
+    let claims = cache.claim_all(parts.iter().map(|p| (key.clone(), p.0)));
     let claimed: Vec<((u64, u64), Arc<Flight>)> =
-        parts.iter().filter_map(|p| cache.claim(&(key.clone(), p.0)).map(|f| (*p, f))).collect();
+        parts.iter().zip(claims).filter_map(|(p, (_, f))| f.map(|f| (*p, f))).collect();
     let (Some(first), Some(last)) = (claimed.first(), claimed.last()) else { return };
     let (start, end) = (first.0 .0, (last.0 .0 + last.0 .1).min(*end).max(*start));
     let data = store.get_range(key, start, end - start);
@@ -1794,6 +1811,64 @@ fn store_segment(
     Ok(())
 }
 
+/// Stores the segment in the local file `path` as a new object and adds
+/// it to the manifest.
+fn store_segment_file(
+    table: &Table,
+    layout: &Layout,
+    manifest: &mut cs::Manifest,
+    path: &std::path::Path,
+    cx: &mut ExecCx,
+) -> Result<()> {
+    let id = new_segment_id();
+    let key = object_key(table.id, &id);
+    cx.shared.columnar.pending_add(&key);
+    cx.written_objects.push(key.clone());
+    cx.shared.objects().put_file(&key, path)?;
+    let source = cs::FileSource::open(path).map_err(|e| Error::new(sqlstate::IO_ERROR, format!("{e}")))?;
+    let segment = cs::Segment::open(Arc::new(source))?;
+    manifest.segments.push(cs::SegmentMeta::describe(id, &segment).with_columns(layout.ids.clone()));
+    Ok(())
+}
+
+/// A temporary file that is removed when dropped.
+struct TempFile {
+    path: std::path::PathBuf,
+}
+
+impl TempFile {
+    /// A file in the database's directory for temporary files, named so
+    /// that a crashed process's leftovers are removed at the next open.
+    fn create(dir: &std::path::Path) -> Result<TempFile> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let io =
+            |e: std::io::Error| Error::new(sqlstate::IO_ERROR, format!("temporary file in {}: {e}", dir.display()));
+        std::fs::create_dir_all(dir).map_err(io)?;
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{}merge-{}-{n}.seg", crate::spill::PREFIX, std::process::id()));
+        std::fs::File::create(&path).map_err(io)?;
+        Ok(TempFile { path })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    fn file(&self) -> Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .map_err(|e| Error::new(sqlstate::IO_ERROR, format!("temporary file {}: {e}", self.path.display())))
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Writes rows as one new segment and adds it to the manifest.
 fn add_segment(
     table: &Table,
@@ -1921,9 +1996,13 @@ pub(crate) fn merge_segments(table: &Arc<Table>, cx: &mut ExecCx) -> Result<usiz
     }
     let picked = cs::Manifest { segments: small.clone(), ..Default::default() };
     let inputs = open_segments(table, &layout, &picked, None, cx)?;
-    let merged = cs::merge(&inputs, writer_options(table))?;
+    // The output goes to a temporary file and is stored from there, so
+    // that memory holds one row group per input, not the merged segment.
+    let tmp = TempFile::create(cx.shared.temp_space().dir())?;
+    cs::merge_to_file(&inputs, writer_options(table), tmp.file()?)?;
+    drop(inputs);
     manifest.segments.retain(|s| !small.iter().any(|m| m.id == s.id));
-    store_segment(table, &layout, &mut manifest, merged, cx)?;
+    store_segment_file(table, &layout, &mut manifest, tmp.path(), cx)?;
     cx.dropped_objects.extend(small.iter().map(|s| object_key(table.id, &s.id)));
     save_manifest(table, &manifest, cx)?;
     Ok(small.len())

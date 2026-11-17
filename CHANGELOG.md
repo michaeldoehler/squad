@@ -309,6 +309,13 @@ preparing it for production use.
   first. Parallel range reads use a fixed set of 8 threads per process
   instead of new threads per read. `Database::columnar_memory()` (new)
   reports what the caches hold.
+- **A merge of columnar segments no longer holds its output in memory.**
+  It writes the merged segment into a temporary file
+  in the database's directory for temporary files (`Config::temp_dir`)
+  and stores it from there; S3 uploads it
+  in parts, one part in memory at a time. `ObjectStore::put_file` (new)
+  stores a local file; the stores of `squad-object` copy or upload it in
+  pieces.
 - **Read replicas no longer lose segments right after a compaction.**
   With segments in a remote object store, replaced segment objects are
   deleted only after `ColumnarConfig::retire_grace` (new, default 10

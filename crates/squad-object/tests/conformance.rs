@@ -323,3 +323,31 @@ fn real_s3_conformance() {
     clean(&store);
     assert!(store.list("").unwrap().is_empty());
 }
+
+#[test]
+fn put_file_stores_the_file_in_every_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("upload");
+    let data = big(13 << 20);
+    std::fs::write(&path, &data).unwrap();
+    let local = LocalStore::new(dir.path().join("objects")).unwrap();
+    let memory = MemoryStore::new();
+    let cached = CachedStore::new(MemoryStore::new(), 1 << 20);
+    for store in [&local as &dyn ObjectStore, &memory, &cached] {
+        store.put_file("a/b", &path).unwrap();
+        assert_eq!(store.get("a/b").unwrap().as_deref(), Some(&data[..]));
+    }
+    assert!(local.list("").unwrap().iter().all(|m| !m.key.contains(".tmp-")));
+    assert!(MemoryStore::new().put_file("x", &dir.path().join("missing")).is_err());
+
+    // S3 uploads a large file in parts, one part in memory at a time.
+    let emulator = S3Emulator::start();
+    let store = S3Store::new(emulator.config("file")).unwrap().with_multipart(6 << 20, 5 << 20);
+    store.put_file("large", &path).unwrap();
+    assert_eq!(emulator.completed_multipart_uploads(), 1);
+    assert_eq!(store.get("large").unwrap().as_deref(), Some(&data[..]));
+    std::fs::write(&path, &data[..1000]).unwrap();
+    store.put_file("small", &path).unwrap();
+    assert_eq!(emulator.completed_multipart_uploads(), 1);
+    assert_eq!(store.get("small").unwrap().as_deref(), Some(&data[..1000]));
+}

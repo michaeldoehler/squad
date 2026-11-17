@@ -61,6 +61,48 @@ impl ChunkSource for Vec<u8> {
     }
 }
 
+/// A segment in a local file, read with positioned reads.
+pub struct FileSource {
+    file: std::fs::File,
+    len: u64,
+}
+
+impl FileSource {
+    pub fn open(path: &std::path::Path) -> io::Result<FileSource> {
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        Ok(FileSource { file, len })
+    }
+}
+
+impl ChunkSource for FileSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn read(&self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+        if offset.checked_add(len).is_none_or(|e| e > self.len) {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "read beyond the end of the segment"));
+        }
+        let mut buf = vec![0u8; len as usize];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::read_exact_at(&self.file, &mut buf, offset)?;
+        }
+        #[cfg(windows)]
+        {
+            let mut done = 0;
+            while done < buf.len() {
+                let n = std::os::windows::fs::FileExt::seek_read(&self.file, &mut buf[done..], offset + done as u64)?;
+                if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
+                }
+                done += n;
+            }
+        }
+        Ok(buf)
+    }
+}
+
 impl ChunkSource for Arc<Vec<u8>> {
     fn len(&self) -> u64 {
         ChunkSource::len(&**self)
@@ -492,16 +534,40 @@ fn gather(schema: &Arc<Schema>, batches: &[Arc<Batch>], part: &[(u32, u32)]) -> 
 struct SegmentBody {
     schema: Arc<Schema>,
     options: WriterOptions,
-    out: Vec<u8>,
+    out: Out,
     groups: Vec<u8>,
     ngroups: u32,
     rows: u64,
 }
 
+/// Where the bytes of a segment being written go.
+enum Out {
+    Memory(Vec<u8>),
+    File { writer: io::BufWriter<std::fs::File>, len: u64 },
+}
+
+impl Out {
+    fn len(&self) -> u64 {
+        match self {
+            Out::Memory(v) => v.len() as u64,
+            Out::File { len, .. } => *len,
+        }
+    }
+
+    fn put(&mut self, bytes: &[u8]) -> Result<()> {
+        match self {
+            Out::Memory(v) => v.extend_from_slice(bytes),
+            Out::File { writer, len } => {
+                io::Write::write_all(writer, bytes).map_err(Error::Io)?;
+                *len += bytes.len() as u64;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl SegmentBody {
-    fn new(schema: Arc<Schema>, options: WriterOptions) -> SegmentBody {
-        let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
+    fn with_out(schema: Arc<Schema>, options: WriterOptions, out: Out) -> SegmentBody {
         SegmentBody { schema, options, out, groups: Vec::new(), ngroups: 0, rows: 0 }
     }
 
@@ -527,18 +593,18 @@ impl SegmentBody {
             chunk.put_u8(comp);
             chunk.put_u32(raw.len() as u32);
             chunk.extend_from_slice(&data);
-            footer.put_u64(out.len() as u64);
+            footer.put_u64(out.len());
             footer.put_u32(chunk.len() as u32 + 4);
-            out.put_u32(crc32c::crc32c(&chunk));
-            out.extend_from_slice(&chunk);
+            out.put(&crc32c::crc32c(&chunk).to_le_bytes())?;
+            out.put(&chunk)?;
             match bloom {
                 Some(b) => {
                     let mut chunk = vec![b.hashes];
                     chunk.extend_from_slice(&b.bits);
-                    footer.put_u64(out.len() as u64);
+                    footer.put_u64(out.len());
                     footer.put_u32(chunk.len() as u32 + 4);
-                    out.put_u32(crc32c::crc32c(&chunk));
-                    out.extend_from_slice(&chunk);
+                    out.put(&crc32c::crc32c(&chunk).to_le_bytes())?;
+                    out.put(&chunk)?;
                 }
                 None => {
                     footer.put_u64(0);
@@ -557,10 +623,11 @@ impl SegmentBody {
 
     /// Bytes written so far.
     fn len(&self) -> usize {
-        self.out.len() + self.groups.len()
+        self.out.len() as usize + self.groups.len()
     }
 
-    fn finish(self) -> Result<Vec<u8>> {
+    /// Writes the footer; returns where the bytes went and their length.
+    fn finish_out(self) -> Result<(Out, u64)> {
         let SegmentBody { schema, options, mut out, groups, ngroups, rows } = self;
         let mut footer = Vec::with_capacity(groups.len() + 64 * schema.len());
         footer.put_u32(VERSION);
@@ -577,11 +644,19 @@ impl SegmentBody {
         footer.put_u64(rows);
         footer.put_u32(ngroups);
         footer.extend_from_slice(&groups);
-        out.extend_from_slice(&footer);
-        out.put_u32(footer.len() as u32);
-        out.put_u32(crc32c::crc32c(&footer));
-        out.extend_from_slice(MAGIC);
-        Ok(out)
+        out.put(&footer)?;
+        out.put(&(footer.len() as u32).to_le_bytes())?;
+        out.put(&crc32c::crc32c(&footer).to_le_bytes())?;
+        out.put(MAGIC)?;
+        let len = out.len();
+        Ok((out, len))
+    }
+
+    fn finish(self) -> Result<Vec<u8>> {
+        match self.finish_out()? {
+            (Out::Memory(v), _) => Ok(v),
+            (Out::File { .. }, _) => Err(Error::Invalid("segment was written to a file".into())),
+        }
     }
 }
 
@@ -595,11 +670,24 @@ pub struct SegmentStreamWriter {
 
 impl SegmentStreamWriter {
     pub fn new(schema: Arc<Schema>, options: WriterOptions) -> Result<SegmentStreamWriter> {
+        SegmentStreamWriter::with_out(schema, options, Out::Memory(MAGIC.to_vec()))
+    }
+
+    /// Writes the segment into `file` (created empty by the caller)
+    /// instead of memory; [`finish_file`](SegmentStreamWriter::finish_file)
+    /// completes it. Memory then holds one row group and the footer.
+    pub fn to_file(schema: Arc<Schema>, options: WriterOptions, file: std::fs::File) -> Result<SegmentStreamWriter> {
+        let mut out = Out::File { writer: io::BufWriter::with_capacity(1 << 20, file), len: 0 };
+        out.put(MAGIC)?;
+        SegmentStreamWriter::with_out(schema, options, out)
+    }
+
+    fn with_out(schema: Arc<Schema>, options: WriterOptions, out: Out) -> Result<SegmentStreamWriter> {
         if options.sort_key.iter().any(|c| *c >= schema.len()) {
             return Err(Error::Invalid("sort key names a column that does not exist".into()));
         }
         let pending = schema.columns.iter().map(|f| ColumnBuilder::new(f.ty).finish()).collect();
-        Ok(SegmentStreamWriter { body: SegmentBody::new(schema, options), pending })
+        Ok(SegmentStreamWriter { body: SegmentBody::with_out(schema, options, out), pending })
     }
 
     /// Appends rows; full row groups are encoded right away.
@@ -654,6 +742,23 @@ impl SegmentStreamWriter {
             self.flush()?;
         }
         self.body.finish()
+    }
+
+    /// Completes a segment started with
+    /// [`to_file`](SegmentStreamWriter::to_file): writes the footer,
+    /// flushes and syncs the file and returns the segment's length.
+    pub fn finish_file(mut self) -> Result<u64> {
+        if self.pending.first().is_some_and(|c| !c.is_empty()) {
+            self.flush()?;
+        }
+        match self.body.finish_out()? {
+            (Out::File { writer, len }, _) => {
+                let file = writer.into_inner().map_err(|e| Error::Io(e.into_error()))?;
+                file.sync_all().map_err(Error::Io)?;
+                Ok(len)
+            }
+            (Out::Memory(_), _) => Err(Error::Invalid("segment was written to memory".into())),
+        }
     }
 }
 

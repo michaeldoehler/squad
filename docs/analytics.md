@@ -102,7 +102,12 @@ of its own size have gathered, not every time a few small ones arrive:
 each row is rewritten about once per tier it passes, so the work of
 merging follows the rate of new data, not the size of the table. The
 merge streams: it holds one decoded row group per input and the encoded
-output, not the inputs.
+output, not the inputs. The output is written to a temporary file
+(in the database's directory for temporary files, `Config::temp_dir`,
+by default `tmp/` in the database directory)
+and stored from there (in an S3 bucket as a multipart upload, one 8 MiB
+part in memory at a time), so a merge needs about one row group per input
+in memory, however large its output; the file is deleted afterwards.
 
 Compaction never blocks inserts or queries. It takes the table's shared
 lock (DDL on the table waits for it, and a compaction waits at most
@@ -338,8 +343,9 @@ you filter or group by in their own columns rather than inside `jsonb`.
   timings against Garage).
 - A compaction of the delta holds the rows it moves (at most 262,144
   rows and `compact_max_bytes`) plus about two row groups; a bulk insert
-  holds its rows, in chunks of one million per segment. A merge holds its
-  encoded output (bounded by `merge_max_bytes`).
+  holds its rows, in chunks of one million per segment. A merge holds one
+  decoded row group per input and writes its output through a temporary
+  file of up to `merge_max_bytes`; that much free disk space is needed.
 - The delta has no back-pressure: if inserts outpace compaction for a
   long time, the delta grows and queries slow down accordingly.
 - Exact `count(DISTINCT)` and group-by with very many groups are bounded
