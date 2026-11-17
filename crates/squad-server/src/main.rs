@@ -73,6 +73,11 @@ OPTIONS for serve:
     --replica-of-file <file>  read the --replica-of URL from a file
     --poll-interval <ms>      how often a replica looks for new commits
                               (default 1000)
+    --work-mem <size>         default work_mem of sessions: memory one sort
+                              or hash table may use before it spills to
+                              temporary files, e.g. 16MB (default 4MB)
+    --temp-dir <dir>          directory for those temporary files (default
+                              <dir>/tmp, or the system's for --memory)
 
 OPTIONS for ping:
     --host <host>             host name, IP address or Unix socket directory
@@ -132,6 +137,8 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         "--replica-of",
         "--replica-of-file",
         "--poll-interval",
+        "--work-mem",
+        "--temp-dir",
         "--host",
         "--port",
         "--database",
@@ -221,6 +228,18 @@ fn parse_number<T: std::str::FromStr>(args: &Args, option: &str) -> Result<Optio
 }
 
 fn open(args: &Args, dir: Option<&String>) -> Result<Database, String> {
+    let db = open_database(args, dir)?;
+    if let Some(v) = args.last("--work-mem") {
+        let bytes = squad::parse_work_mem(v).map_err(|e| format!("invalid --work-mem \"{v}\": {}", e.message()))?;
+        db.set_work_mem(bytes).map_err(|e| e.to_string())?;
+    }
+    if let Some(dir) = args.last("--temp-dir") {
+        db.set_temp_dir(dir).map_err(|e| format!("cannot use --temp-dir \"{dir}\": {e}"))?;
+    }
+    Ok(db)
+}
+
+fn open_database(args: &Args, dir: Option<&String>) -> Result<Database, String> {
     let mut config = Config::default();
     if let Some(mode) = args.last("--sync") {
         config.sync_mode = match mode {

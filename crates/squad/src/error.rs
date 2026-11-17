@@ -86,6 +86,8 @@ pub mod sqlstate {
     pub const QUERY_CANCELED: &str = "57014";
     pub const ADMIN_SHUTDOWN: &str = "57P01";
     pub const TOO_MANY_CONNECTIONS: &str = "53300";
+    pub const DISK_FULL: &str = "53100";
+    pub const OUT_OF_MEMORY: &str = "53200";
     pub const IO_ERROR: &str = "58030";
     pub const PROTOCOL_VIOLATION: &str = "08P01";
     pub const INTERNAL_ERROR: &str = "XX000";

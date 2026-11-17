@@ -32,6 +32,16 @@ pub struct Config {
     pub remote: Option<RemoteConfig>,
     /// Cache size and compaction settings of columnar tables.
     pub columnar: ColumnarConfig,
+    /// Default `work_mem` of sessions, in bytes: how much memory one
+    /// sort, hash table or other buffering operator of a query may use
+    /// before it writes to temporary files. Sessions can change it with
+    /// `SET work_mem`. Default 4 MB, as in PostgreSQL; at least 64 kB.
+    pub work_mem: usize,
+    /// Directory for temporary files of operators that exceed
+    /// `work_mem`. `None`: `tmp` inside the database directory. The
+    /// directory must not be shared with another open database: files
+    /// left in it by a crash are removed when the database is opened.
+    pub temp_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -42,6 +52,8 @@ impl Default for Config {
             checkpoint_wal_bytes: 64 << 20,
             remote: None,
             columnar: ColumnarConfig::default(),
+            work_mem: crate::spill::DEFAULT_WORK_MEM,
+            temp_dir: None,
         }
     }
 }
@@ -68,6 +80,8 @@ impl Database {
         // Segments of columnar tables live in the remote store if there
         // is one, otherwise in a directory next to the row store.
         let remote = config.remote.is_some();
+        let temp_dir = config.temp_dir.clone().unwrap_or_else(|| path.as_ref().join("tmp"));
+        let work_mem = config.work_mem;
         let (shared, objects): (Arc<Shared>, Arc<dyn ObjectStore>) = match config.remote {
             Some(remote) => {
                 let objects = remote.store.clone();
@@ -85,7 +99,10 @@ impl Database {
         };
         shared.set_objects(objects);
         shared.columnar.set_remote(remote);
-        Ok(Database::start(shared, config.columnar))
+        shared.set_temp_dir(temp_dir)?;
+        let db = Database::start(shared, config.columnar);
+        db.set_work_mem(work_mem)?;
+        Ok(db)
     }
 
     fn open_shared(engine: Arc<dyn Engine>) -> Result<Arc<Shared>> {
@@ -144,6 +161,32 @@ impl Database {
     /// the replica was promoted before; on error it stays a replica.
     pub fn promote(&self) -> Result<()> {
         crate::replica::promote(&self.shared)
+    }
+
+    /// Sets the `work_mem` (in bytes) of sessions opened from now on; see
+    /// [`Config::work_mem`]. Fails with SQLSTATE 22023 outside the range
+    /// PostgreSQL allows (64 kB to 2147483647 kB).
+    pub fn set_work_mem(&self, bytes: usize) -> Result<()> {
+        if !(crate::spill::MIN_WORK_MEM..=crate::spill::MAX_WORK_MEM).contains(&bytes) {
+            return Err(Error::new(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                format!("{} kB is outside the valid range for parameter \"work_mem\" (64 .. 2147483647)", bytes / 1024),
+            ));
+        }
+        self.shared.work_mem.store(bytes, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Makes temporary files go to `dir` from now on (see
+    /// [`Config::temp_dir`]); files there that a crashed process left are
+    /// removed. The directory must not belong to another open database.
+    pub fn set_temp_dir(&self, dir: impl AsRef<Path>) -> Result<()> {
+        self.shared.set_temp_dir(dir.as_ref().to_path_buf())
+    }
+
+    /// The directory temporary files of this database go to.
+    pub fn temp_dir(&self) -> std::path::PathBuf {
+        self.shared.temp_space().dir().to_path_buf()
     }
 
     /// True while this database is a read replica.

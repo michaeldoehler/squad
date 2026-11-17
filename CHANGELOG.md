@@ -167,6 +167,22 @@ preparing it for production use.
   fractions, as in PostgreSQL. They used to fail with `0A000`.
 - `scripts/sqlalchemy-check.py`: compares SQLAlchemy's schema
   introspection of squad with that of PostgreSQL.
+- `work_mem` (`SET work_mem`, `SHOW work_mem`, default 4 MB as in
+  PostgreSQL; `Config::work_mem`, `Database::set_work_mem`, `squad serve
+  --work-mem`). Sorts use an external merge sort; hash aggregation,
+  `DISTINCT` and `UNION` spill partitions; hash joins become grace hash
+  joins; `INTERSECT`/`EXCEPT`, window functions, CTEs and the inner side
+  of nested loops spill to temporary files. Buffers that cannot be split
+  (one window partition, the growing state of one aggregate group) fail
+  with SQLSTATE `53200` instead of exhausting memory. Previously these
+  operators held all their rows in memory. `EXPLAIN ANALYZE` reports the
+  sort method, batches and disk use.
+- Temporary files go to `tmp/` in the database directory,
+  `Config::temp_dir`, `Database::set_temp_dir` or `squad serve
+  --temp-dir`; they are removed when their operator ends, fails or is
+  cancelled, and files left by a crash are removed at open.
+- `generate_series` in `FROM` produces its rows one at a time instead of
+  building them all first.
 
 ### Changed
 

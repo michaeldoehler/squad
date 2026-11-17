@@ -138,7 +138,12 @@ databases.
 - **Executor.** A pull-based (Volcano) executor. Scans, filters,
   projections, limits and nested-loop joins stream rows; sorting,
   aggregation, window functions and set operations materialize their
-  input. Uncorrelated subqueries run once per statement and are cached.
+  input. Each materializing operator keeps its buffers below
+  `work_mem` and writes the rest to temporary files: external merge
+  sort, hash aggregation and DISTINCT that spill partitions, grace hash
+  joins, window partitions computed one at a time (see
+  [embedding](embedding.md#memory-for-queries-work_mem-and-temporary-files)).
+  Uncorrelated subqueries run once per statement and are cached.
 - **Rows and indexes.** A table is clustered by its primary key: the row
   lives under `table id ++ encoded key`. Tables without a primary key get
   a hidden 64-bit row id. A secondary index entry maps `index id ++

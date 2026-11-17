@@ -70,6 +70,10 @@ pub struct Shared {
     /// The sessions of this database, for `pg_stat_activity` and
     /// `pg_cancel_backend` / `pg_terminate_backend`.
     pub(crate) backends: crate::backends::Backends,
+    /// `work_mem` of sessions that do not set it.
+    pub(crate) work_mem: std::sync::atomic::AtomicUsize,
+    /// Where operators that exceed `work_mem` write temporary files.
+    pub(crate) temp: RwLock<Arc<crate::spill::TempSpace>>,
 }
 
 /// What the apply loop of a read replica changes in a database. It
@@ -144,6 +148,8 @@ impl Shared {
             next_pid: AtomicI32::new(1),
             advisory: Arc::default(),
             backends: Default::default(),
+            work_mem: std::sync::atomic::AtomicUsize::new(crate::spill::DEFAULT_WORK_MEM),
+            temp: RwLock::new(Arc::new(crate::spill::TempSpace::private())),
             database_name: database_name.to_string(),
             catalog_version: Arc::new(std::sync::atomic::AtomicU64::new(version)),
             recovery: AtomicBool::new(false),
@@ -160,6 +166,18 @@ impl Shared {
 
     pub(crate) fn set_recovery(&self, on: bool) -> bool {
         self.recovery.swap(on, Ordering::AcqRel)
+    }
+
+    /// Makes operators write their temporary files to `dir`, removing the
+    /// files an earlier process left there.
+    pub(crate) fn set_temp_dir(&self, dir: std::path::PathBuf) -> Result<()> {
+        *self.temp.write() = Arc::new(crate::spill::TempSpace::in_dir(dir)?);
+        Ok(())
+    }
+
+    /// The directory of temporary files.
+    pub(crate) fn temp_space(&self) -> Arc<crate::spill::TempSpace> {
+        self.temp.read().clone()
     }
 
     /// Fails on a read replica, where nothing may be written.
@@ -390,6 +408,15 @@ pub struct SessionState {
     pub lock_timeout: Option<Duration>,
     /// `statement_timeout`: a statement running longer fails with 57014.
     pub statement_timeout: Option<Duration>,
+    /// `work_mem` in bytes: the memory one operator may use for its
+    /// buffers before it writes to temporary files.
+    pub work_mem: usize,
+    /// What `RESET work_mem` returns to: the database's default when the
+    /// session was opened.
+    pub work_mem_default: usize,
+    /// Filled while `EXPLAIN ANALYZE` runs a statement: details about plan
+    /// nodes (keyed by their address), such as how a sort was done.
+    pub(crate) plan_notes: Option<HashMap<usize, Vec<String>>>,
     pub currval: HashMap<u32, i64>,
     pub lastval: Option<i64>,
     pub default_isolation: Isolation,
@@ -415,6 +442,7 @@ pub(crate) struct Gucs {
     tz: chrono_tz::Tz,
     lock_timeout: Option<Duration>,
     statement_timeout: Option<Duration>,
+    work_mem: usize,
     default_isolation: Isolation,
     default_read_only: bool,
     row_security: bool,
@@ -441,6 +469,7 @@ impl SessionState {
             tz: self.tz,
             lock_timeout: self.lock_timeout,
             statement_timeout: self.statement_timeout,
+            work_mem: self.work_mem,
             default_isolation: self.default_isolation,
             default_read_only: self.default_read_only,
             row_security: self.row_security,
@@ -453,6 +482,7 @@ impl SessionState {
         self.tz = g.tz;
         self.lock_timeout = g.lock_timeout;
         self.statement_timeout = g.statement_timeout;
+        self.work_mem = g.work_mem;
         self.default_isolation = g.default_isolation;
         self.default_read_only = g.default_read_only;
         self.row_security = g.row_security;
@@ -784,6 +814,9 @@ impl Session {
         let guard = shared.guard.lock().upgrade();
         let mut session = Session::internal(shared);
         session._guard = guard;
+        let work_mem = session.shared.work_mem.load(Ordering::Relaxed);
+        session.state.work_mem = work_mem;
+        session.state.work_mem_default = work_mem;
         let backends = &session.shared.backends;
         session.backend =
             Some(backends.register(session.state.pid, session.state.cancel.clone(), now_micros(), &session.state.user));
@@ -806,6 +839,9 @@ impl Session {
                 tz: chrono_tz::UTC,
                 lock_timeout: None,
                 statement_timeout: None,
+                work_mem: crate::spill::DEFAULT_WORK_MEM,
+                work_mem_default: crate::spill::DEFAULT_WORK_MEM,
+                plan_notes: None,
                 currval: HashMap::new(),
                 lastval: None,
                 default_isolation: Isolation::ReadCommitted,

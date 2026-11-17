@@ -39,6 +39,8 @@ psql -h 127.0.0.1 -U squad squad
 | `--remote <url>`, `--remote-file <file>`, `--remote-sync async\|sync`, `--remote-restore` | keep the durable copy in an object store, see [cloud storage](cloud-storage.md); `--remote-file` reads the URL from a file, so that credentials in it stay out of the process list |
 | `--replica-of <url>`, `--replica-of-file <file>` | serve a **read replica** of the database whose writer runs with `--remote <url>`; `<dir>` holds the replica's local copy |
 | `--poll-interval <ms>` | how often a replica looks for new commits (default 1000) |
+| `--work-mem <size>` | default `work_mem` of sessions, e.g. `16MB` (default `4MB`); see [embedding](embedding.md#memory-for-queries-work_mem-and-temporary-files) |
+| `--temp-dir <dir>` | directory for the temporary files of queries that exceed `work_mem` (default `<dir>/tmp`, or a directory under the system's temporary directory with `--memory`) |
 
 Durations are written `30s`, `500ms`, `5min` or `1h`; a bare number
 means seconds. `--help` (or `-h`) after any subcommand prints the
