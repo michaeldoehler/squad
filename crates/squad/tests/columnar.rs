@@ -1064,3 +1064,25 @@ fn a_compaction_moves_at_most_compact_max_bytes() {
     let puts = store.puts.load(Ordering::SeqCst);
     assert!(puts >= 5, "{puts} segment objects written");
 }
+
+#[test]
+fn merges_write_through_a_temporary_file_and_remove_it() {
+    let store = Counting::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let db = remote_db(&store, ColumnarConfig { temp_dir: Some(tmp.path().join("merge")), ..manual() });
+    let conn = db.connect();
+    conn.batch_execute("CREATE TABLE e (n int, body text) USING columnar WITH (order_by = 'n')").unwrap();
+    for i in 0..8 {
+        conn.execute("INSERT INTO e SELECT g * 8 + $1, md5(g::text) FROM generate_series(1, 500) g", &[&i]).unwrap();
+        conn.batch_execute("VACUUM e").unwrap();
+    }
+    // The eighth VACUUM merged the eight segments into one.
+    assert_eq!(store.inner.list("columnar/").unwrap().len() - db.columnar_memory().retired_segments, 1);
+    let left: Vec<_> = std::fs::read_dir(tmp.path().join("merge")).unwrap().collect();
+    assert!(left.is_empty(), "temporary files left: {left:?}");
+    let (n, first, last): (i64, i32, i32) = {
+        let r = conn.query_one("SELECT count(*), min(n), max(n) FROM e", &[]).unwrap();
+        (r.get(0), r.get(1), r.get(2))
+    };
+    assert_eq!((n, first, last), (4000, 8, 4007));
+}

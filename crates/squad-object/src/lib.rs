@@ -110,6 +110,15 @@ pub trait ObjectStore: Send + Sync + 'static {
 
     /// Deletes the object. Deleting a missing object succeeds.
     fn delete(&self, key: &str) -> Result<()>;
+
+    /// Stores the contents of the local file `path` as the object, like
+    /// [`put`](ObjectStore::put). The provided implementation reads the
+    /// file into memory; the stores in this crate copy or upload it in
+    /// pieces, so that large objects need not fit in memory.
+    fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
+        let data = std::fs::read(path)?;
+        self.put(key, &data)
+    }
 }
 
 /// Rejects keys that could escape a directory or are ambiguous.

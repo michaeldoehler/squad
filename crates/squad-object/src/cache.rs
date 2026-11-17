@@ -117,6 +117,11 @@ impl<S: ObjectStore> ObjectStore for CachedStore<S> {
         Ok(())
     }
 
+    fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
+        self.forget(key);
+        self.inner.put_file(key, path)
+    }
+
     fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool> {
         self.forget(key);
         self.inner.put_if_absent(key, data)

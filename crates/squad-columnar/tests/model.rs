@@ -1004,7 +1004,16 @@ fn streaming_merge_matches_sorting_everything() {
             sort_key: sort_key.clone(),
             compress: true,
         };
-        let merged = Segment::open(Arc::new(merge(&segments, options).unwrap())).unwrap();
+        let bytes = merge(&segments, options.clone()).unwrap();
+        // Merging into a file writes the same bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("merged.seg");
+        let len = merge_to_file(&segments, options, std::fs::File::create(&path).unwrap()).unwrap();
+        assert_eq!(len, bytes.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "seed {seed}: file and memory output differ");
+        let from_file = Segment::open(Arc::new(FileSource::open(&path).unwrap())).unwrap();
+        assert_eq!(from_file.read_all().unwrap().to_rows().len(), all.len());
+        let merged = Segment::open(Arc::new(bytes)).unwrap();
         let got = merged.read_all().unwrap().to_rows();
         if !sort_key.is_empty() {
             let key = |r: &Vec<Datum>| sort_key.iter().map(|c| r[*c].clone()).collect::<Vec<_>>();

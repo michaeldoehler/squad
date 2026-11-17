@@ -88,6 +88,9 @@ pub struct ColumnarConfig {
     /// can finish reading it. Local stores delete as soon as no snapshot
     /// of this process reads it.
     pub retire_grace: Duration,
+    /// Directory for the temporary file a merge writes its output into
+    /// before it is stored; `None` means the system's temporary directory.
+    pub temp_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ColumnarConfig {
@@ -102,6 +105,7 @@ impl Default for ColumnarConfig {
             merge_max_bytes: 256 << 20,
             orphan_grace: Duration::from_secs(3600),
             retire_grace: Duration::from_secs(600),
+            temp_dir: None,
         }
     }
 }
@@ -1794,6 +1798,63 @@ fn store_segment(
     Ok(())
 }
 
+/// Stores the segment in the local file `path` as a new object and adds
+/// it to the manifest.
+fn store_segment_file(
+    table: &Table,
+    layout: &Layout,
+    manifest: &mut cs::Manifest,
+    path: &std::path::Path,
+    cx: &mut ExecCx,
+) -> Result<()> {
+    let id = new_segment_id();
+    let key = object_key(table.id, &id);
+    cx.shared.columnar.pending_add(&key);
+    cx.written_objects.push(key.clone());
+    cx.shared.objects().put_file(&key, path)?;
+    let source = cs::FileSource::open(path).map_err(|e| Error::new(sqlstate::IO_ERROR, format!("{e}")))?;
+    let segment = cs::Segment::open(Arc::new(source))?;
+    manifest.segments.push(cs::SegmentMeta::describe(id, &segment).with_columns(layout.ids.clone()));
+    Ok(())
+}
+
+/// A temporary file that is removed when dropped.
+struct TempFile {
+    path: std::path::PathBuf,
+}
+
+impl TempFile {
+    fn create(dir: Option<&std::path::Path>) -> Result<TempFile> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = dir.map(std::path::Path::to_path_buf).unwrap_or_else(std::env::temp_dir);
+        let io =
+            |e: std::io::Error| Error::new(sqlstate::IO_ERROR, format!("temporary file in {}: {e}", dir.display()));
+        std::fs::create_dir_all(&dir).map_err(io)?;
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("squad-merge-{}-{n}.seg", std::process::id()));
+        std::fs::File::create(&path).map_err(io)?;
+        Ok(TempFile { path })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    fn file(&self) -> Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .map_err(|e| Error::new(sqlstate::IO_ERROR, format!("temporary file {}: {e}", self.path.display())))
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Writes rows as one new segment and adds it to the manifest.
 fn add_segment(
     table: &Table,
@@ -1921,9 +1982,13 @@ pub(crate) fn merge_segments(table: &Arc<Table>, cx: &mut ExecCx) -> Result<usiz
     }
     let picked = cs::Manifest { segments: small.clone(), ..Default::default() };
     let inputs = open_segments(table, &layout, &picked, None, cx)?;
-    let merged = cs::merge(&inputs, writer_options(table))?;
+    // The output goes to a temporary file and is stored from there, so
+    // that memory holds one row group per input, not the merged segment.
+    let tmp = TempFile::create(cx.shared.columnar.config().temp_dir.as_deref())?;
+    cs::merge_to_file(&inputs, writer_options(table), tmp.file()?)?;
+    drop(inputs);
     manifest.segments.retain(|s| !small.iter().any(|m| m.id == s.id));
-    store_segment(table, &layout, &mut manifest, merged, cx)?;
+    store_segment_file(table, &layout, &mut manifest, tmp.path(), cx)?;
     cx.dropped_objects.extend(small.iter().map(|s| object_key(table.id, &s.id)));
     save_manifest(table, &manifest, cx)?;
     Ok(small.len())

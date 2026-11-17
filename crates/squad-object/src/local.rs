@@ -144,6 +144,22 @@ impl ObjectStore for LocalStore {
         Ok(())
     }
 
+    fn put_file(&self, key: &str, source: &Path) -> Result<()> {
+        let path = self.path(key)?;
+        let parent = path.parent().unwrap_or(&self.dir);
+        let created = create_dirs(parent)?;
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!("{TMP_PREFIX}{}-{n}", std::process::id()));
+        let copied = fs::copy(source, &tmp).and_then(|_| OpenOptions::new().write(true).open(&tmp)?.sync_all());
+        if let Err(e) = copied.and_then(|_| fs::rename(&tmp, &path)) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        sync_dir(parent)?;
+        sync_created(&created)?;
+        Ok(())
+    }
+
     fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool> {
         let path = self.path(key)?;
         let (tmp, created) = self.write_tmp(&path, data)?;

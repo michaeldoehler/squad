@@ -282,6 +282,22 @@ pub fn compact(segments: &[Arc<Segment>], options: WriterOptions) -> Result<Vec<
 /// [`Segment::project`]). Inputs that are not sorted by the key still
 /// produce a correct segment, only one that is less well clustered.
 pub fn merge(segments: &[Arc<Segment>], options: WriterOptions) -> Result<Vec<u8>> {
+    let schema = merge_schema(segments)?;
+    let writer = SegmentStreamWriter::new(schema, options.clone())?;
+    merge_into(segments, &options.sort_key, writer)?.finish()
+}
+
+/// Like [`merge`], but writes the merged segment into `file` (created
+/// empty by the caller) and returns its length; memory holds one decoded
+/// row group per input and one output row group, not the output.
+pub fn merge_to_file(segments: &[Arc<Segment>], options: WriterOptions, file: std::fs::File) -> Result<u64> {
+    let schema = merge_schema(segments)?;
+    let writer = SegmentStreamWriter::to_file(schema, options.clone(), file)?;
+    merge_into(segments, &options.sort_key, writer)?.finish_file()
+}
+
+/// The schema all `segments` share.
+fn merge_schema(segments: &[Arc<Segment>]) -> Result<Arc<Schema>> {
     let first = segments.first().ok_or_else(|| Error::Invalid("nothing to merge".into()))?;
     let schema = first.schema().clone();
     if segments.iter().any(|s| {
@@ -289,9 +305,16 @@ pub fn merge(segments: &[Arc<Segment>], options: WriterOptions) -> Result<Vec<u8
     }) {
         return Err(Error::Type("segments to merge differ in schema".into()));
     }
-    let keys = options.sort_key.clone();
-    let all: Vec<usize> = (0..schema.len()).collect();
-    let mut writer = SegmentStreamWriter::new(schema, options)?;
+    Ok(schema)
+}
+
+fn merge_into(
+    segments: &[Arc<Segment>],
+    sort_key: &[usize],
+    mut writer: SegmentStreamWriter,
+) -> Result<SegmentStreamWriter> {
+    let keys = sort_key.to_vec();
+    let all: Vec<usize> = (0..segments.first().map_or(0, |s| s.schema().len())).collect();
     // Without a sort key the inputs are simply concatenated.
     if keys.is_empty() {
         for s in segments {
@@ -300,7 +323,7 @@ pub fn merge(segments: &[Arc<Segment>], options: WriterOptions) -> Result<Vec<u8
                 writer.write_batch(&s.read_row_group(g, &all)?)?;
             }
         }
-        return writer.finish();
+        return Ok(writer);
     }
     struct Input<'a> {
         segment: &'a Segment,
@@ -385,7 +408,7 @@ pub fn merge(segments: &[Arc<Segment>], options: WriterOptions) -> Result<Vec<u8
             live.retain(|&i| i != best);
         }
     }
-    writer.finish()
+    Ok(writer)
 }
 
 /// Compares two rows by the key columns, NULLs last.

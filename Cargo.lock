@@ -2555,6 +2555,7 @@ dependencies = [
  "crc32c",
  "lz4_flex",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
