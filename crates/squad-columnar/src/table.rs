@@ -184,7 +184,7 @@ impl Manifest {
 
     /// Segments to merge, by size tier: segments below half of
     /// `target_rows` and half of `max_bytes` are grouped by size (a tier
-    /// spans a factor of [`MERGE_TIER_FACTOR`] in bytes), and the
+    /// spans a factor of 4 in bytes), and the
     /// smallest tier that holds at least `min_segments` segments is
     /// merged, its smallest segments first, within `target_rows`,
     /// `max_bytes` and `max_segments`.
@@ -219,7 +219,7 @@ impl Manifest {
 }
 
 /// Size ratio between neighbouring merge tiers.
-pub const MERGE_TIER_FACTOR: u64 = 4;
+pub(crate) const MERGE_TIER_FACTOR: u64 = 4;
 
 /// The merge tier of a segment of `bytes` bytes: tier `t > 0` holds sizes
 /// in `[4 KiB · 4^t, 4 KiB · 4^(t+1))`; tier 0 holds everything below
