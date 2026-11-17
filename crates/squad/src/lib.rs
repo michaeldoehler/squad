@@ -52,13 +52,13 @@ pub mod value;
 
 pub use api::{Config, Connection, Database, Row, RowIndex, Statement, Transaction};
 pub use bind::OutputColumn;
-pub use columnar::ColumnarConfig;
+pub use columnar::{ColumnarConfig, ColumnarMemory};
 pub use convert::{FromSql, ToSql};
 pub use error::{sqlstate, Error, Notice, Result, Severity};
 pub use replica::{ReplicaConfig, ReplicationRole, ReplicationStatus};
 pub use session::{CancelHandle, Login, QueryResult, Session, TxnStatus};
 pub use spill::{parse_work_mem, DEFAULT_WORK_MEM};
-pub use squad_storage::{RemoteConfig, RemoteStats, RemoteSync, SyncMode, VerifyReport};
+pub use squad_storage::{RemoteConfig, RemoteStats, RemoteSync, RestoreStats, SnapshotTrigger, SyncMode, VerifyReport};
 
 /// Object stores for [`Config::remote`]: local directories, memory and
 /// (with the `s3` feature) S3-compatible services.

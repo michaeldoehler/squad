@@ -92,6 +92,8 @@ ENVIRONMENT:
                               password for serve (with --user / SQUAD_USER) and
                               for ping
     SQUAD_USER                login name used with SQUAD_PASSWORD
+    SQUAD_LOG                 messages on stderr: off, error, warn, info
+                              (default) or debug
     AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_ENDPOINT_URL
                               S3 settings; each can also be read from the file
                               named by the variable with a _FILE suffix
@@ -142,7 +144,8 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         "--database",
         "--timeout",
     ];
-    const FLAGS: &[&str] = &["--memory", "--cleartext-password", "--remote-restore", "--trust", "--require-tls"];
+    const FLAGS: &[&str] =
+        &["--memory", "--cleartext-password", "--remote-restore", "--trust", "--require-tls", "--help", "-h"];
     let mut parsed = Args { positional: Vec::new(), options: HashMap::new(), flags: Vec::new() };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -466,6 +469,10 @@ fn hash_password() -> Result<(), String> {
 fn run(args: &[String]) -> Result<(), String> {
     let Some(command) = args.first() else { return Err(USAGE.to_string()) };
     let rest = parse_args(&args[1..])?;
+    if rest.flag("--help") || rest.flag("-h") {
+        print!("{USAGE}");
+        return Ok(());
+    }
     load_file_env()?;
     match command.as_str() {
         "--version" | "-V" | "version" => {
@@ -519,7 +526,46 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Writes the messages of squad's libraries (`log` crate) to stderr, one
+/// line each, at the level `SQUAD_LOG` names.
+struct StderrLog {
+    level: log::LevelFilter,
+}
+
+impl log::Log for StderrLog {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= self.level && metadata.target().starts_with("squad")
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            let level = record.level().as_str().to_ascii_lowercase();
+            let _ = writeln!(std::io::stderr(), "{level}: {}", record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_log() -> Result<(), String> {
+    let level = match std::env::var("SQUAD_LOG").ok().filter(|v| !v.is_empty()).as_deref() {
+        None => log::LevelFilter::Info,
+        Some(v) => {
+            v.parse().map_err(|_| format!("invalid SQUAD_LOG \"{v}\" (expected off, error, warn, info or debug)"))?
+        }
+    };
+    // Fails only if a logger is installed already.
+    if log::set_boxed_logger(Box::new(StderrLog { level })).is_ok() {
+        log::set_max_level(level);
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
+    if let Err(msg) = init_log() {
+        eprintln!("{msg}");
+        return ExitCode::FAILURE;
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,

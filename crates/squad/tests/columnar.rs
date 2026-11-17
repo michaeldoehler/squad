@@ -509,6 +509,8 @@ struct Counting {
     ranges: AtomicU64,
     bytes: AtomicU64,
     keys: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    puts: AtomicU64,
+    put_sizes: std::sync::Mutex<Vec<u64>>,
 }
 
 impl Counting {
@@ -519,6 +521,8 @@ impl Counting {
             ranges: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             keys: Default::default(),
+            puts: AtomicU64::new(0),
+            put_sizes: Default::default(),
         })
     }
     fn reset(&self) -> (u64, u64, u64, usize) {
@@ -537,6 +541,10 @@ impl Counting {
 
 impl squad::object::ObjectStore for Counting {
     fn put(&self, key: &str, data: &[u8]) -> squad::object::Result<()> {
+        if key.starts_with("columnar/") {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            self.put_sizes.lock().unwrap().push(data.len() as u64);
+        }
         self.inner.put(key, data)
     }
     fn get(&self, key: &str) -> squad::object::Result<Option<Vec<u8>>> {
@@ -937,4 +945,122 @@ fn databases_of_the_previous_format_are_read_and_upgraded() {
     let db = Database::open(dir.path(), Config { columnar: manual(), ..Config::default() }).unwrap();
     let conn = db.connect();
     expect(&conn, "reopened", 400);
+}
+
+fn remote_db(store: &Arc<Counting>, columnar: ColumnarConfig) -> Database {
+    let engine: Arc<dyn squad_storage::Engine> = Arc::new(squad_storage::MemEngine::new());
+    Database::with_engine_and_objects(engine, store.clone(), columnar).unwrap()
+}
+
+#[test]
+fn background_merges_do_not_rewrite_the_whole_table_each_time() {
+    // Many small compactions, as with steady ingest: every insert becomes
+    // a small segment, and merges combine them.
+    let store = Counting::new();
+    let config = ColumnarConfig {
+        compact_rows: 1,
+        compact_age: std::time::Duration::from_millis(1),
+        retire_grace: std::time::Duration::ZERO,
+        ..ColumnarConfig::default()
+    };
+    let db = remote_db(&store, config);
+    let conn = db.connect();
+    conn.batch_execute(
+        "CREATE TABLE e (ts bigint NOT NULL, project int NOT NULL, body text) USING columnar \
+         WITH (order_by = 'project, ts')",
+    )
+    .unwrap();
+    for i in 0..400 {
+        conn.execute(
+            "INSERT INTO e SELECT $1 * 100 + g, g % 3, repeat(md5(g::text), 8) FROM generate_series(1, 100) g",
+            &[&(i as i64)],
+        )
+        .unwrap();
+        assert!(db.wait_for_compaction(std::time::Duration::from_secs(30)));
+    }
+    let n: i64 = conn.query_one("SELECT count(*) FROM e", &[]).unwrap().get(0);
+    assert_eq!(n, 40_000);
+    let live = store.segment_bytes();
+    // Merging the whole table whenever eight small segments had gathered
+    // wrote a segment of about the size of the table every eighth
+    // insert; merging by size tier writes large segments rarely.
+    let sizes = store.put_sizes.lock().unwrap().clone();
+    let large = sizes.iter().filter(|&&n| n * 4 >= live).count();
+    assert!(large <= 4, "{large} of {} segment writes were a quarter of the table ({live} bytes) or more", sizes.len());
+}
+
+#[test]
+fn replaced_segments_stay_for_the_grace_period_in_a_remote_store() {
+    let store = Counting::new();
+    let grace = std::time::Duration::from_millis(1500);
+    let db = remote_db(&store, ColumnarConfig { retire_grace: grace, ..manual() });
+    let conn = db.connect();
+    conn.batch_execute("CREATE TABLE e (n int) USING columnar").unwrap();
+    for _ in 0..8 {
+        conn.execute("INSERT INTO e SELECT g FROM generate_series(1, 100) g", &[]).unwrap();
+        conn.batch_execute("VACUUM e").unwrap();
+    }
+    // The last VACUUM merged the segments into one; the replaced ones are
+    // still there for readers that follow with a delay.
+    let objects = || store.inner.list("columnar/").unwrap().len();
+    assert!(objects() > 1, "replaced segments were deleted at once");
+    let deadline = std::time::Instant::now() + grace * 4;
+    while objects() > 1 && std::time::Instant::now() < deadline {
+        thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(objects(), 1, "replaced segments are deleted after the grace period");
+    assert_eq!(conn.query_one("SELECT sum(n) FROM e", &[]).unwrap().get::<i64>(0), 8 * 5050);
+}
+
+#[test]
+fn caches_drop_deleted_segments_and_stay_within_their_limits() {
+    let store = Counting::new();
+    let cache = 8u64 << 20;
+    let db =
+        remote_db(&store, ColumnarConfig { cache_bytes: cache, retire_grace: std::time::Duration::ZERO, ..manual() });
+    let conn = db.connect();
+    conn.batch_execute("CREATE TABLE e (n int, body text) USING columnar").unwrap();
+    for round in 0..20 {
+        conn.execute("INSERT INTO e SELECT g, repeat(md5(g::text), 4) FROM generate_series(1, 2000) g", &[]).unwrap();
+        conn.batch_execute("VACUUM e").unwrap();
+        conn.query_one("SELECT count(*), max(body) FROM e", &[]).unwrap();
+        let m = db.columnar_memory();
+        assert!(m.chunk_bytes <= cache + (cache / 16), "round {round}: {m:?}");
+        assert!(m.segment_bytes <= 4 << 20, "round {round}: {m:?}");
+    }
+    // Deleting every row replaces every segment: what was cached of them
+    // is dropped.
+    conn.execute("DELETE FROM e", &[]).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while db.columnar_memory().retired_segments > 0 && std::time::Instant::now() < deadline {
+        thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let m = db.columnar_memory();
+    assert_eq!(m.retired_segments, 0);
+    assert_eq!(m.chunk_bytes, 0, "ranges of deleted segments are still cached: {m:?}");
+    assert_eq!(conn.query_one("SELECT count(*) FROM e", &[]).unwrap().get::<i64>(0), 0);
+    assert_eq!(m.segment_bytes, 0, "deleted segments are still open: {m:?}");
+}
+
+#[test]
+fn a_compaction_moves_at_most_compact_max_bytes() {
+    let store = Counting::new();
+    let db = remote_db(&store, ColumnarConfig { compact_max_bytes: 64 << 10, ..manual() });
+    let conn = db.connect();
+    conn.batch_execute("CREATE TABLE e (n int, body text) USING columnar").unwrap();
+    // About 420 KB in 40 blocks.
+    for i in 0..40 {
+        conn.execute(
+            "INSERT INTO e SELECT $1 * 100 + g, repeat(md5(g::text), 10) FROM generate_series(1, 32) g",
+            &[&i],
+        )
+        .unwrap();
+    }
+    conn.batch_execute("VACUUM e").unwrap();
+    let n: i64 = conn.query_one("SELECT count(*) FROM e", &[]).unwrap().get(0);
+    assert_eq!(n, 1280);
+    // Without the limit one step would have moved all 40 blocks into one
+    // segment (one object written, nothing to merge).
+    let puts = store.puts.load(Ordering::SeqCst);
+    assert!(puts >= 5, "{puts} segment objects written");
 }

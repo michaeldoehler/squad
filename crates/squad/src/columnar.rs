@@ -69,6 +69,12 @@ pub struct ColumnarConfig {
     /// Rows in the delta older than this are compacted even if the other
     /// thresholds are not reached.
     pub compact_age: Duration,
+    /// Most bytes (decoded) one compaction moves out of a table's delta;
+    /// the rest follows in further runs. Rows of wide tables (JSON
+    /// documents, long text) reach this long before the row limit of a
+    /// run (262,144 rows). Bounds the memory of a compaction: it holds
+    /// these rows plus about two row groups.
+    pub compact_max_bytes: u64,
     /// Upper bound of the size of a segment produced by merging smaller
     /// ones; also bounds the memory a merge needs for its output.
     pub merge_max_bytes: u64,
@@ -76,6 +82,12 @@ pub struct ColumnarConfig {
     /// they are older than this, in case a writer that is not this
     /// process is still about to commit them.
     pub orphan_grace: Duration,
+    /// When segments live in a remote object store, a segment that a
+    /// compaction or `DELETE` replaced is deleted only after this much
+    /// time, so that read replicas, which follow the writer with a delay,
+    /// can finish reading it. Local stores delete as soon as no snapshot
+    /// of this process reads it.
+    pub retire_grace: Duration,
 }
 
 impl Default for ColumnarConfig {
@@ -86,8 +98,10 @@ impl Default for ColumnarConfig {
             compact_rows: 65_536,
             compact_blocks: 512,
             compact_age: Duration::from_secs(10),
+            compact_max_bytes: 64 << 20,
             merge_max_bytes: 256 << 20,
             orphan_grace: Duration::from_secs(3600),
+            retire_grace: Duration::from_secs(600),
         }
     }
 }
@@ -557,9 +571,28 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> Lru<K, V> {
             self.bytes -= n;
         }
     }
+
+    /// Drops every entry whose key fails `keep`.
+    fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
+        let gone: Vec<K> = self.map.keys().filter(|k| !keep(k)).cloned().collect();
+        for k in gone {
+            self.remove(&k);
+        }
+    }
+
+    /// Bytes held.
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
 }
 
 const CACHE_SHARDS: usize = 16;
+
+/// Memory for opened segments (their footers: row group directory and
+/// statistics), a sixteenth of the cache, at least 4 MiB.
+fn segment_cache_bytes(cache_bytes: u64) -> u64 {
+    (cache_bytes / 16).max(4 << 20)
+}
 
 type ChunkKey = (Arc<str>, u64);
 
@@ -683,6 +716,69 @@ fn io_error(key: &str, e: squad_object::Error) -> std::io::Error {
     }
 }
 
+/// Fetches one span of ranges of a segment object into the cache.
+fn fetch_span(store: &Arc<dyn squad_object::ObjectStore>, key: &Arc<str>, cache: &ChunkCache, span: &Span) {
+    let (start, end, parts) = span;
+    // Ranges another reader is already fetching are left to it.
+    let claimed: Vec<((u64, u64), Arc<Flight>)> =
+        parts.iter().filter_map(|p| cache.claim(&(key.clone(), p.0)).map(|f| (*p, f))).collect();
+    let (Some(first), Some(last)) = (claimed.first(), claimed.last()) else { return };
+    let (start, end) = (first.0 .0, (last.0 .0 + last.0 .1).min(*end).max(*start));
+    let data = store.get_range(key, start, end - start);
+    for ((o, l), flight) in &claimed {
+        let k = (key.clone(), *o);
+        let result = match &data {
+            Ok(data) => {
+                let at = (o - start) as usize;
+                Ok(Arc::new(data[at..at + *l as usize].to_vec()))
+            }
+            Err(e) => Err(std::io::Error::other(e.to_string())),
+        };
+        cache.complete(&k, flight, &result);
+    }
+}
+
+/// Threads that fetch segment ranges ahead for all databases of the
+/// process. A fixed set instead of new threads per read keeps the
+/// number of threads (and of allocator arenas) constant.
+struct FetchPool {
+    jobs: Mutex<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>>,
+}
+
+const FETCH_THREADS: usize = 8;
+
+impl FetchPool {
+    fn run(&self, job: Box<dyn FnOnce() + Send>) {
+        if let Err(e) = self.jobs.lock().send(job) {
+            // The threads are gone (cannot happen while the process
+            // runs); do the work here.
+            (e.0)();
+        }
+    }
+}
+
+fn fetch_pool() -> &'static FetchPool {
+    static POOL: std::sync::OnceLock<FetchPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..FETCH_THREADS {
+            let rx = rx.clone();
+            std::thread::Builder::new()
+                .name(format!("squad-fetch-{i}"))
+                .spawn(move || loop {
+                    let job = rx.lock().recv();
+                    match job {
+                        Ok(job) => job(),
+                        Err(_) => return,
+                    }
+                })
+                .expect("spawn fetch thread");
+        }
+        FetchPool { jobs: Mutex::new(tx) }
+    })
+}
+
 impl cs::ChunkSource for ObjectSource {
     fn len(&self) -> u64 {
         self.len
@@ -734,40 +830,52 @@ impl cs::ChunkSource for ObjectSource {
                 _ => spans.push((o, o + l, vec![(o, l)])),
             }
         }
-        let fetch = |(start, end, parts): &Span| {
-            // Ranges another reader is already fetching are left to it.
-            let claimed: Vec<((u64, u64), Arc<Flight>)> =
-                parts.iter().filter_map(|p| self.cache.claim(&(self.key.clone(), p.0)).map(|f| (*p, f))).collect();
-            let (Some(first), Some(last)) = (claimed.first(), claimed.last()) else { return };
-            let (start, end) = (first.0 .0, (last.0 .0 + last.0 .1).min(*end).max(*start));
-            let data = self.store.get_range(&self.key, start, end - start);
-            for ((o, l), flight) in &claimed {
-                let key = (self.key.clone(), *o);
-                let result = match &data {
-                    Ok(data) => {
-                        let at = (o - start) as usize;
-                        Ok(Arc::new(data[at..at + *l as usize].to_vec()))
-                    }
-                    Err(e) => Err(std::io::Error::other(e.to_string())),
-                };
-                self.cache.complete(&key, flight, &result);
-            }
-        };
         if spans.len() == 1 {
-            fetch(&spans[0]);
+            fetch_span(&self.store, &self.key, &self.cache, &spans[0]);
             return;
         }
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..spans.len().min(8) {
-                scope.spawn(|| loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(span) = spans.get(i) else { break };
-                    fetch(span);
-                });
-            }
-        });
+        // Separate requests run on the shared fetch threads; this reader
+        // waits until all of them are done.
+        let left = Arc::new((Mutex::new(spans.len()), Condvar::new()));
+        for span in spans {
+            let (store, key, cache, left) = (self.store.clone(), self.key.clone(), self.cache.clone(), left.clone());
+            fetch_pool().run(Box::new(move || {
+                // Counts the span as done even if the fetch panics.
+                struct Done(Arc<(Mutex<usize>, Condvar)>);
+                impl Drop for Done {
+                    fn drop(&mut self) {
+                        let (n, cv) = &*self.0;
+                        let mut n = n.lock();
+                        *n -= 1;
+                        if *n == 0 {
+                            cv.notify_all();
+                        }
+                    }
+                }
+                let _done = Done(left);
+                fetch_span(&store, &key, &cache, &span);
+            }));
+        }
+        let (n, cv) = &*left;
+        let mut n = n.lock();
+        while *n > 0 {
+            cv.wait(&mut n);
+        }
     }
+}
+
+/// Memory held by the caches of columnar tables, from
+/// [`Database::columnar_memory`](crate::Database::columnar_memory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnarMemory {
+    /// Opened segments: footers, row group directories and statistics.
+    pub segment_bytes: u64,
+    /// Ranges of segment objects (column chunks, footers, blooms).
+    pub chunk_bytes: u64,
+    /// Decoded delta blocks.
+    pub block_bytes: u64,
+    /// Replaced segment objects waiting to be deleted.
+    pub retired_segments: usize,
 }
 
 /// Columnar state shared by all sessions of a database.
@@ -781,7 +889,7 @@ pub(crate) struct ColumnarState {
     blocks: Mutex<Lru<(u32, u64), Arc<cs::Batch>>>,
     /// Replaced segment objects waiting for old snapshots to end, with
     /// the timestamp of the commit that replaced them.
-    retired: Mutex<Vec<(u64, String)>>,
+    retired: Mutex<Vec<(u64, Instant, String)>>,
     retired_count: std::sync::atomic::AtomicUsize,
     /// Segment objects written by transactions that have not ended yet.
     pending: Mutex<HashMap<String, usize>>,
@@ -802,7 +910,7 @@ impl ColumnarState {
         let bytes = config.cache_bytes;
         ColumnarState {
             chunks: Mutex::new(Arc::new(ChunkCache::new(bytes))),
-            segments: Mutex::new(Lru::new(4096)),
+            segments: Mutex::new(Lru::new(segment_cache_bytes(bytes))),
             blocks: Mutex::new(Lru::new((bytes / 4).max(16 << 20))),
             retired: Mutex::new(Vec::new()),
             retired_count: Default::default(),
@@ -818,6 +926,7 @@ impl ColumnarState {
         let bytes = config.cache_bytes;
         *self.chunks.lock() = Arc::new(ChunkCache::new(bytes));
         *self.blocks.lock() = Lru::new((bytes / 4).max(16 << 20));
+        *self.segments.lock() = Lru::new(segment_cache_bytes(bytes));
         *self.config.lock() = config;
     }
 
@@ -841,9 +950,14 @@ impl ColumnarState {
     /// deleted by [`sweep`](ColumnarState::sweep) once no snapshot can
     /// still read a manifest that names them.
     pub(crate) fn retire(&self, ts: u64, keys: Vec<String>) {
+        let now = Instant::now();
         let mut retired = self.retired.lock();
-        retired.extend(keys.into_iter().map(|k| (ts, k)));
+        retired.extend(keys.into_iter().map(|k| (ts, now, k)));
         self.retired_count.store(retired.len(), Ordering::Release);
+        drop(retired);
+        // The compactor's thread deletes them once their grace ends.
+        let _state = self.compactor.state.lock();
+        self.compactor.wake.notify_one();
     }
 
     /// True if segment objects wait to be deleted.
@@ -852,20 +966,57 @@ impl ColumnarState {
     }
 
     /// Deletes retired segment objects that no snapshot at or after
-    /// `horizon` can name.
+    /// `horizon` can name (and, in a remote store, that were retired at
+    /// least `retire_grace` ago), and drops them from the caches.
     pub(crate) fn sweep(&self, horizon: u64, store: &dyn squad_object::ObjectStore) {
+        let grace = if self.remote.load(Ordering::Relaxed) { self.config.lock().retire_grace } else { Duration::ZERO };
         let due: Vec<String> = {
             let mut retired = self.retired.lock();
             if retired.is_empty() {
                 return;
             }
-            let (due, keep): (Vec<_>, Vec<_>) = retired.drain(..).partition(|(ts, _)| *ts <= horizon);
+            let (due, keep): (Vec<_>, Vec<_>) =
+                retired.drain(..).partition(|(ts, at, _)| *ts <= horizon && at.elapsed() >= grace);
             *retired = keep;
             self.retired_count.store(retired.len(), Ordering::Release);
-            due.into_iter().map(|(_, k)| k).collect()
+            due.into_iter().map(|(_, _, k)| k).collect()
         };
-        for key in due {
-            let _ = store.delete(&key);
+        if due.is_empty() {
+            return;
+        }
+        for key in &due {
+            let _ = store.delete(key);
+        }
+        self.forget(&due);
+    }
+
+    /// When the oldest retired object becomes deletable by age; `None` if
+    /// nothing is retired.
+    pub(crate) fn next_sweep(&self) -> Option<Duration> {
+        let grace = if self.remote.load(Ordering::Relaxed) { self.config.lock().retire_grace } else { Duration::ZERO };
+        self.retired.lock().iter().map(|(_, at, _)| grace.saturating_sub(at.elapsed())).min()
+    }
+
+    /// Drops deleted segment objects from the segment and chunk caches,
+    /// so that their memory is free at once instead of when the caches
+    /// would evict them.
+    fn forget(&self, keys: &[String]) {
+        let gone: HashSet<&str> = keys.iter().map(String::as_str).collect();
+        self.segments.lock().retain(|(k, _)| !gone.contains(&**k));
+        let chunks = self.chunks.lock().clone();
+        for shard in &chunks.shards {
+            shard.lock().retain(|(k, _)| !gone.contains(&**k));
+        }
+    }
+
+    /// Memory held by the caches of columnar tables.
+    pub(crate) fn memory(&self) -> ColumnarMemory {
+        let chunks = self.chunks.lock().clone();
+        ColumnarMemory {
+            segment_bytes: self.segments.lock().bytes(),
+            chunk_bytes: chunks.shards.iter().map(|s| s.lock().bytes()).sum(),
+            block_bytes: self.blocks.lock().bytes(),
+            retired_segments: self.retired_count.load(Ordering::Acquire),
         }
     }
 
@@ -912,7 +1063,7 @@ impl ColumnarState {
                     cache: self.chunks.lock().clone(),
                 };
                 let seg = Arc::new(cs::Segment::open(Arc::new(source))?);
-                self.segments.lock().insert((key.clone(), 0), seg.clone(), 1);
+                self.segments.lock().insert((key.clone(), 0), seg.clone(), seg.memory_bytes());
                 seg
             }
         };
@@ -926,7 +1077,8 @@ impl ColumnarState {
                     return Ok(s);
                 }
                 let projected = Arc::new(raw.project(layout.schema.clone(), &map)?);
-                self.segments.lock().insert((key, sig), projected.clone(), 1);
+                let size = projected.memory_bytes();
+                self.segments.lock().insert((key, sig), projected.clone(), size);
                 Ok(projected)
             }
         }
@@ -1002,10 +1154,18 @@ struct DeltaPart {
 }
 
 /// Reads the delta: rows stored one per key by older versions, then the
-/// blocks, oldest first, until `max_rows` rows are collected.
-fn read_delta(table: &Table, layout: &Layout, max_rows: usize, cx: &mut ExecCx) -> Result<Vec<DeltaPart>> {
+/// blocks, oldest first, until `max_rows` rows or `max_bytes` bytes are
+/// collected (at least one block is always taken).
+fn read_delta(
+    table: &Table,
+    layout: &Layout,
+    max_rows: usize,
+    max_bytes: u64,
+    cx: &mut ExecCx,
+) -> Result<Vec<DeltaPart>> {
     let mut parts = Vec::new();
     let mut rows = 0usize;
+    let mut bytes = 0u64;
     // Rows of the old format: keys `prefix 0|1 …`.
     let (lo, hi) = delta_range(table.id, 0, BLOCK_TAG);
     let mut cursor = Cursor::new(cx.txn, lo, hi, false).with_chunk(64);
@@ -1022,7 +1182,7 @@ fn read_delta(table: &Table, layout: &Layout, max_rows: usize, cx: &mut ExecCx) 
     }
     let (lo, hi) = delta_range(table.id, BLOCK_TAG, BLOCK_TAG + 1);
     let mut cursor = Cursor::new(cx.txn, lo, hi, false).with_chunk(16);
-    while rows < max_rows {
+    while rows < max_rows && bytes < max_bytes {
         let Some((k, v)) = cursor.next(cx.txn)? else { break };
         let id = block_id(&k).ok_or_else(|| Error::new(sqlstate::DATA_CORRUPTED, "malformed delta block key"))?;
         let cache_key = (table.id, id);
@@ -1036,6 +1196,7 @@ fn read_delta(table: &Table, layout: &Layout, max_rows: usize, cx: &mut ExecCx) 
             }
         };
         rows += raw.num_rows();
+        bytes += batch_bytes(&raw);
         parts.push(DeltaPart { block: Some(id), row_keys: Vec::new(), batch: layout.adopt(&raw)? });
     }
     Ok(parts)
@@ -1290,7 +1451,7 @@ impl<'p> ColumnarScan<'p> {
             None => (None, None),
         };
         let mut parts: Vec<Part> =
-            read_delta(table, &layout, usize::MAX, cx)?.into_iter().map(|d| Part::Delta(d.batch)).collect();
+            read_delta(table, &layout, usize::MAX, u64::MAX, cx)?.into_iter().map(|d| Part::Delta(d.batch)).collect();
         // Whole segments that cannot match are not even opened.
         parts.extend(open_segments(table, &layout, &manifest, prune.as_ref(), cx)?.into_iter().map(Part::Segment));
         let projection = (0..layout.schema.len()).collect();
@@ -1505,7 +1666,7 @@ pub(crate) fn aggregate(
     let mut source = cs::TableSource::new(layout.schema.clone());
     // Segments the manifest's statistics rule out are not opened.
     source.segments = open_segments(table, &layout, &manifest, filter.as_ref(), cx)?;
-    source.delta = read_delta(table, &layout, usize::MAX, cx)?.into_iter().map(|d| d.batch).collect();
+    source.delta = read_delta(table, &layout, usize::MAX, u64::MAX, cx)?.into_iter().map(|d| d.batch).collect();
     let request = cs::AggregateRequest {
         predicate: filter,
         group_by: keys,
@@ -1638,12 +1799,12 @@ fn add_segment(
     table: &Table,
     layout: &Layout,
     manifest: &mut cs::Manifest,
-    batches: &[&cs::Batch],
+    batches: Vec<Arc<cs::Batch>>,
     cx: &mut ExecCx,
 ) -> Result<()> {
     let mut writer = cs::SegmentWriter::new(layout.schema.clone(), writer_options(table));
     for b in batches {
-        writer.write_batch(b)?;
+        writer.write_shared(b)?;
     }
     store_segment(table, layout, manifest, writer.finish()?, cx)
 }
@@ -1704,7 +1865,7 @@ pub(crate) fn bulk_insert(table: &Table, rows: &[Row], cx: &mut ExecCx) -> Resul
     let mut manifest = lock_segments(table, cx)?;
     for chunk in rows.chunks(BULK_SEGMENT_ROWS) {
         let batch = rows_to_batch(table, layout.schema.clone(), chunk, cx)?;
-        add_segment(table, &layout, &mut manifest, &[&batch], cx)?;
+        add_segment(table, &layout, &mut manifest, vec![Arc::new(batch)], cx)?;
     }
     save_manifest(table, &manifest, cx)
 }
@@ -1717,13 +1878,19 @@ pub(crate) fn compact_delta(table: &Arc<Table>, cx: &mut ExecCx) -> Result<u64> 
     let mut manifest = lock_segments(table, cx)?;
     // With the lock held, the refreshed snapshot shows exactly the delta
     // that no earlier compaction has moved.
-    let parts = read_delta(table, &layout, COMPACT_MAX_ROWS, cx)?;
+    let max_bytes = cx.shared.columnar.config().compact_max_bytes.max(1);
+    let parts = read_delta(table, &layout, COMPACT_MAX_ROWS, max_bytes, cx)?;
     let rows: usize = parts.iter().map(|p| p.batch.num_rows()).sum();
     if rows == 0 {
         return Ok(0);
     }
-    let batches: Vec<&cs::Batch> = parts.iter().map(|p| &*p.batch).collect();
-    add_segment(table, &layout, &mut manifest, &batches, cx)?;
+    // A run that stopped at a limit leaves rows behind: run again soon.
+    let bytes: u64 = parts.iter().map(|p| batch_bytes(&p.batch)).sum();
+    if rows >= COMPACT_MAX_ROWS || bytes >= max_bytes {
+        cx.shared.columnar.compactor.mark_due(table.id);
+    }
+    let batches: Vec<Arc<cs::Batch>> = parts.iter().map(|p| p.batch.clone()).collect();
+    add_segment(table, &layout, &mut manifest, batches, cx)?;
     for p in &parts {
         match p.block {
             Some(id) => cx.txn.delete_blind(&block_key(table.id, id))?,
@@ -1809,7 +1976,7 @@ pub(crate) fn delete(plan: &ScanPlan, cx: &mut ExecCx) -> Result<u64> {
     };
     let mut count = 0u64;
     let block_schema = layout.block_schema();
-    for part in read_delta(table, &layout, usize::MAX, cx)? {
+    for part in read_delta(table, &layout, usize::MAX, u64::MAX, cx)? {
         let hits = matching(&part.batch, cx)?;
         let n = hits.iter().filter(|h| **h).count();
         if n == 0 {
@@ -1982,7 +2149,7 @@ pub(crate) fn remove_orphans(shared: &crate::session::Shared, tables: Option<&[u
         }
     }
     drop(txn);
-    let retired: HashSet<String> = state.retired.lock().iter().map(|(_, k)| k.clone()).collect();
+    let retired: HashSet<String> = state.retired.lock().iter().map(|(_, _, k)| k.clone()).collect();
     let now = std::time::SystemTime::now();
     let mut removed = 0;
     for meta in listed {
@@ -2144,6 +2311,9 @@ fn run_compactor(shared: Arc<crate::session::Shared>) {
         if compactor.stopping() {
             return;
         }
+        if shared.columnar.has_retired() {
+            shared.columnar.sweep(shared.store.oldest_snapshot(), &*shared.objects());
+        }
         let config = shared.columnar.config();
         // Pick the due tables, or sleep until the oldest delta is due.
         let due: Vec<u32> = {
@@ -2168,6 +2338,13 @@ fn run_compactor(shared: Arc<crate::session::Shared>) {
                     .map(|s| (s.since + config.compact_age).saturating_duration_since(now))
                     .min()
                     .unwrap_or(Duration::from_secs(3600));
+                // Retired segments become deletable when their grace ends.
+                let next = match shared.columnar.next_sweep() {
+                    // At most once a second while an old snapshot holds
+                    // them back.
+                    Some(at) => next.min(at.max(Duration::from_secs(1))),
+                    None => next,
+                };
                 if !compactor.stopping() {
                     let _ = compactor.wake.wait_for(&mut state, next.max(Duration::from_millis(5)));
                 }

@@ -269,8 +269,50 @@ preparing it for production use.
   credentials.
 - The example `analytics_bench` of `squad-columnar` is now
   `engine_bench`, so that example names are unique in the workspace.
+- **Remote snapshots are taken often enough to keep restores short.**
+  The log since the newest snapshot used to be counted in memory from
+  zero at every start, so a writer restarted every few hours never
+  reached `snapshot_wal_bytes` and a restore had to replay tens of
+  thousands of log objects. A writer now counts the log after the newest
+  snapshot from the store when it opens, and takes a snapshot also after
+  `RemoteConfig::snapshot_wal_objects` log objects (default 2000) and
+  `RemoteConfig::snapshot_interval` (default 15 minutes, if there is new
+  log); after a restore at open that replayed more than the thresholds
+  it takes one in the background. `RemoteStats` reports the log since
+  the newest snapshot, the trigger of the last snapshot and what the
+  restore at open did (`RestoreStats`).
+- **Restores fetch in parallel.** Snapshot chunks and log objects are
+  downloaded with up to `RemoteConfig::restore_concurrency` requests at
+  a time (default 16; `ReplicaConfig::restore_concurrency`), chunks are
+  verified on the fetching threads, and log objects are applied strictly
+  in order; replicas prefetch new log objects the same way. Against a
+  store with 2 ms per request, a restore of 6 chunks and 300 log objects
+  went from 668 ms to 59 ms. `restore_from_with` takes the concurrency
+  and returns `RestoreStats`.
+- Restores and snapshots report progress and results through the `log`
+  crate (level info): start, every 5 seconds, end; `squad` writes these
+  messages to stderr, filtered by `SQUAD_LOG`.
 
 ### Fixed
+
+- **Columnar tables no longer rewrite whole tables over and over.** Small
+  segments were merged smallest first, and every segment under 2 million
+  rows counted as small, so whenever eight new small segments had gathered
+  (about every 100 s with steady inserts) the whole table was merged into
+  one new segment again. Merges now combine segments of similar size
+  (tiers of a factor of 4), so each row is rewritten about once per tier.
+- **Memory of columnar tables is bounded.** The cache of opened segments
+  was bounded by count (4096 segments), not bytes; it is now a sixteenth
+  of `cache_bytes`. Deleted segments are dropped from the caches at once.
+  A compaction moves at most `compact_max_bytes` (new, default 64 MiB) of
+  decoded rows per run and sorts them without copying them into one batch
+  first. Parallel range reads use a fixed set of 8 threads per process
+  instead of new threads per read. `Database::columnar_memory()` (new)
+  reports what the caches hold.
+- **Read replicas no longer lose segments right after a compaction.**
+  With segments in a remote object store, replaced segment objects are
+  deleted only after `ColumnarConfig::retire_grace` (new, default 10
+  minutes).
 - `pg_index.indkey` and `indoption` were `smallint[]` (`'{1,2,4}'`)
   instead of `int2vector` (`'1 2 4'`); SQLAlchemy failed to parse them.
 - `pg_stat_activity` showed only the calling session, and
@@ -280,6 +322,8 @@ preparing it for production use.
   `integer` and `bigint`, and the advisory lock functions `bigint` (one
   argument) or `integer` (two), as in PostgreSQL; drivers that send
   binary parameters (tokio-postgres) failed with a type mismatch.
+- `squad serve --help` (and `--help`/`-h` after any subcommand) failed
+  with `unknown option --help`; it now prints the usage.
 
 - Damage in the middle of the write-ahead log (a record that later
   records show was already durable) made recovery drop every later

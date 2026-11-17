@@ -322,26 +322,15 @@ impl Default for WriterOptions {
 }
 
 /// Collects batches and writes them as one segment.
+///
+/// Batches are kept as they are given (shared, not copied). `finish`
+/// sorts by the sort key without concatenating them first: it computes
+/// the order over all batches and then gathers one row group at a time,
+/// so it needs the batches plus about two row groups of memory.
 pub struct SegmentWriter {
     schema: Arc<Schema>,
     options: WriterOptions,
-    batches: Vec<Batch>,
-}
-
-fn cmp_cell(col: &Column, a: usize, b: usize) -> Ordering {
-    match (col.is_null(a), col.is_null(b)) {
-        (true, true) => return Ordering::Equal,
-        (true, false) => return Ordering::Greater,
-        (false, true) => return Ordering::Less,
-        _ => {}
-    }
-    match &col.data {
-        ColumnData::Bool(v) => v[a].cmp(&v[b]),
-        ColumnData::Int64(v) => v[a].cmp(&v[b]),
-        ColumnData::Float64(v) => cmp_f64(v[a], v[b]),
-        ColumnData::Decimal(v) => v[a].cmp(&v[b]),
-        ColumnData::Bytes(v) => v.get(a).cmp(v.get(b)),
-    }
+    batches: Vec<Arc<Batch>>,
 }
 
 impl SegmentWriter {
@@ -349,19 +338,32 @@ impl SegmentWriter {
         SegmentWriter { schema, options, batches: Vec::new() }
     }
 
-    pub fn write_batch(&mut self, batch: &Batch) -> Result<()> {
+    fn check(&self, batch: &Batch) -> Result<()> {
         if batch.schema.columns.len() != self.schema.columns.len()
             || batch.schema.columns.iter().zip(&self.schema.columns).any(|(a, b)| a.ty != b.ty)
         {
             return Err(Error::Type("batch schema does not match the segment schema".into()));
         }
-        self.batches.push(batch.clone());
+        Ok(())
+    }
+
+    /// Adds a copy of `batch`.
+    pub fn write_batch(&mut self, batch: &Batch) -> Result<()> {
+        self.check(batch)?;
+        self.batches.push(Arc::new(batch.clone()));
+        Ok(())
+    }
+
+    /// Adds a batch without copying it.
+    pub fn write_shared(&mut self, batch: Arc<Batch>) -> Result<()> {
+        self.check(&batch)?;
+        self.batches.push(batch);
         Ok(())
     }
 
     /// Rows buffered so far.
     pub fn num_rows(&self) -> usize {
-        self.batches.iter().map(Batch::num_rows).sum()
+        self.batches.iter().map(|b| b.num_rows()).sum()
     }
 
     /// Encodes everything written and returns the segment's bytes.
@@ -370,64 +372,118 @@ impl SegmentWriter {
         if options.sort_key.iter().any(|c| *c >= schema.len()) {
             return Err(Error::Invalid("sort key names a column that does not exist".into()));
         }
-        let mut all = if batches.len() == 1 {
-            batches.into_iter().next().unwrap()
-        } else {
-            Batch::concat(schema.clone(), &batches)
-        };
-        let rows = all.num_rows();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         if rows > u32::MAX as usize {
             return Err(Error::Invalid("a segment holds at most 2^32 - 1 rows".into()));
         }
-        if !options.sort_key.is_empty() && rows > 1 {
-            let keys: Vec<&Column> = options.sort_key.iter().map(|&c| &all.columns[c]).collect();
-            let ints: Vec<&Vec<i64>> = keys
-                .iter()
-                .filter_map(|k| match (&k.data, &k.validity) {
+        let group = options.row_group_rows.max(1);
+        let order = sort_order(&batches, &options.sort_key);
+        let mut out = SegmentStreamWriter::new(schema.clone(), options)?;
+        match order {
+            None => {
+                for b in &batches {
+                    out.write_batch(b)?;
+                }
+            }
+            Some(order) => {
+                for part in order.chunks(group) {
+                    out.write_batch(&gather(&schema, &batches, part))?;
+                }
+            }
+        }
+        out.finish()
+    }
+}
+
+/// The rows of `batches` (taken in sequence) ordered by `keys`, as
+/// (batch, row) pairs; `None` when they already are in that order. Ties
+/// keep the sequence order.
+fn sort_order(batches: &[Arc<Batch>], keys: &[usize]) -> Option<Vec<(u32, u32)>> {
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    if keys.is_empty() || rows < 2 {
+        return None;
+    }
+    let ints: Option<Vec<Vec<&Vec<i64>>>> = batches
+        .iter()
+        .map(|b| {
+            keys.iter()
+                .map(|&k| match (&b.columns[k].data, &b.columns[k].validity) {
                     (ColumnData::Int64(v), None) => Some(v),
                     _ => None,
                 })
-                .collect();
-            let order: Vec<u32> = if ints.len() == keys.len() && keys.len() <= 2 {
-                // The common case — integer ids and timestamps — sorts
-                // plain tuples instead of going through a comparator.
-                let second = ints.get(1);
-                let mut tuples: Vec<(i64, i64, u32)> =
-                    (0..rows).map(|r| (ints[0][r], second.map_or(0, |v| v[r]), r as u32)).collect();
-                tuples.sort_unstable();
-                tuples.into_iter().map(|t| t.2).collect()
-            } else {
-                let mut order: Vec<u32> = (0..rows as u32).collect();
-                order.sort_unstable_by(|&a, &b| {
-                    for k in &keys {
-                        let o = cmp_cell(k, a as usize, b as usize);
-                        if o != Ordering::Equal {
-                            return o;
-                        }
+                .collect()
+        })
+        .collect();
+    let order: Vec<(u32, u32)> = match ints {
+        // The common case — integer ids and timestamps — sorts plain
+        // tuples instead of going through a comparator.
+        Some(ints) if keys.len() <= 2 => {
+            let mut tuples: Vec<(i64, i64, u32, u32)> = Vec::with_capacity(rows);
+            for (bi, cols) in ints.iter().enumerate() {
+                let n = batches[bi].num_rows();
+                for r in 0..n {
+                    tuples.push((cols[0][r], cols.get(1).map_or(0, |v| v[r]), bi as u32, r as u32));
+                }
+            }
+            tuples.sort_unstable();
+            tuples.into_iter().map(|t| (t.2, t.3)).collect()
+        }
+        _ => {
+            let mut order: Vec<(u32, u32)> = Vec::with_capacity(rows);
+            for (bi, b) in batches.iter().enumerate() {
+                order.extend((0..b.num_rows() as u32).map(|r| (bi as u32, r)));
+            }
+            order.sort_unstable_by(|&(ba, ra), &(bb, rb)| {
+                for &k in keys {
+                    let o = crate::table::cmp_cells(
+                        &batches[ba as usize].columns[k],
+                        ra as usize,
+                        &batches[bb as usize].columns[k],
+                        rb as usize,
+                    );
+                    if o != Ordering::Equal {
+                        return o;
                     }
-                    a.cmp(&b)
-                });
-                order
-            };
-            if order.windows(2).any(|w| w[0] > w[1]) {
-                all = all.take(&order);
-            }
+                }
+                (ba, ra).cmp(&(bb, rb))
+            });
+            order
         }
+    };
+    if order.windows(2).all(|w| w[0] < w[1]) {
+        None
+    } else {
+        Some(order)
+    }
+}
 
-        let mut body = SegmentBody::new(schema, options);
-        let group_rows = body.options.row_group_rows.max(1);
-        let groups = rows.div_ceil(group_rows);
-        for g in 0..groups {
-            let (start, end) = (g * group_rows, ((g + 1) * group_rows).min(rows));
-            if groups == 1 {
-                body.write_group(&all.columns)?;
-            } else {
-                let indices: Vec<u32> = (start as u32..end as u32).collect();
-                let part: Vec<Column> = all.columns.iter().map(|c| c.take(&indices)).collect();
-                body.write_group(&part)?;
-            }
+/// The rows `part` names, in that order, as one batch.
+fn gather(schema: &Arc<Schema>, batches: &[Arc<Batch>], part: &[(u32, u32)]) -> Batch {
+    // Rows needed from each batch, in the order they appear in `part`.
+    let mut wanted: Vec<Vec<u32>> = vec![Vec::new(); batches.len()];
+    let mut slot: Vec<(u32, u32)> = Vec::with_capacity(part.len());
+    for &(b, r) in part {
+        slot.push((b, wanted[b as usize].len() as u32));
+        wanted[b as usize].push(r);
+    }
+    let mut pieces = Vec::new();
+    let mut offset = vec![0u32; batches.len()];
+    let mut at = 0u32;
+    for (b, rows) in wanted.iter().enumerate() {
+        if rows.is_empty() {
+            continue;
         }
-        body.finish()
+        offset[b] = at;
+        at += rows.len() as u32;
+        pieces.push(batches[b].take(rows));
+    }
+    let combined = if pieces.len() == 1 { pieces.pop().unwrap() } else { Batch::concat(schema.clone(), &pieces) };
+    drop(pieces);
+    let indices: Vec<u32> = slot.iter().map(|&(b, k)| offset[b as usize] + k).collect();
+    if indices.windows(2).all(|w| w[0] < w[1]) {
+        combined
+    } else {
+        combined.take(&indices)
     }
 }
 
@@ -660,6 +716,29 @@ fn io_err(e: io::Error) -> Error {
 }
 
 impl Segment {
+    /// Approximate memory the opened segment holds (its schema, row
+    /// group directory and statistics), not counting data read through
+    /// its source.
+    pub fn memory_bytes(&self) -> u64 {
+        fn datum(d: &Datum) -> u64 {
+            match d {
+                Datum::Bytes(b) => b.capacity() as u64,
+                _ => 0,
+            }
+        }
+        fn stats(s: &ColumnStats) -> u64 {
+            datum(&s.min) + datum(&s.max)
+        }
+        let mut n = std::mem::size_of::<Segment>() as u64;
+        n += self.schema.columns.iter().map(|f| (std::mem::size_of::<Field>() + f.name.len()) as u64).sum::<u64>();
+        n += self.stats.iter().map(|s| std::mem::size_of::<ColumnStats>() as u64 + stats(s)).sum::<u64>();
+        for g in &self.groups {
+            n += std::mem::size_of::<RowGroupMeta>() as u64;
+            n += g.columns.iter().map(|c| std::mem::size_of::<ChunkMeta>() as u64 + stats(&c.stats)).sum::<u64>();
+        }
+        n
+    }
+
     /// Opens a segment by reading and verifying its footer.
     pub fn open(source: Arc<dyn ChunkSource>) -> Result<Segment> {
         let len = source.len();

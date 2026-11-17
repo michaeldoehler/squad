@@ -268,8 +268,9 @@ let manifest = Manifest::from_bytes(&bytes)?;
 // Retention: segments whose newest row is older than the cutoff.
 let drop = manifest.expired(0, &Datum::Int(cutoff_micros));
 
-// Compaction: merge small segments into one sorted segment, streaming
-// (one decoded row group per input in memory).
+// Compaction: merge small segments of one size tier (a factor of 4 in
+// bytes) into one sorted segment, streaming (one decoded row group per
+// input in memory).
 let small = manifest.merge_candidates(4_000_000, 256 << 20, 32, 4);
 let merged: Vec<u8> = merge(&segments_to_merge, WriterOptions { sort_key: vec![1, 0], ..Default::default() })?;
 ```
