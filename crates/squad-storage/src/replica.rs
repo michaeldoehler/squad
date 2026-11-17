@@ -41,12 +41,14 @@ use squad_object::ObjectStore;
 
 use crate::disk::{DiskEngine, DiskOptions};
 use crate::remote::{
-    base_key, claim_epoch, dir_is_empty, encode_base, materialize_latest, max_claim, probe_conditional_writes,
-    read_marker, read_remote, read_remote_from, remote_err, superseded, wipe, write_marker, RemoteConfig, RemoteStats,
-    SnapshotState, TieredEngine, DATA_FILE, REPLICA_FILE,
+    apply_object, base_key, claim_epoch, dir_is_empty, encode_base, fetch_in_order, materialize_latest, max_claim,
+    probe_conditional_writes, read_marker, read_remote, read_remote_from, remote_err, superseded, wipe, write_marker,
+    Backlog, RemoteConfig, RemoteStats, SnapshotState, TieredEngine, WalObject, DATA_FILE, REPLICA_FILE,
 };
-use crate::wal;
 use crate::{Engine, EngineStats, Result, StorageError, VerifyReport, WriteBatch};
+
+/// How often a long catch-up reports its progress.
+const PROGRESS_EVERY: Duration = Duration::from_secs(5);
 
 /// Directory, inside the replica's own, into which a newer snapshot is
 /// downloaded before it replaces the local copy.
@@ -198,7 +200,7 @@ impl ReplicaEngine {
             Some(found) => found,
             None => {
                 wipe(&opts, dir)?;
-                let (disk, latest) = materialize_latest(&*store, dir, &opts)?;
+                let (disk, latest, _) = materialize_latest(&*store, dir, &opts, config.restore_concurrency)?;
                 let epoch = latest
                     .epoch_at(disk.last_lsn())
                     .ok_or_else(|| StorageError::Invalid("the object store holds no database to follow".into()))?;
@@ -288,61 +290,73 @@ impl ReplicaEngine {
             }
             _ => None,
         };
-        let mut waiting = false;
+        // The objects of a writer being replaced wait.
+        let objects: Vec<&WalObject> = state.wal.iter().take_while(|o| frozen != Some(o.epoch)).collect();
+        let mut complete = true;
         let mut applied = 0u64;
         let mut cursor = None;
         {
             let mode = self.mode.read();
             let Mode::Follower(disk) = &*mode else { return Ok(0) };
-            for object in &state.wal {
-                if frozen == Some(object.epoch) {
-                    waiting = true;
-                    break;
-                }
-                // Gone: the writer cleaned up meanwhile. The next round
-                // sees the new state.
-                let Some(bytes) = store.get(&object.key).map_err(remote_err)? else { break };
-                let mut off = 0;
-                while let Some((lsn, ops, next)) = wal::read_record(&bytes, off) {
-                    off = next;
-                    let have = disk.last_lsn();
-                    if lsn <= have || lsn > object.limit {
-                        continue;
+            let (started, mut reported) = (Instant::now(), Instant::now());
+            // Objects are fetched ahead, in parallel, and applied in order.
+            let result = fetch_in_order(
+                objects.len(),
+                self.config.restore_concurrency,
+                |i| store.get(&objects[i].key).map_err(remote_err),
+                |i, bytes| {
+                    let object = objects[i];
+                    // Gone: the writer cleaned up meanwhile. The next round
+                    // sees the new state.
+                    let Some(bytes) = bytes else {
+                        complete = false;
+                        return Ok(false);
+                    };
+                    applied += apply_object(
+                        &object.key,
+                        &bytes,
+                        object.limit,
+                        || disk.last_lsn(),
+                        |lsn, batch| {
+                            if object.epoch != apply.epoch {
+                                write_marker(&self.opts, &self.dir, object.epoch)?;
+                                apply.epoch = object.epoch;
+                                self.epoch.store(object.epoch, Ordering::Release);
+                            }
+                            let written = disk.write(hooks.prepare(batch))?;
+                            if written == lsn {
+                                self.applied_lsn.store(lsn, Ordering::Release);
+                                hooks.applied(lsn);
+                            }
+                            Ok(written)
+                        },
+                    )?;
+                    // Complete, and not cut short by a takeover.
+                    if disk.last_lsn() < object.limit {
+                        cursor = Some((object.epoch, object.key.clone()));
                     }
-                    if lsn != have + 1 {
-                        return Err(StorageError::Corruption(format!(
-                            "log object {} does not continue at LSN {}",
-                            object.key,
-                            have + 1
-                        )));
+                    if reported.elapsed() >= PROGRESS_EVERY {
+                        reported = Instant::now();
+                        log::info!(
+                            "replica: log applied to LSN {} of {} ({}/{} objects), {:.0} s",
+                            disk.last_lsn(),
+                            state.lsn,
+                            i + 1,
+                            objects.len(),
+                            started.elapsed().as_secs_f64()
+                        );
                     }
-                    if object.epoch != apply.epoch {
-                        write_marker(&self.opts, &self.dir, object.epoch)?;
-                        apply.epoch = object.epoch;
-                        self.epoch.store(object.epoch, Ordering::Release);
-                    }
-                    let batch =
-                        WriteBatch { ops: ops.iter().map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec))).collect() };
-                    let batch = hooks.prepare(batch);
-                    let written = disk.write(batch)?;
-                    if written != lsn {
-                        return Err(StorageError::Corruption(format!(
-                            "replay of {} produced LSN {written}, expected {lsn}",
-                            object.key
-                        )));
-                    }
-                    self.applied_lsn.store(lsn, Ordering::Release);
-                    hooks.applied(lsn);
-                    applied += 1;
-                }
-                if off != bytes.len() {
-                    return Err(StorageError::Corruption(format!("log object {} is damaged", object.key)));
-                }
-                // Complete, and not cut short by a takeover.
-                if disk.last_lsn() < object.limit {
-                    cursor = Some((object.epoch, object.key.clone()));
-                }
+                    Ok(true)
+                },
+            );
+            if applied > 0 && started.elapsed() >= PROGRESS_EVERY {
+                log::info!(
+                    "replica: applied {applied} records up to LSN {} in {:.1} s",
+                    disk.last_lsn(),
+                    started.elapsed().as_secs_f64()
+                );
             }
+            result?;
             if applied > 0 {
                 disk.sync(disk.last_lsn())?;
                 *self.last_apply.lock() = Some(Instant::now());
@@ -351,6 +365,7 @@ impl ReplicaEngine {
         if cursor.is_some() {
             apply.cursor = cursor;
         }
+        let waiting = complete && objects.len() < state.wal.len();
         self.waiting.store(waiting, Ordering::Release);
         Ok(applied)
     }
@@ -362,7 +377,8 @@ impl ReplicaEngine {
         let staging = self.dir.join(STAGING_DIR);
         vfs.create_dir_all(&staging)?;
         wipe(&self.opts, &staging)?;
-        let (staged, state) = materialize_latest(&*self.store, &staging, &self.opts)?;
+        let (staged, state, _) =
+            materialize_latest(&*self.store, &staging, &self.opts, self.config.restore_concurrency)?;
         let lsn = staged.last_lsn();
         let epoch = state
             .epoch_at(lsn)
@@ -460,7 +476,8 @@ impl ReplicaEngine {
         let Mode::Follower(disk) = std::mem::replace(&mut *mode, Mode::Closed) else { return Err(closed()) };
         let config = RemoteConfig { restore: false, ..self.config.clone() };
         let epoch = claim.epoch;
-        let tiered = TieredEngine::start(disk, &self.dir, self.opts.clone(), config, claim, snapshot, lsn)?;
+        let backlog = Backlog::of(&state);
+        let tiered = TieredEngine::start(disk, &self.dir, self.opts.clone(), config, claim, snapshot, lsn, backlog)?;
         tiered.set_conditional_writes(conditional_writes);
         *mode = Mode::Writer(tiered);
         self.epoch.store(epoch, Ordering::Release);

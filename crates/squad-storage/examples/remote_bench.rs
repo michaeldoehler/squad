@@ -1,5 +1,6 @@
 //! Measures what the remote copy costs: commit latency with synchronous
-//! shipping to an S3 endpoint, and the upload volume of snapshots.
+//! shipping to an S3 endpoint, the upload volume of snapshots, and the
+//! time a restore takes with one and with several requests at a time.
 //!
 //! ```text
 //! cargo run --release -p squad-storage --example remote_bench --features squad-object/test-util
@@ -14,7 +15,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use squad_object::{open_url, ObjectStore};
-use squad_storage::{DiskEngine, DiskOptions, Engine, RemoteConfig, RemoteSync, TieredEngine, WriteBatch};
+use squad_storage::{
+    restore_from_with, DiskEngine, DiskOptions, Engine, RemoteConfig, RemoteSync, TieredEngine, WriteBatch,
+    DEFAULT_RESTORE_CONCURRENCY,
+};
 
 fn batch(i: u64) -> WriteBatch {
     let mut b = WriteBatch::new();
@@ -130,4 +134,23 @@ fn main() {
         after.chunks_reused - full.chunks_reused,
         t.elapsed().as_secs_f64() * 1e3
     );
+
+    // Restore: that snapshot plus 1500 log objects (one per commit),
+    // with one request at a time and with the default of 16.
+    for i in 0..1500 {
+        let lsn = engine.write(batch(i)).unwrap();
+        engine.sync(lsn).unwrap();
+    }
+    println!();
+    for concurrency in [1, DEFAULT_RESTORE_CONCURRENCY] {
+        let target = dir.path().join(format!("restore-{concurrency}"));
+        let stats = restore_from_with(&*store, &target, DiskOptions::default(), concurrency).unwrap();
+        println!(
+            "restore with {concurrency:>2} requests at a time: {} chunks ({:.1} MiB), {} log objects, {:.2} s",
+            stats.chunks,
+            stats.chunk_bytes as f64 / 1048576.0,
+            stats.wal_objects,
+            stats.duration.as_secs_f64()
+        );
+    }
 }
