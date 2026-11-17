@@ -38,6 +38,8 @@ cheap to clone and safe to share between threads.
 | `checkpoint_wal_bytes` | 64 MiB | Log size that triggers an automatic checkpoint. |
 | `remote` | `None` | Keep a durable copy in an object store; see [cloud storage](cloud-storage.md). |
 | `columnar` | see below | Settings of columnar tables (`ColumnarConfig`). |
+| `work_mem` | 4 MiB | Default `work_mem` of sessions; see [memory for queries](#memory-for-queries-work_mem-and-temporary-files). |
+| `temp_dir` | `None` | Directory for temporary files; `None` means `tmp/` inside the database directory. |
 
 `ColumnarConfig` (see [analytics](analytics.md)):
 
@@ -287,6 +289,85 @@ handle:
   warning `PID … is not a PostgreSQL backend process`, as in PostgreSQL.
   Signalling the calling connection itself ends its own statement at
   once. Any connection may signal any other: there are no roles.
+
+## Memory for queries: `work_mem` and temporary files
+
+Sorting, hash aggregation, `DISTINCT`, hash joins, `INTERSECT`/`EXCEPT`,
+window functions and materialized CTEs buffer rows. Each such operator
+keeps its buffers below the session's `work_mem`, as in PostgreSQL, and
+writes what does not fit to temporary files:
+
+| Operator | Beyond `work_mem` |
+| --- | --- |
+| `ORDER BY`, the sorts of window functions | external merge sort: sorted runs of at most `work_mem` go to temporary files and are merged |
+| `GROUP BY` (hash aggregation) | rows of new groups go to 16 partitions on disk by a hash of the group key; if the states of the groups in memory keep growing, they are written out too; each partition is aggregated the same way afterwards, split again where needed |
+| `DISTINCT`, `UNION` | rows of keys not seen yet go to partitions on disk, which are deduplicated one by one |
+| hash join | both sides are split into partitions by the join key on disk and joined pair by pair (grace hash join) |
+| `INTERSECT`, `EXCEPT` | the table of right-side keys and the remaining left rows go to partitions by key |
+| window functions | the input goes to a temporary file, is sorted per window, computed one partition at a time, and sorted back into its order |
+| CTEs, the inner side of nested-loop joins | kept in a temporary file and read from there |
+| `IN`, `ANY`, `ALL` subqueries evaluated as a set | the rows are kept in a temporary file and scanned for each probe instead of hashed, like PostgreSQL's plain subplan |
+
+Hash tables may use twice `work_mem` before they spill, like
+PostgreSQL's default `hash_mem_multiplier` of 2. Memory is estimated
+from the size of the values held, not measured, so actual use can be
+somewhat above the setting.
+
+The default is 4 MB, PostgreSQL's default. Sessions change it with
+`SET work_mem = '64MB'` (units `B`, `kB`, `MB`, `GB`, `TB`; a bare
+number means kB; from 64 kB to 2147483647 kB), and `Config::work_mem`
+or `Database::set_work_mem` change the default for new sessions.
+Queries over data that fits into `work_mem` run exactly as before;
+larger ones get slower when they spill. Over a table of one million rows
+(in memory), a sort, a hash aggregation, a `DISTINCT` and a hash join
+took between 5% and 60% longer with 4 MB than with 1 GB, which is why
+the default stays at PostgreSQL's value. Raise `work_mem` for
+sessions that run big reports, with an eye on how many such operators
+can run at the same time: every sort and hash table of every running
+statement may take up to its budget.
+
+Some buffers cannot be split, and fail with SQLSTATE `53200`
+(`out_of_memory`, with a message naming `work_mem`) instead of growing
+without bound:
+
+- a single window partition larger than `work_mem` (`row_number() OVER
+  (ORDER BY …)` without `PARTITION BY` over a large input is one
+  partition);
+- the state of a single aggregate group that outgrows the hash table's
+  budget: `array_agg`, `string_agg`, `json_agg` and the like over a
+  large group, `count(DISTINCT …)` and other `DISTINCT` or `ORDER BY`
+  aggregates over many values in one group (or without `GROUP BY`);
+- a hash join or hash aggregation partition that is still too large
+  after six rounds of splitting, which happens only when very many rows
+  share one key;
+- the rows a recursive `UNION` (without `ALL`) has seen.
+
+Raising `work_mem` for the session makes such a query work. Not covered
+by `work_mem` are the result set of a statement, which the embedding API
+and the server hold in memory until it is returned, the writes of an
+open transaction, which are buffered until commit, and the vectorized
+aggregation of columnar tables, which has its own limits (see
+[analytics](analytics.md)).
+
+Temporary files go to `tmp/` inside the database directory (a read
+replica uses its own directory the same way), or to `Config::temp_dir`
+/ `Database::set_temp_dir`; `Database::temp_dir()` tells where. An
+in-memory database uses a directory of its own under the system's
+temporary directory, removed when the database closes. A file is
+deleted as soon as its operator is done, when its statement fails and
+when it is cancelled; files left behind by a crash are removed the next
+time the database is opened (for in-memory databases, by the operating
+system's cleaning of its temporary directory). The temporary directory
+must not be shared by databases that are open at the same time. There is
+no limit on the disk space temporary files take (PostgreSQL's
+`temp_file_limit` is not supported); a full disk fails the statement
+with SQLSTATE `53100`.
+
+`EXPLAIN ANALYZE` shows what the operators did, in PostgreSQL's words:
+`Sort Method: quicksort  Memory: 25kB` or `Sort Method: external merge
+Disk: 1488kB`; `Batches: 5  Memory Usage: 130kB  Disk Usage: 912kB` for
+hash aggregation, `DISTINCT`, hash joins and set operations; `Storage:
+Memory` or `Storage: Disk` for window functions.
 
 ## Using several threads
 

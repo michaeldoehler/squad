@@ -218,11 +218,16 @@ fn encode_value(out: &mut Vec<u8>, v: &Value) {
 /// Serializes a row for storage.
 pub fn encode_row(row: &[Value]) -> Vec<u8> {
     let mut out = Vec::with_capacity(row.len() * 9 + 2);
-    push_varint(&mut out, row.len() as u64);
-    for v in row {
-        encode_value(&mut out, v);
-    }
+    encode_row_into(&mut out, row);
     out
+}
+
+/// Appends the [`encode_row`] encoding of `row` to `out`.
+pub fn encode_row_into(out: &mut Vec<u8>, row: &[Value]) {
+    push_varint(out, row.len() as u64);
+    for v in row {
+        encode_value(out, v);
+    }
 }
 
 struct Reader<'a> {

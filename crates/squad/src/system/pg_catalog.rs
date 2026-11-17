@@ -42,6 +42,7 @@ const SETTINGS: &[&str] = &[
     "timezone",
     "transaction_isolation",
     "transaction_read_only",
+    "work_mem",
 ];
 
 fn fk_code(a: FkAction) -> char {

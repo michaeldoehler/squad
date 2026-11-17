@@ -4,7 +4,7 @@
 //! materialize it.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -17,16 +17,21 @@ use crate::encoding::{decode_row, encode_key, encode_key_tuple};
 use crate::expr::{quantified, sql_eq, Expr, Row, SubKind, SubqueryExpr};
 use crate::plan::{JoinKind, LockWait, Plan, RowLock, ScanPlan, SetOpKind, SortKey, Srf};
 use crate::session::{SessionState, Shared};
-use crate::types::{compare, FnCtx, Interval, Value};
+use crate::spill::{
+    compare_ordered, out_of_memory, partition_of, row_size, Partitions, RowStore, SortOrder, Sorted, Sorter, SpillFile,
+    SpillReader, Stored, StoredIter, ENTRY_OVERHEAD, MAX_LEVEL,
+};
+use crate::types::{FnCtx, Interval, Value};
 use crate::{sqlstate, Error, Result};
 
 enum SubCache {
     Value(Value),
-    /// Result set of an uncorrelated quantified subquery.
+    /// Result set of an uncorrelated quantified subquery, with the keys
+    /// of its rows hashed while they fit into the hash budget.
     Set {
-        keys: HashSet<Vec<u8>>,
+        keys: Option<HashSet<Vec<u8>>>,
         has_null: bool,
-        rows: Rc<Vec<Row>>,
+        rows: Rc<Stored>,
     },
 }
 
@@ -43,7 +48,7 @@ pub struct ExecCx<'a> {
     pub session: &'a mut SessionState,
     pub shared: &'a Arc<Shared>,
     sub_cache: Vec<Option<SubCache>>,
-    ctes: HashMap<usize, Rc<Vec<Row>>>,
+    ctes: HashMap<usize, Rc<Stored>>,
     /// Rows changed by the data-modifying statements run so far.
     pub rows_affected: u64,
     /// Segment objects made obsolete by this statement.
@@ -118,6 +123,28 @@ impl<'a> ExecCx<'a> {
         Ok(())
     }
 
+    /// The memory budget of one operator's buffers (`work_mem`).
+    pub(crate) fn work_mem(&self) -> usize {
+        self.session.work_mem
+    }
+
+    /// The budget of hash tables: twice `work_mem`, like PostgreSQL's
+    /// default `hash_mem_multiplier`.
+    pub(crate) fn hash_mem(&self) -> usize {
+        self.work_mem().saturating_mul(2)
+    }
+
+    pub(crate) fn temp_space(&self) -> Arc<crate::spill::TempSpace> {
+        self.shared.temp_space()
+    }
+
+    /// Records a detail about a plan node for `EXPLAIN ANALYZE`.
+    pub(crate) fn note(&mut self, plan: &Plan, line: String) {
+        if let Some(notes) = &mut self.session.plan_notes {
+            notes.entry(plan as *const Plan as usize).or_default().push(line);
+        }
+    }
+
     pub fn wait_policy(&self) -> WaitPolicy {
         WaitPolicy::Wait(self.session.lock_timeout)
     }
@@ -136,17 +163,30 @@ impl<'a> ExecCx<'a> {
         if self.sub_cache[sub.id].is_none() {
             let cache = match &sub.kind {
                 SubKind::Quantified { .. } => {
-                    let rows = collect(&sub.plan, self)?;
-                    let mut keys = HashSet::with_capacity(rows.len());
-                    let mut has_null = false;
-                    for r in &rows {
+                    // Beyond the budget the rows stay in a temporary file
+                    // and each probe scans them, like PostgreSQL's plain
+                    // (not hashed) subplan.
+                    let budget = self.hash_mem();
+                    let mut node = open(&sub.plan, self)?;
+                    let mut rows = RowStore::new(self);
+                    let mut keys = Some(HashSet::new());
+                    let (mut has_null, mut used) = (false, 0);
+                    while let Some(r) = node.next(self)? {
+                        self.check_interrupts()?;
                         if r.iter().any(Value::is_null) {
                             has_null = true;
-                        } else {
-                            keys.insert(encode_key_tuple(r));
+                        } else if let Some(k) = &mut keys {
+                            let key = encode_key_tuple(&r);
+                            used += key.len() + ENTRY_OVERHEAD;
+                            k.insert(key);
+                            if used > budget {
+                                keys = None;
+                            }
                         }
+                        rows.push(r, self)?;
                     }
-                    SubCache::Set { keys, has_null, rows: Rc::new(rows) }
+                    drop(node);
+                    SubCache::Set { keys, has_null, rows: rows.finish()? }
                 }
                 _ => SubCache::Value(self.run_subquery(sub, row)?),
             };
@@ -159,7 +199,7 @@ impl<'a> ExecCx<'a> {
                 let (has_null, rows) = (*has_null, rows.clone());
                 let mut lvals = Vec::with_capacity(left.len());
                 // `keys` borrows self; evaluate the probe first.
-                let hit = if op.is_none() && !*all {
+                let hit = if op.is_none() && !*all && keys.is_some() {
                     let mut null = false;
                     for e in left {
                         let v = e.clone().eval(row, self)?;
@@ -172,7 +212,7 @@ impl<'a> ExecCx<'a> {
                         let SubCache::Set { keys, .. } = self.sub_cache[sub.id].as_ref().unwrap() else {
                             unreachable!()
                         };
-                        Some(keys.contains(&encode_key_tuple(&lvals)))
+                        Some(keys.as_ref().is_some_and(|k| k.contains(&encode_key_tuple(&lvals))))
                     }
                 } else {
                     let _ = keys;
@@ -196,26 +236,38 @@ impl<'a> ExecCx<'a> {
         left: &[Expr],
         op: &Option<crate::expr::FuncRef>,
         all: bool,
-        rows: &[Row],
+        rows: &Rc<Stored>,
         row: &[Value],
     ) -> Result<Value> {
         let lvals = left.iter().map(|e| e.eval(row, self)).collect::<Result<Vec<_>>>()?;
         let fn_ctx = self.fn_ctx.clone();
-        quantified(rows.iter(), all, |r| match op {
-            Some(op) => {
-                if lvals[0].is_null() || r[0].is_null() {
-                    return Ok(None);
+        let test = |r: &[Value]| -> Result<Option<bool>> {
+            match op {
+                Some(op) => {
+                    if lvals[0].is_null() || r[0].is_null() {
+                        return Ok(None);
+                    }
+                    Ok((op.eval)(&fn_ctx, &[lvals[0].clone(), r[0].clone()])?.as_bool())
                 }
-                Ok((op.eval)(&fn_ctx, &[lvals[0].clone(), r[0].clone()])?.as_bool())
+                None if lvals.len() == 1 => Ok(sql_eq(&lvals[0], &r[0])),
+                None => Ok(sql_eq(&Value::Record(lvals.clone()), &Value::Record(r.to_vec()))),
             }
-            None => {
-                if lvals.len() == 1 {
-                    Ok(sql_eq(&lvals[0], &r[0]))
-                } else {
-                    Ok(sql_eq(&Value::Record(lvals.clone()), &Value::Record(r.clone())))
-                }
+        };
+        if let Stored::Mem(rows) = &**rows {
+            return quantified(rows.iter(), all, |r| test(r));
+        }
+        let mut it = rows.iter()?;
+        let mut unknown = false;
+        while let Some(r) = it.next_row()? {
+            self.check_interrupts()?;
+            match test(&r)? {
+                Some(b) if b != all => return Ok(Value::Bool(!all)),
+                Some(_) => {}
+                None => unknown = true,
             }
-        })
+        }
+        // No row decided it: as `quantified` does for rows in memory.
+        Ok(if unknown { Value::Null } else { Value::Bool(all) })
     }
 
     fn run_subquery(&mut self, sub: &SubqueryExpr, row: &[Value]) -> Result<Value> {
@@ -240,7 +292,7 @@ impl<'a> ExecCx<'a> {
                 Ok(Value::Array(rows.into_iter().map(|mut r| r.swap_remove(0)).collect()))
             }
             SubKind::Quantified { left, op, all } => {
-                let rows = collect(&sub.plan, self)?;
+                let rows = store(&sub.plan, self)?;
                 // The left side belongs to the enclosing query: evaluate it
                 // without the row pushed for the subquery.
                 let pushed = if sub.correlated { self.outer.pop() } else { None };
@@ -270,6 +322,17 @@ pub fn collect(plan: &Plan, cx: &mut ExecCx) -> Result<Vec<Row>> {
     Ok(rows)
 }
 
+/// Runs a plan into a [`RowStore`].
+fn store(plan: &Plan, cx: &mut ExecCx) -> Result<Rc<Stored>> {
+    let mut node = open(plan, cx)?;
+    let mut out = RowStore::new(cx);
+    while let Some(r) = node.next(cx)? {
+        cx.check_interrupts()?;
+        out.push(r, cx)?;
+    }
+    out.finish()
+}
+
 struct VecNode(std::vec::IntoIter<Row>);
 
 impl Node for VecNode {
@@ -278,17 +341,34 @@ impl Node for VecNode {
     }
 }
 
-fn rows(v: Vec<Row>) -> Box<dyn Node> {
+pub(crate) fn rows<'p>(v: Vec<Row>) -> Box<dyn Node + 'p> {
     Box::new(VecNode(v.into_iter()))
 }
 
 /// Shared rows of a CTE, handed out by cloning.
-struct RcNode(Rc<Vec<Row>>, usize);
+struct StoredNode(StoredIter);
 
-impl Node for RcNode {
+impl Node for StoredNode {
     fn next(&mut self, _: &mut ExecCx) -> Result<Option<Row>> {
-        self.1 += 1;
-        Ok(self.0.get(self.1 - 1).cloned())
+        self.0.next_row()
+    }
+}
+
+/// Rows read back from a temporary file.
+pub(crate) struct SpillNode(pub(crate) SpillReader);
+
+impl Node for SpillNode {
+    fn next(&mut self, _: &mut ExecCx) -> Result<Option<Row>> {
+        self.0.next_row()
+    }
+}
+
+/// The output of a sort.
+pub(crate) struct SortedNode(pub(crate) Sorted);
+
+impl Node for SortedNode {
+    fn next(&mut self, _: &mut ExecCx) -> Result<Option<Row>> {
+        Ok(self.0.next()?.map(|(_, row)| row))
     }
 }
 
@@ -334,131 +414,111 @@ pub fn open<'p>(plan: &'p Plan, cx: &mut ExecCx) -> Result<Box<dyn Node + 'p>> {
             Box::new(LimitNode { input: open(input, cx)?, skip, remaining: limit })
         }
         Plan::NestedLoop { left, right, kind, on, lateral, index_join, right_width } => {
-            if matches!(kind, JoinKind::Right | JoinKind::Full) {
-                rows(nested_loop_outer(left, right, *kind, on.as_ref(), *right_width, cx)?)
-            } else {
-                let rescan = *lateral || *index_join;
-                let inner = if rescan { None } else { Some(Rc::new(collect(right, cx)?)) };
-                Box::new(NestedLoopNode {
-                    left: open(left, cx)?,
-                    right,
-                    kind: *kind,
-                    on: on.as_ref(),
-                    lateral: *lateral,
-                    index_join: *index_join,
-                    right_width: *right_width,
-                    inner,
-                    current: None,
-                })
-            }
-        }
-        Plan::HashJoin { left, right, kind, left_keys, right_keys, filter, left_width, right_width } => {
-            let build = collect(right, cx)?;
-            let mut table: HashMap<Vec<u8>, Vec<usize>> = HashMap::with_capacity(build.len());
-            for (i, r) in build.iter().enumerate() {
-                if let Some(k) = join_key(right_keys, r, cx)? {
-                    table.entry(k).or_default().push(i);
-                }
-            }
-            let matched = vec![false; if matches!(kind, JoinKind::Right | JoinKind::Full) { build.len() } else { 0 }];
-            Box::new(HashJoinNode {
+            let outer_right = matches!(kind, JoinKind::Right | JoinKind::Full);
+            // RIGHT and FULL joins read the right side once and remember
+            // which of its rows found a partner.
+            let rescan = (*lateral || *index_join) && !outer_right;
+            let inner = if rescan { None } else { Some(store(right, cx)?) };
+            let rmatched = match (&inner, outer_right) {
+                (Some(i), true) => vec![false; i.len() as usize],
+                _ => Vec::new(),
+            };
+            Box::new(NestedLoopNode {
                 left: open(left, cx)?,
-                build,
-                table,
+                left_plan: left,
+                right,
                 kind: *kind,
-                left_keys,
-                filter: filter.as_ref(),
-                left_width: *left_width,
+                on: on.as_ref(),
+                index_join: *index_join,
                 right_width: *right_width,
-                matched,
-                pending: Vec::new(),
-                drained: false,
+                inner,
+                current: None,
+                rmatched,
+                left_width: None,
+                tail: None,
             })
         }
-        Plan::Aggregate { input, groups, aggs } => rows(crate::agg::aggregate(input, groups, aggs, cx)?),
-        Plan::Window { input, calls } => rows(crate::agg::window(input, calls, cx)?),
+        // Without keys every row lands in one bucket: that is a nested
+        // loop, which can keep its inner side on disk.
+        Plan::HashJoin { left, right, kind, left_keys, filter, left_width, right_width, .. }
+            if left_keys.is_empty() =>
+        {
+            let inner = store(right, cx)?;
+            let outer_right = matches!(kind, JoinKind::Right | JoinKind::Full);
+            Box::new(NestedLoopNode {
+                left: open(left, cx)?,
+                left_plan: left,
+                right,
+                kind: *kind,
+                on: filter.as_ref(),
+                index_join: false,
+                right_width: *right_width,
+                rmatched: if outer_right { vec![false; inner.len() as usize] } else { Vec::new() },
+                inner: Some(inner),
+                current: None,
+                left_width: Some(*left_width),
+                tail: None,
+            })
+        }
+        Plan::HashJoin { left, right, kind, left_keys, right_keys, filter, left_width, right_width } => {
+            Box::new(HashJoinNode::open(
+                plan,
+                left,
+                right,
+                *kind,
+                left_keys,
+                right_keys,
+                filter.as_ref(),
+                *left_width,
+                *right_width,
+                cx,
+            )?)
+        }
+        Plan::Aggregate { input, groups, aggs } => crate::agg::aggregate(plan, input, groups, aggs, cx)?,
+        Plan::Window { input, calls } => crate::agg::window(plan, input, calls, cx)?,
         Plan::Sort { input, keys } => {
-            let input = collect(input, cx)?;
-            rows(sort_rows(input, keys, cx)?)
+            let mut sorter = Sorter::new(sort_orders(keys), cx);
+            let mut node = open(input, cx)?;
+            while let Some(row) = node.next(cx)? {
+                cx.check_interrupts()?;
+                let mut k = Vec::with_capacity(keys.len());
+                for key in keys {
+                    k.push(key.expr.eval(&row, cx)?);
+                }
+                sorter.push(k, row, cx)?;
+            }
+            drop(node);
+            let (sorted, stats) = sorter.finish(cx)?;
+            cx.note(plan, stats.describe());
+            Box::new(SortedNode(sorted))
         }
-        Plan::Distinct { input, on } => {
-            Box::new(DistinctNode { input: open(input, cx)?, on: on.as_deref(), seen: HashSet::new(), last: None })
-        }
+        Plan::Distinct { input, on } => Box::new(DistinctNode::new(plan, open(input, cx)?, on.as_deref(), cx)),
         Plan::SetOp { kind, all, left, right } => match (kind, all) {
             (SetOpKind::Union, true) => Box::new(ChainNode { first: Some(open(left, cx)?), second: open(right, cx)? }),
-            (SetOpKind::Union, false) => Box::new(DistinctNode {
-                input: Box::new(ChainNode { first: Some(open(left, cx)?), second: open(right, cx)? }),
-                on: None,
-                seen: HashSet::new(),
-                last: None,
-            }),
-            _ => {
-                let l = collect(left, cx)?;
-                let r = collect(right, cx)?;
-                let mut counts: HashMap<Vec<u8>, usize> = HashMap::new();
-                for row in &r {
-                    *counts.entry(encode_key_tuple(row)).or_default() += 1;
-                }
-                let mut emitted: HashSet<Vec<u8>> = HashSet::new();
-                let mut out = Vec::new();
-                for row in l {
-                    let k = encode_key_tuple(&row);
-                    let in_right = counts.get_mut(&k).filter(|c| **c > 0);
-                    let keep = match (kind, all, in_right) {
-                        (SetOpKind::Intersect, true, Some(c)) => {
-                            *c -= 1;
-                            true
-                        }
-                        (SetOpKind::Intersect, false, Some(_)) => emitted.insert(k),
-                        (SetOpKind::Intersect, _, None) => false,
-                        (SetOpKind::Except, true, Some(c)) => {
-                            *c -= 1;
-                            false
-                        }
-                        (SetOpKind::Except, true, None) => true,
-                        (SetOpKind::Except, false, Some(_)) => false,
-                        (SetOpKind::Except, false, None) => emitted.insert(k),
-                        (SetOpKind::Union, ..) => unreachable!(),
-                    };
-                    if keep {
-                        out.push(row);
-                    }
-                }
-                rows(out)
+            (SetOpKind::Union, false) => {
+                let both = Box::new(ChainNode { first: Some(open(left, cx)?), second: open(right, cx)? });
+                Box::new(DistinctNode::new(plan, both, None, cx))
             }
+            _ => Box::new(SetOpNode::open(plan, *kind, *all, left, right, cx)?),
         },
         Plan::With { ctes, body } => {
             for cte in ctes {
-                let base = collect(&cte.plan, cx)?;
                 let result = match &cte.recursive {
-                    None => base,
-                    Some((step, union_all)) => {
-                        let mut seen: HashSet<Vec<u8>> = HashSet::new();
-                        let mut dedup = |rows: Vec<Row>| -> Vec<Row> {
-                            if *union_all {
-                                rows
-                            } else {
-                                rows.into_iter().filter(|r| seen.insert(encode_key_tuple(r))).collect()
-                            }
-                        };
-                        let mut all = dedup(base);
-                        let mut working = all.clone();
-                        while !working.is_empty() {
-                            cx.ctes.insert(cte.id, Rc::new(working));
-                            working = dedup(collect(step, cx)?);
-                            all.extend(working.iter().cloned());
-                        }
-                        all
-                    }
+                    None => store(&cte.plan, cx)?,
+                    Some((step, union_all)) => recursive_cte(cte.id, &cte.plan, step, *union_all, cx)?,
                 };
-                cx.ctes.insert(cte.id, Rc::new(result));
+                cx.ctes.insert(cte.id, result);
             }
             open(body, cx)?
         }
         Plan::CteScan(id) => {
             let data =
                 cx.ctes.get(id).cloned().ok_or_else(|| Error::internal("CTE referenced before it was computed"))?;
-            Box::new(RcNode(data, 0))
+            Box::new(StoredNode(data.iter()?))
+        }
+        Plan::FuncScan { func: Srf::GenerateSeries, args, ordinality } => {
+            let vals = args.iter().map(|e| e.eval(&[], cx)).collect::<Result<Vec<_>>>()?;
+            Box::new(SeriesNode { series: Series::new(&vals, cx)?, ordinality: ordinality.then_some(0) })
         }
         Plan::FuncScan { func, args, ordinality } => {
             let vals = args.iter().map(|e| e.eval(&[], cx)).collect::<Result<Vec<_>>>()?;
@@ -705,21 +765,125 @@ impl Node for ChainNode<'_> {
     }
 }
 
+/// Memory, batches and disk use of a hash operator, for `EXPLAIN ANALYZE`.
+#[derive(Default)]
+struct HashStats {
+    batches: usize,
+    peak: usize,
+    disk: u64,
+}
+
+impl HashStats {
+    fn track(&mut self, used: usize) {
+        self.peak = self.peak.max(used);
+    }
+
+    fn add_files(&mut self, files: &[Option<Rc<SpillFile>>]) {
+        self.disk += files.iter().flatten().map(|f| f.bytes()).sum::<u64>();
+    }
+
+    fn describe(&self) -> String {
+        let mut s = format!("Batches: {}  Memory Usage: {}kB", self.batches.max(1), self.peak.div_ceil(1024));
+        if self.disk > 0 {
+            s.push_str(&format!("  Disk Usage: {}kB", self.disk.div_ceil(1024)));
+        }
+        s
+    }
+}
+
+fn empty_node<'p>() -> Box<dyn Node + 'p> {
+    rows(Vec::new())
+}
+
+/// DISTINCT: whole-row (hashed, spilling to partitions beyond its budget)
+/// or `DISTINCT ON` over sorted input.
 struct DistinctNode<'p> {
+    plan: &'p Plan,
     input: Box<dyn Node + 'p>,
     on: Option<&'p [Expr]>,
     seen: HashSet<Vec<u8>>,
     last: Option<Vec<u8>>,
+    used: usize,
+    budget: usize,
+    /// Partitioning level of the current batch.
+    level: u32,
+    /// Rows of keys not seen before, once `seen` is full.
+    spill: Option<Partitions>,
+    /// Partitions still to be deduplicated, with their level.
+    pending: Vec<(Rc<SpillFile>, u32)>,
+    stats: HashStats,
+}
+
+impl<'p> DistinctNode<'p> {
+    fn new(plan: &'p Plan, input: Box<dyn Node + 'p>, on: Option<&'p [Expr]>, cx: &ExecCx) -> DistinctNode<'p> {
+        DistinctNode {
+            plan,
+            input,
+            on,
+            seen: HashSet::new(),
+            last: None,
+            used: 0,
+            budget: cx.hash_mem(),
+            level: 0,
+            spill: None,
+            pending: Vec::new(),
+            stats: HashStats::default(),
+        }
+    }
+
+    /// Switches to the next spilled partition; false when there is none.
+    fn next_batch(&mut self, cx: &mut ExecCx) -> Result<bool> {
+        if let Some(parts) = self.spill.take() {
+            let files = parts.finish()?;
+            self.stats.add_files(&files);
+            self.pending.extend(files.into_iter().flatten().map(|f| (f, self.level + 1)));
+        }
+        let Some((file, level)) = self.pending.pop() else {
+            if self.on.is_none() {
+                cx.note(self.plan, self.stats.describe());
+            }
+            return Ok(false);
+        };
+        self.input = Box::new(SpillNode(file.reader()?));
+        self.level = level;
+        self.seen = HashSet::new();
+        self.used = 0;
+        self.stats.batches += 1;
+        Ok(true)
+    }
 }
 
 impl Node for DistinctNode<'_> {
     fn next(&mut self, cx: &mut ExecCx) -> Result<Option<Row>> {
-        while let Some(row) = self.input.next(cx)? {
+        loop {
+            let Some(row) = self.input.next(cx)? else {
+                if self.on.is_none() && self.next_batch(cx)? {
+                    continue;
+                }
+                return Ok(None);
+            };
             match self.on {
                 None => {
-                    if self.seen.insert(encode_key_tuple(&row)) {
-                        return Ok(Some(row));
+                    cx.check_interrupts()?;
+                    let key = encode_key_tuple(&row);
+                    if self.seen.contains(&key) {
+                        continue;
                     }
+                    if let Some(parts) = &mut self.spill {
+                        parts.write(partition_of(&key, self.level), &row)?;
+                        continue;
+                    }
+                    self.used += key.len() + ENTRY_OVERHEAD;
+                    self.stats.track(self.used);
+                    self.seen.insert(key);
+                    if self.used > self.budget {
+                        if self.level >= MAX_LEVEL {
+                            return Err(out_of_memory("the hash table of DISTINCT", cx.work_mem()));
+                        }
+                        self.spill = Some(Partitions::new(cx));
+                        self.stats.batches = self.stats.batches.max(1);
+                    }
+                    return Ok(Some(row));
                 }
                 Some(on) => {
                     let mut key = Vec::new();
@@ -733,7 +897,6 @@ impl Node for DistinctNode<'_> {
                 }
             }
         }
-        Ok(None)
     }
 }
 
@@ -753,42 +916,71 @@ fn pad(left: &[Value], width: usize) -> Row {
 
 struct NestedLoopNode<'p> {
     left: Box<dyn Node + 'p>,
+    left_plan: &'p Plan,
     right: &'p Plan,
     kind: JoinKind,
     on: Option<&'p Expr>,
-    lateral: bool,
     index_join: bool,
     right_width: usize,
     /// Materialized right side when it does not depend on the left row.
-    inner: Option<Rc<Vec<Row>>>,
+    inner: Option<Rc<Stored>>,
     /// Left row being joined: `(row, right rows, position, matched)`.
-    current: Option<(Row, Rc<Vec<Row>>, usize, bool)>,
+    current: Option<(Row, StoredIter, usize, bool)>,
+    /// RIGHT and FULL joins: which right rows found a partner.
+    rmatched: Vec<bool>,
+    /// Width of the left rows, once one was seen.
+    left_width: Option<usize>,
+    /// RIGHT and FULL joins after the left side ended: the right rows
+    /// being checked for partners.
+    tail: Option<(StoredIter, usize)>,
 }
 
 impl Node for NestedLoopNode<'_> {
     fn next(&mut self, cx: &mut ExecCx) -> Result<Option<Row>> {
         loop {
+            if let Some((it, pos)) = &mut self.tail {
+                while let Some(r) = it.next_row()? {
+                    cx.check_interrupts()?;
+                    *pos += 1;
+                    if !self.rmatched[*pos - 1] {
+                        // The left width is unknown when the left side is
+                        // empty; the planner records only the right width.
+                        let width = self.left_width.unwrap_or(0).max(plan_width(self.left_plan));
+                        let mut row = vec![Value::Null; width];
+                        row.extend(r);
+                        return Ok(Some(row));
+                    }
+                }
+                return Ok(None);
+            }
             if self.current.is_none() {
-                let Some(left) = self.left.next(cx)? else { return Ok(None) };
+                let Some(left) = self.left.next(cx)? else {
+                    if matches!(self.kind, JoinKind::Right | JoinKind::Full) {
+                        let inner = self.inner.clone().unwrap_or_else(Stored::empty);
+                        self.tail = Some((inner.iter()?, 0));
+                        continue;
+                    }
+                    return Ok(None);
+                };
+                self.left_width.get_or_insert(left.len());
                 let right = match &self.inner {
                     Some(r) => r.clone(),
                     None => {
                         // Re-run the right side with the left row visible.
                         let stack = if self.index_join { &mut cx.nl_left } else { &mut cx.outer };
                         stack.push(left.clone());
-                        let result = collect(self.right, cx);
+                        let result = store(self.right, cx);
                         let stack = if self.index_join { &mut cx.nl_left } else { &mut cx.outer };
                         stack.pop();
-                        let _ = self.lateral;
-                        Rc::new(result?)
+                        result?
                     }
                 };
-                self.current = Some((left, right, 0, false));
+                self.current = Some((left, right.iter()?, 0, false));
             }
             let (left, right, pos, matched) = self.current.as_mut().unwrap();
-            while *pos < right.len() {
+            while let Some(r) = right.next_cow()? {
                 cx.check_interrupts()?;
-                let row = concat(left, &right[*pos]);
+                let row = concat(left, &r);
                 *pos += 1;
                 let ok = match self.on {
                     Some(on) => on.test(&row, cx)?,
@@ -798,6 +990,9 @@ impl Node for NestedLoopNode<'_> {
                     continue;
                 }
                 *matched = true;
+                if let Some(m) = self.rmatched.get_mut(*pos - 1) {
+                    *m = true;
+                }
                 match self.kind {
                     JoinKind::Semi => {
                         let out = std::mem::take(left);
@@ -810,56 +1005,12 @@ impl Node for NestedLoopNode<'_> {
             }
             let (left, _, _, matched) = self.current.take().unwrap();
             match self.kind {
-                JoinKind::Left if !matched => return Ok(Some(pad(&left, self.right_width))),
+                JoinKind::Left | JoinKind::Full if !matched => return Ok(Some(pad(&left, self.right_width))),
                 JoinKind::Anti if !matched => return Ok(Some(left)),
                 _ => {}
             }
         }
     }
-}
-
-/// RIGHT and FULL joins without usable equality keys.
-fn nested_loop_outer(
-    left: &Plan,
-    right: &Plan,
-    kind: JoinKind,
-    on: Option<&Expr>,
-    right_width: usize,
-    cx: &mut ExecCx,
-) -> Result<Vec<Row>> {
-    let lrows = collect(left, cx)?;
-    let rrows = collect(right, cx)?;
-    let left_width = lrows.first().map_or(0, Vec::len);
-    let mut rmatched = vec![false; rrows.len()];
-    let mut out = Vec::new();
-    for l in &lrows {
-        let mut matched = false;
-        for (i, r) in rrows.iter().enumerate() {
-            cx.check_interrupts()?;
-            let row = concat(l, r);
-            if match on {
-                Some(on) => on.test(&row, cx)?,
-                None => true,
-            } {
-                matched = true;
-                rmatched[i] = true;
-                out.push(row);
-            }
-        }
-        if !matched && kind == JoinKind::Full {
-            out.push(pad(l, right_width));
-        }
-    }
-    // The left width is unknown when the left side is empty; the planner
-    // records only the right width, so derive it from the unmatched rows.
-    for (i, r) in rrows.iter().enumerate() {
-        if !rmatched[i] {
-            let mut row = vec![Value::Null; left_width.max(plan_width(left))];
-            row.extend_from_slice(r);
-            out.push(row);
-        }
-    }
-    Ok(out)
 }
 
 /// Number of columns a plan produces, where it is statically known.
@@ -903,12 +1054,28 @@ fn join_key(keys: &[Expr], row: &[Value], cx: &mut ExecCx) -> Result<Option<Vec<
     Ok(Some(key))
 }
 
+/// The partition of a join key; rows whose key has a NULL never match and
+/// go to the first partition.
+fn key_partition(key: &Option<Vec<u8>>, level: u32) -> usize {
+    key.as_ref().map_or(0, |k| partition_of(k, level))
+}
+
+/// One pair of partitions of a grace hash join: build rows, probe rows,
+/// and the level to split them at if the build rows are still too many.
+type JoinBatch = (Option<Rc<SpillFile>>, Option<Rc<SpillFile>>, u32);
+
+/// Hash join. The right side is loaded into a hash table; if it outgrows
+/// its budget, both sides are split by a hash of the join key into
+/// partitions on disk, which are then joined pair by pair (grace hash
+/// join), splitting a pair again where needed.
 struct HashJoinNode<'p> {
+    plan: &'p Plan,
     left: Box<dyn Node + 'p>,
     build: Vec<Row>,
     table: HashMap<Vec<u8>, Vec<usize>>,
     kind: JoinKind,
     left_keys: &'p [Expr],
+    right_keys: &'p [Expr],
     filter: Option<&'p Expr>,
     left_width: usize,
     right_width: usize,
@@ -916,6 +1083,186 @@ struct HashJoinNode<'p> {
     /// Output rows of the current probe row, in reverse order.
     pending: Vec<Row>,
     drained: bool,
+    budget: usize,
+    batches: VecDeque<JoinBatch>,
+    /// After partitioning: build rows whose key has a NULL. They match
+    /// nothing, so they stay out of the partitions; RIGHT and FULL joins
+    /// emit them at the end.
+    null_rows: Option<RowStore>,
+    null_tail: Option<StoredIter>,
+    stats: HashStats,
+}
+
+impl<'p> HashJoinNode<'p> {
+    /// Sends a build row to its partition, or aside if its key has a NULL.
+    fn partition_build_row(&mut self, parts: &mut Partitions, row: Row, cx: &mut ExecCx) -> Result<()> {
+        match join_key(self.right_keys, &row, cx)? {
+            Some(k) => parts.write(partition_of(&k, 0), &row),
+            None if matches!(self.kind, JoinKind::Right | JoinKind::Full) => {
+                self.null_rows.get_or_insert_with(|| RowStore::new(cx)).push(row, cx)
+            }
+            None => Ok(()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open(
+        plan: &'p Plan,
+        left: &'p Plan,
+        right: &'p Plan,
+        kind: JoinKind,
+        left_keys: &'p [Expr],
+        right_keys: &'p [Expr],
+        filter: Option<&'p Expr>,
+        left_width: usize,
+        right_width: usize,
+        cx: &mut ExecCx,
+    ) -> Result<HashJoinNode<'p>> {
+        let mut node = HashJoinNode {
+            plan,
+            left: empty_node(),
+            build: Vec::new(),
+            table: HashMap::new(),
+            kind,
+            left_keys,
+            right_keys,
+            filter,
+            left_width,
+            right_width,
+            matched: Vec::new(),
+            pending: Vec::new(),
+            drained: true,
+            budget: cx.hash_mem(),
+            batches: VecDeque::new(),
+            null_rows: None,
+            null_tail: None,
+            stats: HashStats::default(),
+        };
+        let mut input = open(right, cx)?;
+        let mut parts: Option<Partitions> = None;
+        let mut used = 0;
+        while let Some(r) = input.next(cx)? {
+            cx.check_interrupts()?;
+            if let Some(p) = &mut parts {
+                node.partition_build_row(p, r, cx)?;
+                continue;
+            }
+            used += row_size(&r) + ENTRY_OVERHEAD;
+            node.stats.track(used);
+            node.build.push(r);
+            if used > node.budget {
+                let mut p = Partitions::new(cx);
+                for r in std::mem::take(&mut node.build) {
+                    node.partition_build_row(&mut p, r, cx)?;
+                }
+                parts = Some(p);
+            }
+        }
+        drop(input);
+        match parts {
+            None => {
+                node.index_build(cx)?;
+                node.left = open(left, cx)?;
+                node.drained = false;
+                node.stats.batches = 1;
+            }
+            Some(parts) => {
+                let build = parts.finish()?;
+                let mut probe = Partitions::new(cx);
+                let mut input = open(left, cx)?;
+                while let Some(r) = input.next(cx)? {
+                    cx.check_interrupts()?;
+                    let k = join_key(left_keys, &r, cx)?;
+                    probe.write(key_partition(&k, 0), &r)?;
+                }
+                let probe = probe.finish()?;
+                node.stats.add_files(&build);
+                node.stats.add_files(&probe);
+                for (b, p) in build.into_iter().zip(probe) {
+                    if b.is_some() || p.is_some() {
+                        node.batches.push_back((b, p, 1));
+                    }
+                }
+            }
+        }
+        Ok(node)
+    }
+
+    /// Builds the hash table over `self.build`.
+    fn index_build(&mut self, cx: &mut ExecCx) -> Result<()> {
+        self.table = HashMap::with_capacity(self.build.len());
+        for (i, r) in self.build.iter().enumerate() {
+            if let Some(k) = join_key(self.right_keys, r, cx)? {
+                self.table.entry(k).or_default().push(i);
+            }
+        }
+        let outer = matches!(self.kind, JoinKind::Right | JoinKind::Full);
+        self.matched = vec![false; if outer { self.build.len() } else { 0 }];
+        Ok(())
+    }
+
+    /// Loads the next pair of partitions; false when all are done.
+    fn next_batch(&mut self, cx: &mut ExecCx) -> Result<bool> {
+        'batches: while let Some((build, probe, level)) = self.batches.pop_front() {
+            self.build = Vec::new();
+            self.table = HashMap::new();
+            let mut used = 0;
+            if let Some(b) = build {
+                let mut reader = b.reader()?;
+                drop(b);
+                while let Some(r) = reader.next_row()? {
+                    cx.check_interrupts()?;
+                    used += row_size(&r) + ENTRY_OVERHEAD;
+                    self.stats.track(used);
+                    self.build.push(r);
+                    if used <= self.budget {
+                        continue;
+                    }
+                    // Still too large: split this pair again.
+                    if level >= MAX_LEVEL {
+                        return Err(out_of_memory("the hash table of a hash join", cx.work_mem()));
+                    }
+                    let mut sub = Partitions::new(cx);
+                    for r in std::mem::take(&mut self.build)
+                        .into_iter()
+                        .map(Ok)
+                        .chain(std::iter::from_fn(|| reader.next_row().transpose()))
+                    {
+                        let r = r?;
+                        let k = join_key(self.right_keys, &r, cx)?;
+                        sub.write(key_partition(&k, level), &r)?;
+                    }
+                    let mut psub = Partitions::new(cx);
+                    if let Some(p) = probe {
+                        let mut reader = p.reader()?;
+                        while let Some(r) = reader.next_row()? {
+                            cx.check_interrupts()?;
+                            let k = join_key(self.left_keys, &r, cx)?;
+                            psub.write(key_partition(&k, level), &r)?;
+                        }
+                    }
+                    let (b, p) = (sub.finish()?, psub.finish()?);
+                    self.stats.add_files(&b);
+                    self.stats.add_files(&p);
+                    for (b, p) in b.into_iter().zip(p).rev() {
+                        if b.is_some() || p.is_some() {
+                            self.batches.push_front((b, p, level + 1));
+                        }
+                    }
+                    continue 'batches;
+                }
+            }
+            self.index_build(cx)?;
+            self.left = match probe {
+                Some(p) => Box::new(SpillNode(p.reader()?)),
+                None => empty_node(),
+            };
+            self.drained = false;
+            self.stats.batches += 1;
+            return Ok(true);
+        }
+        Ok(false)
+    }
 }
 
 impl Node for HashJoinNode<'_> {
@@ -924,7 +1271,25 @@ impl Node for HashJoinNode<'_> {
             if let Some(r) = self.pending.pop() {
                 return Ok(Some(r));
             }
+            if let Some(tail) = &mut self.null_tail {
+                return Ok(tail.next_row()?.map(|r| {
+                    let mut row = vec![Value::Null; self.left_width];
+                    row.extend(r);
+                    row
+                }));
+            }
             if self.drained {
+                if self.next_batch(cx)? {
+                    continue;
+                }
+                cx.note(self.plan, self.stats.describe());
+                if let Some(nulls) = self.null_rows.take() {
+                    self.null_tail = Some(nulls.finish()?.iter()?);
+                    continue;
+                }
+                // Free the last batch now rather than when the node goes.
+                self.build = Vec::new();
+                self.table = HashMap::new();
                 return Ok(None);
             }
             let Some(left) = self.left.next(cx)? else {
@@ -970,34 +1335,235 @@ impl Node for HashJoinNode<'_> {
     }
 }
 
+/// INTERSECT and EXCEPT (with or without ALL). The right side becomes a
+/// table of `key → (count, emitted)`; left rows stream past it. If the
+/// table outgrows its budget, it and the rest of the left side are split
+/// into partitions by key, which are processed pair by pair.
+struct SetOpNode<'p> {
+    plan: &'p Plan,
+    kind: SetOpKind,
+    all: bool,
+    left: Box<dyn Node + 'p>,
+    state: HashMap<Vec<u8>, (u64, bool)>,
+    used: usize,
+    budget: usize,
+    level: u32,
+    /// After spilling: partitions of the state and of the left rows.
+    spill: Option<(Partitions, Partitions)>,
+    batches: Vec<JoinBatch>,
+    stats: HashStats,
+}
+
+impl<'p> SetOpNode<'p> {
+    fn open(
+        plan: &'p Plan,
+        kind: SetOpKind,
+        all: bool,
+        left: &'p Plan,
+        right: &'p Plan,
+        cx: &mut ExecCx,
+    ) -> Result<SetOpNode<'p>> {
+        let mut node = SetOpNode {
+            plan,
+            kind,
+            all,
+            left: empty_node(),
+            state: HashMap::new(),
+            used: 0,
+            budget: cx.hash_mem(),
+            level: 0,
+            spill: None,
+            batches: Vec::new(),
+            stats: HashStats { batches: 1, ..HashStats::default() },
+        };
+        let mut input = open(right, cx)?;
+        while let Some(row) = input.next(cx)? {
+            cx.check_interrupts()?;
+            let key = encode_key_tuple(&row);
+            node.add(key, 1, false, cx)?;
+        }
+        drop(input);
+        node.left = open(left, cx)?;
+        Ok(node)
+    }
+
+    /// Adds right-side state for a key, spilling when the table is full.
+    fn add(&mut self, key: Vec<u8>, count: u64, emitted: bool, cx: &mut ExecCx) -> Result<()> {
+        if let Some((parts, _)) = &mut self.spill {
+            let part = partition_of(&key, self.level);
+            return parts.write(part, &[Value::Bytea(key), Value::Int8(count as i64), Value::Bool(emitted)]);
+        }
+        match self.state.get_mut(&key) {
+            Some(e) => {
+                e.0 += count;
+                e.1 |= emitted;
+            }
+            None => {
+                self.used += key.len() + ENTRY_OVERHEAD;
+                self.stats.track(self.used);
+                self.state.insert(key, (count, emitted));
+                if self.used > self.budget {
+                    self.start_spilling(cx)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn start_spilling(&mut self, cx: &mut ExecCx) -> Result<()> {
+        if self.level >= MAX_LEVEL {
+            return Err(out_of_memory(&format!("the hash table of {:?}", self.kind).to_uppercase(), cx.work_mem()));
+        }
+        let mut parts = Partitions::new(cx);
+        for (key, (count, emitted)) in std::mem::take(&mut self.state) {
+            let part = partition_of(&key, self.level);
+            parts.write(part, &[Value::Bytea(key), Value::Int8(count as i64), Value::Bool(emitted)])?;
+        }
+        self.used = 0;
+        self.spill = Some((parts, Partitions::new(cx)));
+        Ok(())
+    }
+
+    /// Ends the current batch and starts the next one; false when done.
+    fn next_batch(&mut self, cx: &mut ExecCx) -> Result<bool> {
+        if let Some((state, left)) = self.spill.take() {
+            let (s, l) = (state.finish()?, left.finish()?);
+            self.stats.add_files(&s);
+            self.stats.add_files(&l);
+            for (s, l) in s.into_iter().zip(l) {
+                // Without left rows a partition produces nothing.
+                if l.is_some() {
+                    self.batches.push((s, l, self.level + 1));
+                }
+            }
+        }
+        let Some((state, left, level)) = self.batches.pop() else {
+            cx.note(self.plan, self.stats.describe());
+            return Ok(false);
+        };
+        self.state = HashMap::new();
+        self.used = 0;
+        self.level = level;
+        self.stats.batches += 1;
+        if let Some(state) = state {
+            let mut reader = state.reader()?;
+            while let Some(r) = reader.next_row()? {
+                cx.check_interrupts()?;
+                let mut r = r.into_iter();
+                let (Some(Value::Bytea(key)), Some(Value::Int8(count)), Some(Value::Bool(emitted))) =
+                    (r.next(), r.next(), r.next())
+                else {
+                    return Err(Error::internal("malformed set operation state"));
+                };
+                self.add(key, count as u64, emitted, cx)?;
+            }
+        }
+        self.left = match left {
+            Some(l) => Box::new(SpillNode(l.reader()?)),
+            None => empty_node(),
+        };
+        Ok(true)
+    }
+}
+
+impl Node for SetOpNode<'_> {
+    fn next(&mut self, cx: &mut ExecCx) -> Result<Option<Row>> {
+        loop {
+            let Some(row) = self.left.next(cx)? else {
+                if self.next_batch(cx)? {
+                    continue;
+                }
+                return Ok(None);
+            };
+            cx.check_interrupts()?;
+            let key = encode_key_tuple(&row);
+            if let Some((_, left)) = &mut self.spill {
+                left.write(partition_of(&key, self.level), &row)?;
+                continue;
+            }
+            let entry = self.state.get_mut(&key);
+            let keep = match (self.kind, self.all, entry) {
+                (SetOpKind::Intersect, true, Some(e)) if e.0 > 0 => {
+                    e.0 -= 1;
+                    true
+                }
+                (SetOpKind::Intersect, false, Some(e)) if e.0 > 0 && !e.1 => {
+                    e.1 = true;
+                    true
+                }
+                (SetOpKind::Intersect, ..) => false,
+                (SetOpKind::Except, true, Some(e)) if e.0 > 0 => {
+                    e.0 -= 1;
+                    false
+                }
+                (SetOpKind::Except, true, _) => true,
+                (SetOpKind::Except, false, Some(e)) if e.0 > 0 || e.1 => false,
+                (SetOpKind::Except, false, Some(e)) => {
+                    e.1 = true;
+                    true
+                }
+                (SetOpKind::Except, false, None) => {
+                    // A left-only row: remember that it was emitted. The
+                    // table may have to spill; the row is emitted anyway.
+                    self.add(key, 0, true, cx)?;
+                    true
+                }
+                (SetOpKind::Union, ..) => unreachable!(),
+            };
+            if keep {
+                return Ok(Some(row));
+            }
+        }
+    }
+}
+
+/// `WITH RECURSIVE`: runs the recursive term until it adds no rows.
+fn recursive_cte(id: usize, base: &Plan, step: &Plan, union_all: bool, cx: &mut ExecCx) -> Result<Rc<Stored>> {
+    let budget = cx.hash_mem();
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut used = 0;
+    let mut all = RowStore::new(cx);
+    let mut working = RowStore::new(cx);
+    let mut add = |row: Row, all: &mut RowStore, working: &mut RowStore, cx: &mut ExecCx| -> Result<()> {
+        cx.check_interrupts()?;
+        if !union_all {
+            let key = encode_key_tuple(&row);
+            if seen.contains(&key) {
+                return Ok(());
+            }
+            used += key.len() + ENTRY_OVERHEAD;
+            if used > budget {
+                return Err(out_of_memory("the rows a recursive UNION has seen", cx.work_mem()));
+            }
+            seen.insert(key);
+        }
+        all.push(row.clone(), cx)?;
+        working.push(row, cx)
+    };
+    let mut node = open(base, cx)?;
+    while let Some(r) = node.next(cx)? {
+        add(r, &mut all, &mut working, cx)?;
+    }
+    drop(node);
+    loop {
+        let rows = working.finish()?;
+        if rows.is_empty() {
+            break;
+        }
+        cx.ctes.insert(id, rows);
+        working = RowStore::new(cx);
+        let mut node = open(step, cx)?;
+        while let Some(r) = node.next(cx)? {
+            add(r, &mut all, &mut working, cx)?;
+        }
+    }
+    all.finish()
+}
+
 /// Compares two rows of pre-computed sort key values.
 pub(crate) fn compare_keys(a: &[Value], b: &[Value], keys: &[SortKey]) -> Ordering {
     for ((x, y), k) in a.iter().zip(b).zip(keys) {
-        let ord = match (x.is_null(), y.is_null()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => {
-                if k.nulls_first {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (false, true) => {
-                if k.nulls_first {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            (false, false) => {
-                let o = compare(x, y);
-                if k.desc {
-                    o.reverse()
-                } else {
-                    o
-                }
-            }
-        };
+        let ord = compare_ordered(x, y, SortOrder { desc: k.desc, nulls_first: k.nulls_first });
         if ord != Ordering::Equal {
             return ord;
         }
@@ -1005,18 +1571,8 @@ pub(crate) fn compare_keys(a: &[Value], b: &[Value], keys: &[SortKey]) -> Orderi
     Ordering::Equal
 }
 
-pub(crate) fn sort_rows(input: Vec<Row>, keys: &[SortKey], cx: &mut ExecCx) -> Result<Vec<Row>> {
-    let mut keyed = Vec::with_capacity(input.len());
-    for row in input {
-        cx.check_interrupts()?;
-        let mut k = Vec::with_capacity(keys.len());
-        for key in keys {
-            k.push(key.expr.eval(&row, cx)?);
-        }
-        keyed.push((k, row));
-    }
-    keyed.sort_by(|a, b| compare_keys(&a.0, &b.0, keys));
-    Ok(keyed.into_iter().map(|(_, r)| r).collect())
+pub(crate) fn sort_orders(keys: &[SortKey]) -> Vec<SortOrder> {
+    keys.iter().map(|k| SortOrder { desc: k.desc, nulls_first: k.nulls_first }).collect()
 }
 
 struct ProjectSetNode<'p> {
@@ -1123,78 +1679,130 @@ pub(crate) fn refresh_locked_row(cx: &mut ExecCx, table: &Table, key: &[u8]) -> 
     }
 }
 
+/// The values of `generate_series`, produced one at a time.
+enum Series {
+    Done,
+    Int { cur: i64, end: i64, step: i64, wide: bool },
+    Numeric { cur: rust_decimal::Decimal, end: rust_decimal::Decimal, step: rust_decimal::Decimal },
+    Time { cur: i64, end: i64, step: Interval, sign: i128, tz: bool, plus: crate::value::FuncImpl },
+}
+
+impl Series {
+    fn new(args: &[Value], _cx: &mut ExecCx) -> Result<Series> {
+        if args.iter().any(Value::is_null) {
+            return Ok(Series::Done);
+        }
+        Ok(match (&args[0], &args[1]) {
+            (Value::Timestamp(_) | Value::TimestampTz(_), _) => {
+                let tz = matches!(args[0], Value::TimestampTz(_));
+                let (Value::Timestamp(start) | Value::TimestampTz(start)) = args[0] else { unreachable!() };
+                let (Value::Timestamp(end) | Value::TimestampTz(end)) = args[1] else {
+                    return Err(Error::internal("generate_series bounds differ in type"));
+                };
+                let Value::Interval(step) = args[2] else {
+                    return Err(Error::internal("generate_series step is not an interval"));
+                };
+                let sign = step.cmp_key().signum();
+                if sign == 0 {
+                    return Err(Error::new(sqlstate::INVALID_PARAMETER_VALUE, "step size cannot equal zero"));
+                }
+                let plus = crate::value::resolve_operator(
+                    "+",
+                    Some(&if tz { crate::Type::TimestampTz } else { crate::Type::Timestamp }),
+                    &crate::Type::Interval,
+                )?
+                .eval;
+                Series::Time { cur: start, end, step, sign, tz, plus }
+            }
+            (Value::Numeric(start), Value::Numeric(end)) => {
+                let step = match args.get(2) {
+                    Some(Value::Numeric(s)) => *s,
+                    _ => rust_decimal::Decimal::ONE,
+                };
+                if step.is_zero() {
+                    return Err(Error::new(sqlstate::INVALID_PARAMETER_VALUE, "step size cannot equal zero"));
+                }
+                Series::Numeric { cur: *start, end: *end, step }
+            }
+            (a, b) => {
+                let (Some(start), Some(end)) = (a.as_i64(), b.as_i64()) else {
+                    return Err(Error::internal("generate_series over unsupported type"));
+                };
+                let step = args.get(2).and_then(Value::as_i64).unwrap_or(1);
+                if step == 0 {
+                    return Err(Error::new(sqlstate::INVALID_PARAMETER_VALUE, "step size cannot equal zero"));
+                }
+                Series::Int { cur: start, end, step, wide: matches!(a, Value::Int8(_)) }
+            }
+        })
+    }
+
+    fn next(&mut self, cx: &mut ExecCx) -> Result<Option<Value>> {
+        cx.check_interrupts()?;
+        match self {
+            Series::Done => Ok(None),
+            Series::Int { cur, end, step, wide } => {
+                if !((*step > 0 && *cur <= *end) || (*step < 0 && *cur >= *end)) {
+                    return Ok(None);
+                }
+                let v = if *wide { Value::Int8(*cur) } else { Value::Int4(*cur as i32) };
+                match cur.checked_add(*step) {
+                    Some(n) => *cur = n,
+                    None => *self = Series::Done,
+                }
+                Ok(Some(v))
+            }
+            Series::Numeric { cur, end, step } => {
+                if !((step.is_sign_positive() && *cur <= *end) || (step.is_sign_negative() && *cur >= *end)) {
+                    return Ok(None);
+                }
+                let v = Value::Numeric(*cur);
+                *cur += *step;
+                Ok(Some(v))
+            }
+            Series::Time { cur, end, step, sign, tz, plus } => {
+                if !((*sign > 0 && *cur <= *end) || (*sign < 0 && *cur >= *end)) {
+                    return Ok(None);
+                }
+                let v = if *tz { Value::TimestampTz(*cur) } else { Value::Timestamp(*cur) };
+                match plus(&cx.fn_ctx, &[v.clone(), Value::Interval(Interval { ..*step })])? {
+                    Value::Timestamp(t) | Value::TimestampTz(t) => *cur = t,
+                    _ => *self = Series::Done,
+                }
+                Ok(Some(v))
+            }
+        }
+    }
+}
+
+/// `generate_series` in FROM, streamed.
+struct SeriesNode {
+    series: Series,
+    /// `WITH ORDINALITY`: the number of the last row.
+    ordinality: Option<i64>,
+}
+
+impl Node for SeriesNode {
+    fn next(&mut self, cx: &mut ExecCx) -> Result<Option<Row>> {
+        let Some(v) = self.series.next(cx)? else { return Ok(None) };
+        Ok(Some(match &mut self.ordinality {
+            Some(n) => {
+                *n += 1;
+                vec![v, Value::Int8(*n)]
+            }
+            None => vec![v],
+        }))
+    }
+}
+
 fn srf_rows(func: &Srf, args: Vec<Value>, cx: &mut ExecCx) -> Result<Vec<Row>> {
     let one = |v: Value| vec![v];
     Ok(match func {
         Srf::GenerateSeries => {
-            if args.iter().any(Value::is_null) {
-                return Ok(Vec::new());
-            }
+            let mut series = Series::new(&args, cx)?;
             let mut out = Vec::new();
-            match (&args[0], &args[1]) {
-                (Value::Timestamp(_) | Value::TimestampTz(_), _) => {
-                    let tz = matches!(args[0], Value::TimestampTz(_));
-                    let (Value::Timestamp(start) | Value::TimestampTz(start)) = args[0] else { unreachable!() };
-                    let (Value::Timestamp(end) | Value::TimestampTz(end)) = args[1] else {
-                        return Err(Error::internal("generate_series bounds differ in type"));
-                    };
-                    let Value::Interval(step) = args[2] else {
-                        return Err(Error::internal("generate_series step is not an interval"));
-                    };
-                    let sign = step.cmp_key().signum();
-                    if sign == 0 {
-                        return Err(Error::new(sqlstate::INVALID_PARAMETER_VALUE, "step size cannot equal zero"));
-                    }
-                    let plus = crate::value::resolve_operator(
-                        "+",
-                        Some(&if tz { crate::Type::TimestampTz } else { crate::Type::Timestamp }),
-                        &crate::Type::Interval,
-                    )?;
-                    let mut cur = start;
-                    while (sign > 0 && cur <= end) || (sign < 0 && cur >= end) {
-                        cx.check_interrupts()?;
-                        let v = if tz { Value::TimestampTz(cur) } else { Value::Timestamp(cur) };
-                        out.push(one(v.clone()));
-                        cur = match (plus.eval)(&cx.fn_ctx, &[v, Value::Interval(Interval { ..step })])? {
-                            Value::Timestamp(t) | Value::TimestampTz(t) => t,
-                            _ => break,
-                        };
-                    }
-                }
-                (Value::Numeric(start), Value::Numeric(end)) => {
-                    let step = match args.get(2) {
-                        Some(Value::Numeric(s)) => *s,
-                        _ => rust_decimal::Decimal::ONE,
-                    };
-                    if step.is_zero() {
-                        return Err(Error::new(sqlstate::INVALID_PARAMETER_VALUE, "step size cannot equal zero"));
-                    }
-                    let mut cur = *start;
-                    while (step.is_sign_positive() && cur <= *end) || (step.is_sign_negative() && cur >= *end) {
-                        cx.check_interrupts()?;
-                        out.push(one(Value::Numeric(cur)));
-                        cur += step;
-                    }
-                }
-                (a, b) => {
-                    let (Some(start), Some(end)) = (a.as_i64(), b.as_i64()) else {
-                        return Err(Error::internal("generate_series over unsupported type"));
-                    };
-                    let step = args.get(2).and_then(Value::as_i64).unwrap_or(1);
-                    if step == 0 {
-                        return Err(Error::new(sqlstate::INVALID_PARAMETER_VALUE, "step size cannot equal zero"));
-                    }
-                    let wide = matches!(a, Value::Int8(_));
-                    let mut cur = start;
-                    while (step > 0 && cur <= end) || (step < 0 && cur >= end) {
-                        cx.check_interrupts()?;
-                        out.push(one(if wide { Value::Int8(cur) } else { Value::Int4(cur as i32) }));
-                        match cur.checked_add(step) {
-                            Some(n) => cur = n,
-                            None => break,
-                        }
-                    }
-                }
+            while let Some(v) = series.next(cx)? {
+                out.push(one(v));
             }
             out
         }

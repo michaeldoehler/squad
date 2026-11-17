@@ -246,6 +246,7 @@ pub(crate) fn open(dir: &std::path::Path, config: ReplicaConfig) -> Result<Arc<S
     };
     let engine = Arc::new(ReplicaEngine::open(dir, options, remote)?);
     let shared = Shared::open(Store::new(engine.clone())?, "squad")?;
+    shared.set_temp_dir(dir.join("tmp"))?;
     shared.set_recovery(true);
     // Segments of columnar tables are read from where the writer puts them.
     shared.set_objects(config.store.clone());

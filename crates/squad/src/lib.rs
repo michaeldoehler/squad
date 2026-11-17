@@ -45,6 +45,7 @@ pub mod plan;
 mod policy;
 mod replica;
 pub mod session;
+mod spill;
 mod system;
 pub mod types;
 pub mod value;
@@ -56,6 +57,7 @@ pub use convert::{FromSql, ToSql};
 pub use error::{sqlstate, Error, Notice, Result, Severity};
 pub use replica::{ReplicaConfig, ReplicationRole, ReplicationStatus};
 pub use session::{CancelHandle, Login, QueryResult, Session, TxnStatus};
+pub use spill::{parse_work_mem, DEFAULT_WORK_MEM};
 pub use squad_storage::{RemoteConfig, RemoteStats, RemoteSync, SyncMode, VerifyReport};
 
 /// Object stores for [`Config::remote`]: local directories, memory and
