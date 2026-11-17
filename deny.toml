@@ -14,6 +14,14 @@ ignore = [
     # yet: sqlx (a test dependency) pins libsqlite3-sys < 0.38, and Cargo
     # allows one version of a `links = "sqlite3"` crate per lockfile.
     { id = "RUSTSEC-2026-0459", reason = "benchmark-only, own files; blocked on sqlx" },
+    # chrono, chrono-tz and humantime were declared unmaintained on
+    # 2026-11-17 (no vulnerability). squad uses chrono and chrono-tz for
+    # calendar arithmetic and time zone rules, sqlx (a test dependency)
+    # uses chrono, and sqllogictest uses humantime. Moving squad to jiff is
+    # planned; until then the advisories are acknowledged here.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; move to jiff planned" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained; move to jiff planned" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime, through sqllogictest (test runner only)" },
 ]
 
 [licenses]

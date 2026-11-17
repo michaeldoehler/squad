@@ -168,15 +168,14 @@ conflict with recovery`. The transaction can be run again at once.
    reading the old copy are cancelled; `rebases` in the status counts
    how often this happened. The same happens to snapshots that kept
    more than about a million removed row versions waiting.
-2. **A columnar segment is gone.** The writer deletes a segment of a
-   [columnar table](analytics.md) as soon as a compaction or `DELETE`
-   has replaced it. A replica that has not yet applied that commit may
+2. **A columnar segment is gone.** With segments in a remote object
+   store, the writer deletes a segment of a
+   [columnar table](analytics.md) that a compaction, merge or `DELETE`
+   replaced only after `ColumnarConfig::retire_grace` (default 10
+   minutes). A replica that lags behind the writer by more than that may
    still plan a query against the old segment list and find the object
-   missing. Column chunks a replica has already read are held in its
-   cache and stay readable, but segments are read in ranges, so a query
-   that needs other chunks of a replaced segment fails; the window is
-   the replication lag after a compaction or merge, which on a busy
-   writer now run in the background at any time.
+   missing; the query fails and can be repeated. Raise `retire_grace` if
+   replicas may lag longer.
 
 ## Monitoring
 

@@ -1673,10 +1673,6 @@ impl Session {
         let wait = Some(Duration::from_millis(200));
         let moved = self.compact_step(table_id, Step::Delta, wait)?;
         while self.compact_step(table_id, Step::Merge, wait)? > 0 {}
-        // More rows than one run takes: run again soon.
-        if moved as usize >= crate::columnar::COMPACT_MAX_ROWS {
-            self.shared.columnar.compactor.mark_due(table_id);
-        }
         self.collect_table_garbage(table_id);
         Ok(moved)
     }
