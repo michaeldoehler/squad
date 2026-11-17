@@ -556,6 +556,12 @@ fn many_connections_and_shutdown() {
         t.join().unwrap();
     }
     assert_eq!(setup.rows("SELECT n FROM counter"), vec![vec![s("400")]]);
+    // The server notices the closed connections after the clients have
+    // gone; wait for it rather than race it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while server.connections() > 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(server.connections(), 1);
     // Shutdown closes open connections and stops accepting new ones.
     server.shutdown();
