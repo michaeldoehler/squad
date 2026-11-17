@@ -644,12 +644,28 @@ impl ChunkCache {
     /// Registers a fetch of `key` unless it is cached or being fetched.
     fn claim(&self, key: &ChunkKey) -> Option<Arc<Flight>> {
         let mut inflight = self.inflight.lock();
+        self.claim_locked(&mut inflight, key)
+    }
+
+    fn claim_locked(&self, inflight: &mut HashMap<ChunkKey, Arc<Flight>>, key: &ChunkKey) -> Option<Arc<Flight>> {
         if inflight.contains_key(key) || self.cached(key).is_some() {
             return None;
         }
         let f = Arc::new(Flight::default());
         inflight.insert(key.clone(), f.clone());
         Some(f)
+    }
+
+    /// Claims the given ranges in one step, so that two readers fetching
+    /// the same span do not each claim every other range of it (and then
+    /// both send a request).
+    fn claim_all(&self, keys: impl Iterator<Item = ChunkKey>) -> Vec<(ChunkKey, Option<Arc<Flight>>)> {
+        let mut inflight = self.inflight.lock();
+        keys.map(|k| {
+            let f = self.claim_locked(&mut inflight, &k);
+            (k, f)
+        })
+        .collect()
     }
 
     /// Ends a fetch registered by [`claim`](ChunkCache::claim).
@@ -724,8 +740,9 @@ fn io_error(key: &str, e: squad_object::Error) -> std::io::Error {
 fn fetch_span(store: &Arc<dyn squad_object::ObjectStore>, key: &Arc<str>, cache: &ChunkCache, span: &Span) {
     let (start, end, parts) = span;
     // Ranges another reader is already fetching are left to it.
+    let claims = cache.claim_all(parts.iter().map(|p| (key.clone(), p.0)));
     let claimed: Vec<((u64, u64), Arc<Flight>)> =
-        parts.iter().filter_map(|p| cache.claim(&(key.clone(), p.0)).map(|f| (*p, f))).collect();
+        parts.iter().zip(claims).filter_map(|(p, (_, f))| f.map(|f| (*p, f))).collect();
     let (Some(first), Some(last)) = (claimed.first(), claimed.last()) else { return };
     let (start, end) = (first.0 .0, (last.0 .0 + last.0 .1).min(*end).max(*start));
     let data = store.get_range(key, start, end - start);
